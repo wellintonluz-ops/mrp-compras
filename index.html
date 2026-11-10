@@ -1,0 +1,1147 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MRP &amp; Compras | Grupo TBX</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<style>
+  body { font-family: 'Inter', system-ui, -apple-system, Segoe UI, sans-serif; }
+  .nav-btn.active { background: #1e293b; color: #fff; }
+  .nav-btn.active svg { color: #38bdf8; }
+  table.tbl th { position: sticky; top: 0; background: #f8fafc; z-index: 1; }
+  table.tbl th, table.tbl td { white-space: nowrap; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .badge { display:inline-block; padding: 1px 8px; border-radius: 9999px; font-size: 11px; font-weight: 600; }
+  .b-atrasado { background:#fee2e2; color:#b91c1c; }
+  .b-comprar { background:#ffedd5; color:#c2410c; }
+  .b-planejar { background:#fef9c3; color:#a16207; }
+  .b-ok { background:#dcfce7; color:#15803d; }
+  .b-sem_demanda { background:#f1f5f9; color:#64748b; }
+  .scroll-x { overflow-x: auto; }
+  .cell-input { width: 70px; text-align: right; border: 1px solid transparent; border-radius: 4px; padding: 1px 4px; background: transparent; }
+  .cell-input:hover { border-color:#cbd5e1; } .cell-input:focus { border-color:#0ea5e9; background:#fff; outline:none; }
+  .modal-bg { background: rgba(15,23,42,.55); }
+  .cell-input::-webkit-inner-spin-button, .cell-input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; } .cell-input { -moz-appearance: textfield; }
+  .tab.active { border-color:#0ea5e9; color:#0369a1; }
+  #toast { transition: opacity .3s; }
+  .md h3{font-weight:700;margin-top:.8em} .md ul{list-style:disc;padding-left:1.2em} .md p{margin:.4em 0} .md table{border-collapse:collapse;margin:.5em 0} .md td,.md th{border:1px solid #e2e8f0;padding:2px 6px}
+</style>
+</head>
+<body class="bg-slate-100 text-slate-800 text-sm">
+
+<!-- LOGIN -->
+<div id="loginScreen" class="hidden fixed inset-0 bg-slate-900 flex items-center justify-center z-50">
+  <div class="bg-white rounded-2xl p-8 w-96 text-center shadow-2xl">
+    <div class="text-2xl font-bold text-slate-800">MRP &amp; Compras</div>
+    <div class="text-slate-500 mb-6">Grupo TBX · Planejamento de importação</div>
+    <button id="btnLogin" class="w-full bg-sky-600 hover:bg-sky-700 text-white rounded-lg py-2.5 font-semibold">Entrar com Google</button>
+    <div id="loginMsg" class="text-red-600 text-xs mt-3"></div>
+    <div class="text-xs text-slate-400 mt-4">Acesso restrito a contas @grupotbx.com.br</div>
+  </div>
+</div>
+
+<div class="flex h-screen overflow-hidden">
+  <!-- SIDEBAR -->
+  <aside class="w-56 bg-slate-900 text-slate-300 flex flex-col shrink-0">
+    <div class="px-4 py-4 border-b border-slate-800">
+      <div class="text-white font-bold text-base leading-tight">MRP &amp; Compras</div>
+      <div class="text-[11px] text-slate-500">Grupo TBX · Importação</div>
+    </div>
+    <nav id="nav" class="flex-1 p-2 space-y-0.5 overflow-y-auto"></nav>
+    <div class="p-3 border-t border-slate-800 text-[11px] space-y-1">
+      <div id="modeInfo"></div>
+      <div id="userInfo" class="truncate"></div>
+      <button id="btnLogout" class="hidden text-slate-400 hover:text-white underline">Sair</button>
+    </div>
+  </aside>
+
+  <!-- MAIN -->
+  <main class="flex-1 flex flex-col overflow-hidden">
+    <header class="bg-white border-b px-6 py-3 flex items-center gap-4">
+      <h1 id="pageTitle" class="text-lg font-bold text-slate-800">Painel</h1>
+      <div id="pageSub" class="text-slate-500 text-xs"></div>
+      <div class="ml-auto flex items-center gap-3 text-xs text-slate-500">
+        <span id="baseInfo"></span>
+        <span id="saveInfo" class="text-emerald-600"></span>
+      </div>
+    </header>
+    <div id="emptyBanner" class="hidden m-6 mb-0 p-4 rounded-lg bg-sky-50 border border-sky-200 text-sky-900">
+      Nenhum dado carregado ainda. Vá em <b>Importar</b> e envie a planilha do MRP atual (.xlsb) para migrar itens, estrutura, previsão, estoque, ordens e embarques.
+    </div>
+    <section id="page" class="flex-1 overflow-auto p-6"></section>
+  </main>
+</div>
+
+<!-- MODAL -->
+<div id="modal" class="hidden fixed inset-0 modal-bg z-40 flex items-start justify-center overflow-y-auto py-8">
+  <div id="modalBox" class="bg-white rounded-xl shadow-2xl w-full max-w-5xl mx-4">
+    <div class="flex items-center px-5 py-3 border-b">
+      <div id="modalTitle" class="font-bold text-base"></div>
+      <button onclick="closeModal()" class="ml-auto text-slate-400 hover:text-slate-700 text-xl leading-none">&times;</button>
+    </div>
+    <div id="modalBody" class="p-5"></div>
+  </div>
+</div>
+<div id="toast" class="fixed bottom-5 right-5 bg-slate-900 text-white px-4 py-2 rounded-lg shadow-lg opacity-0 pointer-events-none z-50"></div>
+
+<script>
+/* ===== MRP CORE: importador da planilha + motor de cálculo ===== */
+const MRPCore = (function () {
+  const DAY = 86400000;
+  // ---------- datas ----------
+  function iso(d) { return d.toISOString().slice(0, 10); }
+  function parseISO(s) { const [y, m, d] = s.split('-').map(Number); return new Date(Date.UTC(y, m - 1, d)); }
+  function addDays(s, n) { return iso(new Date(parseISO(s).getTime() + n * DAY)); }
+  function diffDays(a, b) { return Math.round((parseISO(b) - parseISO(a)) / DAY); } // b - a
+  function serialToISO(v) {
+    if (typeof v === 'number' && v > 20000 && v < 80000) return iso(new Date(Date.UTC(1899, 11, 30) + Math.round(v) * DAY));
+    if (typeof v === 'string') {
+      const m = v.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+      if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+      if (/^\d{4}-\d{2}-\d{2}/.test(v)) return v.slice(0, 10);
+    }
+    if (v instanceof Date && !isNaN(v)) return iso(new Date(Date.UTC(v.getFullYear(), v.getMonth(), v.getDate())));
+    return null;
+  }
+  function todayISO() { const n = new Date(); return iso(new Date(Date.UTC(n.getFullYear(), n.getMonth(), n.getDate()))); }
+  const num = v => { if (typeof v === 'number') return isFinite(v) ? v : 0; if (typeof v === 'string') { const x = parseFloat(v.replace(/\./g, '').replace(',', '.')); return isFinite(x) ? x : 0; } return 0; };
+  const str = v => (v === null || v === undefined) ? '' : String(v).trim();
+  const clean = v => { const s = str(v); return (s === '****' || s === '-' || s === '0x7') ? '' : s; };
+
+  // ---------- modelo vazio ----------
+  function emptyDB() {
+    return {
+      settings: {
+        horizonte: 240, segurancaDias: 30, coberturaDias: 60, leadTimePadrao: 45, transitPadrao: 35,
+        desembaracoDias: 0, cbmContainer: 68, incluirSimulacoes: true, dataBase: '',
+        cambio: { USD: 5.40, CNY: 0.76, BRL: 1 }, workerUrl: ''
+      },
+      produtos: [],     // itens comprados (MP)
+      estrutura: [],    // {pa, mp, qtd}
+      previsao: [],     // {pa, grupo, padrao, meses:{'YYYY-MM': taxaDia}}
+      ordens: [],       // linhas de ordem de compra
+      embarques: [],    // follow-up de navios
+      fornecedores: [], // {nome, leadTime, transitTime, moeda, contato, linha}
+      estoqueAtualizadoEm: null
+    };
+  }
+
+  // ---------- importador da planilha atual (SheetJS workbook) ----------
+  function sheetRows(XLSX, wb, name) {
+    const ws = wb.Sheets[name];
+    if (!ws || !ws['!ref']) return null;
+    const rg = XLSX.utils.decode_range(ws['!ref']); rg.s.c = 0; rg.s.r = 0; // índices absolutos (coluna A = 0)
+    return XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null, blankrows: true, range: rg });
+  }
+  const statusMap = { in_production: 'Em produção', in_transit: 'Em trânsito', in_stock: 'Recebido', simulation: 'Simulação' };
+  function normSupplier(s) { return str(s).toUpperCase().replace(/_/g, ' ').replace(/\s+/g, ' ').trim(); }
+
+  function importWorkbook(XLSX, wb) {
+    const db = emptyDB();
+    const log = [];
+    const prodMap = new Map();
+    const getProd = cod => {
+      cod = str(cod); if (!cod) return null;
+      if (!prodMap.has(cod)) prodMap.set(cod, { cod, desc: '', familia: '', fornecedor: '', leadTime: null, transitTime: null, multiplo: 1, pcsCx: null, cbmCx: null, custo: 0, moeda: 'USD', estoque: 0, segurancaDias: null, coberturaDias: null, ativo: true, mrp: false });
+      return prodMap.get(cod);
+    };
+
+    // MRP: lista de itens planejados + família
+    const mrp = sheetRows(XLSX, wb, 'MRP');
+    if (mrp) {
+      let n = 0;
+      mrp.forEach(r => { if (r && str(r[2]) === 'Actual' && str(r[1])) { const p = getProd(r[1]); p.familia = str(r[0]).replace(/^PA_/, '').replace(/_/g, ' ').replace(/\s+/g, ' ').trim(); p.mrp = true; n++; } });
+      log.push(`MRP: ${n} itens planejados`);
+    }
+    // Estrutura
+    const st = sheetRows(XLSX, wb, 'Structure');
+    if (st) {
+      const hdr = st.findIndex(r => r && str(r[0]) === 'Produto Pai');
+      for (let i = hdr + 1; i < st.length; i++) {
+        const r = st[i]; if (!r || !str(r[0]) || !str(r[1])) continue;
+        db.estrutura.push({ pa: str(r[0]), mp: str(r[1]), qtd: num(r[2]) || 1 });
+      }
+      log.push(`Estrutura: ${db.estrutura.length} vínculos produto → componente`);
+    }
+    // Previsão (diária → taxa média por mês)
+    const fc = sheetRows(XLSX, wb, 'Forecast');
+    if (fc) {
+      const hdr = fc.findIndex(r => r && str(r[1]) === 'Forecast');
+      const dates = (fc[hdr] || []).map(v => serialToISO(v));
+      for (let i = hdr + 1; i < fc.length; i++) {
+        const r = fc[i]; if (!r || !str(r[1])) continue;
+        const acc = {};
+        for (let c = 3; c < r.length; c++) {
+          const d = dates[c]; if (!d) continue;
+          const ym = d.slice(0, 7);
+          (acc[ym] = acc[ym] || { s: 0, n: 0 });
+          acc[ym].s += num(r[c]); acc[ym].n++;
+        }
+        const meses = {};
+        Object.keys(acc).sort().forEach(ym => { meses[ym] = Math.round((acc[ym].s / acc[ym].n) * 100) / 100; });
+        const ks = Object.keys(meses).sort();
+        const padrao = ks.length ? meses[ks[ks.length - 1]] : 0;
+        db.previsao.push({ pa: str(r[1]), grupo: str(r[2]).replace(/_/g, ' '), padrao, meses });
+      }
+      log.push(`Previsão: ${db.previsao.length} produtos de venda`);
+    }
+    // Estoque por componente
+    const ss = sheetRows(XLSX, wb, 'Stock_Structure');
+    if (ss) {
+      let n = 0; const seen = new Set();
+      ss.forEach(r => {
+        if (!r || !['PA', 'MP'].includes(str(r[0]))) return;
+        const cod = str(r[2]); if (!cod || seen.has(cod)) return;
+        seen.add(cod);
+        if (prodMap.has(cod)) { prodMap.get(cod).estoque = num(r[3]); n++; }
+      });
+      const fl = sheetRows(XLSX, wb, 'Stock_MP_Floors');
+      if (fl) fl.forEach(r => { if (r && prodMap.has(str(r[0])) && typeof r[3] === 'number') prodMap.get(str(r[0])).estoque = num(r[3]); });
+      log.push(`Estoque: ${n} itens com saldo importado`);
+    }
+    // Descrições do sistema (export do ERP)
+    const sys = sheetRows(XLSX, wb, 'Stock_System');
+    if (sys) {
+      sys.forEach(r => { if (r && str(r[0]) && prodMap.has(str(r[0]))) { const p = prodMap.get(str(r[0])); if (!p.desc) p.desc = str(r[1]); } });
+    }
+    // Custos
+    const co = sheetRows(XLSX, wb, 'COSTS');
+    if (co) {
+      const hdr = co.findIndex(r => r && str(r[0]) === 'Cód');
+      for (let i = hdr + 1; i < co.length; i++) {
+        const r = co[i]; if (!r || !str(r[0])) continue;
+        const p = prodMap.get(str(r[0])); if (!p) continue;
+        const moeda = str(r[3]).toUpperCase();
+        const m = moeda.includes('IUAN') || moeda.includes('YUAN') || moeda.includes('RENM') ? 'CNY' : moeda.includes('REAL') ? 'BRL' : 'USD';
+        (p.cotacoes = p.cotacoes || []).push({ fornecedor: normSupplier(r[2]), moeda: m, custo: num(r[7]) });
+      }
+      prodMap.forEach(p => {
+        const cs = (p.cotacoes || []).filter(c => c.custo > 0); if (!cs.length) return;
+        if (!p.fornecedor) p.fornecedor = cs[0].fornecedor;
+        const c = cs.find(x => x.fornecedor === p.fornecedor) || cs[0];
+        p.custo = c.custo; p.moeda = c.moeda;
+        p.cotacoes = cs;
+      });
+    }
+    // CBM / embalagem
+    const cb = sheetRows(XLSX, wb, 'Tab_CBM');
+    if (cb) {
+      cb.forEach(r => { if (!r) return; const p = prodMap.get(str(r[0])); if (!p) return; if (num(r[1])) p.pcsCx = num(r[1]); if (num(r[3])) p.cbmCx = num(r[3]); });
+    }
+    // Ordens de compra
+    const po = sheetRows(XLSX, wb, 'Purchase_Order');
+    const supLT = {};
+    if (po) {
+      const hdr = po.findIndex(r => r && str(r[6]) === 'Item' && str(r[7]) === 'PO_Date');
+      for (let i = hdr + 1; i < po.length; i++) {
+        const r = po[i]; if (!r || !str(r[6])) continue;
+        const qtd = num(r[9]) || num(r[8]);
+        const forn = normSupplier(r[4]);
+        const lt = num(r[10]), tt = num(r[12]);
+        if (forn && lt) supLT[forn] = { leadTime: lt, transitTime: tt };
+        const p = getProd(r[6]);
+        if (!p.fornecedor && forn) p.fornecedor = forn;
+        if (!p.familia && str(r[3])) p.familia = str(r[3]);
+        if (num(r[20]) > 1) p.multiplo = num(r[20]);
+        if (!qtd) continue;
+        const st = statusMap[str(r[17]).toLowerCase()] || 'Em produção';
+        db.ordens.push({
+          id: 'po_' + i + '_' + Math.random().toString(36).slice(2, 7),
+          po: str(r[5]), fornecedor: forn, item: str(r[6]), qtd,
+          dataPedido: serialToISO(r[7]), leadTime: lt, dataEmbarque: serialToISO(r[11]), transitTime: tt,
+          dataChegada: serialToISO(r[13]), qtdRecebida: str(r[17]).toLowerCase() === 'in_stock' ? qtd : 0,
+          status: st, custoUnit: num(r[29]), moeda: (str(r[26]).toUpperCase().includes('IUAN') ? 'CNY' : 'USD'),
+          responsavel: str(r[28]), obs: ''
+        });
+      }
+      log.push(`Ordens de compra: ${db.ordens.length} linhas com quantidade`);
+    }
+    // Fornecedores
+    const supNames = new Set();
+    prodMap.forEach(p => { if (p.fornecedor) supNames.add(p.fornecedor); });
+    db.ordens.forEach(o => o.fornecedor && supNames.add(o.fornecedor));
+    const su = sheetRows(XLSX, wb, 'Suppliers');
+    const supInfo = {};
+    if (su) su.forEach(r => { if (r && str(r[2]) && str(r[2]) !== 'Suppliers' && isNaN(Number(str(r[2])))) { const n = normSupplier(r[2]); supNames.add(n); supInfo[n] = { contato: str(r[1]), linha: str(r[3]) }; } });
+    db.fornecedores = [...supNames].sort().map(nome => ({
+      nome, leadTime: supLT[nome]?.leadTime ?? null, transitTime: supLT[nome]?.transitTime ?? null,
+      contato: supInfo[nome]?.contato || '', linha: supInfo[nome]?.linha || ''
+    }));
+    // Follow-up de embarques
+    const fu = sheetRows(XLSX, wb, 'Follow-up');
+    if (fu) {
+      const hdr = fu.findIndex(r => r && str(r[0]).startsWith('AGENTE'));
+      for (let i = hdr + 1; i < fu.length; i++) {
+        const r = fu[i]; if (!r || !str(r[0])) continue;
+        db.embarques.push({
+          id: 'emb_' + i + '_' + Math.random().toString(36).slice(2, 7),
+          agente: clean(r[0]), porto: clean(r[1]), navio: clean(r[2]),
+          prevChegada: serialToISO(clean(r[3]).replace(/PREV\.?\s*/i, '')) || '', atracacao: serialToISO(r[5]) || '',
+          refImp: clean(r[6]), po: clean(r[8]).replace(/\.0$/, ''), bl: clean(r[9]), fornecedor: normSupplier(clean(r[10])),
+          dataEmbarque: serialToISO(r[11]) || '', freeTime: num(r[12]) || '', containers: num(r[13]) || '',
+          rastreioDocs: clean(r[15]), status: clean(r[17])
+        });
+      }
+      log.push(`Embarques: ${db.embarques.length} processos`);
+    }
+    db.produtos = [...prodMap.values()].filter(p => p.mrp || db.ordens.some(o => o.item === p.cod)).sort((a, b) => (a.familia + a.cod).localeCompare(b.familia + b.cod));
+    db.estoqueAtualizadoEm = null; // estoque veio da planilha; atualizar pelo export do ERP
+    log.push(`Itens no cadastro: ${db.produtos.length}`);
+    return { db, log };
+  }
+
+  // Atualização de estoque a partir de export do ERP (SKU + Total disponível)
+  function importStock(XLSX, wb, db) {
+    const ws = wb.Sheets[wb.SheetNames.find(n => /stock|estoque/i.test(n)) || wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null });
+    let hdr = -1, cSku = -1, cQtd = -1;
+    for (let i = 0; i < Math.min(rows.length, 20); i++) {
+      const r = (rows[i] || []).map(x => str(x).toLowerCase());
+      const s = r.findIndex(x => x === 'sku' || x === 'código' || x === 'codigo' || x === 'cód' || x === 'cod');
+      let q = r.findIndex(x => x === 'total disponível' || x === 'total disponivel');
+      if (q < 0) q = r.findIndex(x => x.includes('dispon') || x === 'estoque' || x === 'saldo' || x === 'quantidade');
+      if (s >= 0 && q >= 0) { hdr = i; cSku = s; cQtd = q; break; }
+    }
+    if (hdr < 0) throw new Error('Não encontrei as colunas "SKU" e "Total disponível" (ou "Estoque"/"Saldo").');
+    const map = new Map();
+    for (let i = hdr + 1; i < rows.length; i++) { const r = rows[i]; if (r && str(r[cSku])) map.set(str(r[cSku]), num(r[cQtd])); }
+    let n = 0; const faltando = [];
+    db.produtos.forEach(p => { if (map.has(p.cod)) { p.estoque = map.get(p.cod); n++; } else faltando.push(p.cod); });
+    db.estoqueAtualizadoEm = todayISO();
+    return { atualizados: n, faltando };
+  }
+
+  // ---------- motor MRP ----------
+  function buildDemandIndex(db) {
+    const fcByPa = new Map(db.previsao.map(f => [f.pa, f]));
+    const parents = new Map(); // mp -> [{pa,qtd}]
+    const paWithStruct = new Set();
+    db.estrutura.forEach(e => { paWithStruct.add(e.pa); if (!parents.has(e.mp)) parents.set(e.mp, []); parents.get(e.mp).push({ pa: e.pa, qtd: e.qtd }); });
+    // venda direta: previsão de um código que não tem estrutura e é ele próprio um item comprado
+    db.previsao.forEach(f => { if (!paWithStruct.has(f.pa)) { if (!parents.has(f.pa)) parents.set(f.pa, []); parents.get(f.pa).push({ pa: f.pa, qtd: 1 }); } });
+    return { fcByPa, parents };
+  }
+  function paRate(f, ym) { if (!f) return 0; const v = f.meses?.[ym]; return (v === undefined || v === null || v === '') ? num(f.padrao) : num(v); }
+  function mpRateForMonth(idx, cod, ym) {
+    const ps = idx.parents.get(cod); if (!ps) return 0;
+    let s = 0; ps.forEach(({ pa, qtd }) => { s += paRate(idx.fcByPa.get(pa), ym) * qtd; });
+    return s;
+  }
+  function itemParams(db, p) {
+    const s = db.settings; const f = db.fornecedores.find(x => x.nome === p.fornecedor) || {};
+    const lt = num(p.leadTime ?? f.leadTime ?? s.leadTimePadrao) || num(s.leadTimePadrao);
+    const tt = num(p.transitTime ?? f.transitTime ?? s.transitPadrao) || num(s.transitPadrao);
+    return {
+      leadTime: lt, transitTime: tt, desembaraco: num(s.desembaracoDias),
+      LT: lt + tt + num(s.desembaracoDias),
+      seg: num(p.segurancaDias ?? s.segurancaDias), cob: num(p.coberturaDias ?? s.coberturaDias) || 30,
+      mult: Math.max(1, num(p.multiplo) || 1)
+    };
+  }
+  function computeItem(db, idx, p, opts) {
+    const today = opts.today, H = opts.horizonte;
+    const prm = itemParams(db, p);
+    // demanda diária
+    const rates = new Array(H + 1);
+    const cacheYM = {};
+    for (let d = 0; d <= H; d++) { const ym = addDays(today, d).slice(0, 7); if (!(ym in cacheYM)) cacheYM[ym] = mpRateForMonth(idx, p.cod, ym); rates[d] = cacheYM[ym]; }
+    const avg = (from, n) => { let s = 0, c = 0; for (let d = from; d < Math.min(H + 1, from + n); d++) { s += rates[d]; c++; } return c ? s / c : 0; };
+    const avg30 = avg(0, 30);
+    // chegadas em aberto
+    const arr = new Array(H + 1).fill(0);
+    const abertas = [];
+    let atrasadas = 0;
+    db.ordens.forEach(o => {
+      if (o.item !== p.cod) return;
+      if (o.status === 'Recebido' || o.status === 'Cancelado') return;
+      if (o.status === 'Simulação' && !opts.incluirSimulacoes) return;
+      const aberto = num(o.qtd) - num(o.qtdRecebida); if (aberto <= 0) return;
+      let dt = o.dataChegada || (o.dataPedido ? addDays(o.dataPedido, num(o.leadTime) + num(o.transitTime)) : today);
+      let d = diffDays(today, dt); if (d < 0) { atrasadas += aberto; d = 0; }
+      if (d <= H) arr[d] += aberto;
+      abertas.push({ ...o, aberto, chegadaEfetiva: addDays(today, Math.max(0, Math.min(d, H))) });
+    });
+    const totalAberto = abertas.reduce((s, o) => s + o.aberto, 0);
+    // projeção (venda perdida quando falta: o estoque não fica negativo)
+    const project = (extra) => {
+      const S = new Array(H + 1), lost = new Array(H + 1); let s = num(p.estoque);
+      for (let d = 0; d <= H; d++) { s += arr[d] + (extra ? extra[d] : 0) - rates[d]; if (s < 0) { lost[d] = -s; s = 0; } else lost[d] = 0; S[d] = s; }
+      return { S, lost };
+    };
+    const base = project(null), S = base.S, lost = base.lost;
+    const firstBelow = (Sx, lvl, from) => { for (let d = from || 0; d <= H; d++) if (rates[d] > 0 && (Sx[d] < lvl - 1e-9 || Sx[d] <= 0)) return d; return -1; };
+    let rupt = -1; for (let d = 0; d <= H; d++) if (lost[d] > 1e-9 || (S[d] <= 0 && rates[d] > 0)) { rupt = d; break; }
+    const perdaTotal = lost.reduce((a, b) => a + b, 0);
+    // dias de estoque (sem chegadas)
+    let diasEstoque = null; { let s = num(p.estoque); if (avg30 <= 0) diasEstoque = null; else { let d = 0; while (d <= H && s - rates[d] >= 0) { s -= rates[d]; d++; } diasEstoque = d > H ? H : d; } }
+    // plano de compras sugerido (iterativo)
+    const extra = new Array(H + 1).fill(0);
+    const plano = [];
+    let from = 0;
+    for (let k = 0; k < 8; k++) {
+      const px = project(extra), Sx = px.S;
+      const dNeed = firstBelow(Sx, prm.seg * avg(0, 60), from);
+      if (dNeed < 0) break;
+      const idealPedido = dNeed - prm.LT;            // dias a partir de hoje (negativo = atrasado)
+      const arrivalD = Math.max(dNeed, prm.LT);      // pedido novo não chega antes do lead time
+      if (arrivalD > H) break;
+      const before = arrivalD > 0 ? Sx[arrivalD - 1] : num(p.estoque);
+      let need = 0; for (let d = arrivalD; d < Math.min(H + 1, arrivalD + prm.cob); d++) need += rates[d];
+      const ssAt = prm.seg * avg(arrivalD, 60);
+      let qtd = need + ssAt - Math.max(0, before);
+      qtd = Math.max(qtd, prm.mult);
+      qtd = Math.ceil(qtd / prm.mult) * prm.mult;
+      let faltaAntes = 0; for (let d = 0; d < arrivalD; d++) faltaAntes += px.lost[d];
+      extra[arrivalD] += qtd;
+      plano.push({ dataPedido: addDays(today, Math.max(0, idealPedido)), dataPedidoIdeal: addDays(today, idealPedido), dataChegada: addDays(today, arrivalD), qtd, atrasado: idealPedido < 0, rupturaAntes: k === 0 && faltaAntes > 0, faltaAntes: k === 0 ? faltaAntes : 0 });
+      from = arrivalD + 1;
+    }
+    const prox = plano[0] || null;
+    let status = 'ok', dias = null;
+    if (prox) {
+      dias = diffDays(today, prox.dataPedidoIdeal);
+      status = dias < 0 ? 'atrasado' : dias <= 7 ? 'comprar' : dias <= 30 ? 'planejar' : 'ok';
+    }
+    if (avg30 <= 0 && !rates.some(x => x > 0)) status = 'sem_demanda';
+    const custoBRL = num(p.custo) * num(db.settings.cambio?.[p.moeda] ?? 1);
+    const cbmUn = (num(p.cbmCx) && num(p.pcsCx)) ? num(p.cbmCx) / num(p.pcsCx) : 0;
+    return {
+      cod: p.cod, produto: p, prm, rates, arr, S, lost, perdaTotal, avg30, rupturaDia: rupt, ruptura: rupt >= 0 ? addDays(today, rupt) : null,
+      diasEstoque, coberturaComChegadas: rupt >= 0 ? rupt : null, abertas, totalAberto, atrasadas, plano, prox, status, diasParaPedido: dias,
+      custoBRL, cbmUn, estoqueValor: num(p.estoque) * custoBRL
+    };
+  }
+  function computeAll(db, o = {}) {
+    const opts = { today: o.today || db.settings.dataBase || todayISO(), horizonte: num(o.horizonte || db.settings.horizonte) || 240, incluirSimulacoes: o.incluirSimulacoes ?? db.settings.incluirSimulacoes };
+    const idx = buildDemandIndex(db);
+    const res = db.produtos.filter(p => p.ativo !== false).map(p => computeItem(db, idx, p, opts));
+    return { opts, itens: res, byCod: new Map(res.map(r => [r.cod, r])) };
+  }
+  return { emptyDB, importWorkbook, importStock, computeAll, computeItem, buildDemandIndex, itemParams, addDays, diffDays, todayISO, serialToISO, num, str };
+})();
+
+
+</script>
+<script>
+/* ================= CONFIGURAÇÃO =================
+   Para salvar na nuvem (compartilhado entre usuários), cole aqui o config do projeto Firebase.
+   Enquanto ficar null, o site funciona em MODO LOCAL (dados ficam só neste navegador). */
+const FIREBASE_CONFIG = null;
+const DOMINIO_PERMITIDO = 'grupotbx.com.br';
+const COLECAO = 'mrp';                 // coleção do Firestore
+const LOCAL_KEY = 'mrp_tbx_v1';
+const DATASETS = ['settings', 'produtos', 'estrutura', 'previsao', 'ordens', 'embarques', 'fornecedores', 'meta'];
+
+/* ================= ESTADO ================= */
+const C = MRPCore;
+let DB = C.emptyDB();
+let R = null;                 // resultado do cálculo
+let page = 'painel';
+let fsdb = null, user = null;
+const charts = {};
+const ui = { mrpFiltro: { q: '', familia: '', fornecedor: '', status: '' }, sugFiltro: { status: 'acao', janela: 30, fornecedor: '' }, ordFiltro: { q: '', status: 'abertas', fornecedor: '' }, prevFiltro: { q: '', grupo: '' }, cadTab: 'itens', sort: {} };
+
+/* ================= PERSISTÊNCIA ================= */
+const Store = {
+  mode: 'local',
+  async init() {
+    if (FIREBASE_CONFIG) {
+      firebase.initializeApp(FIREBASE_CONFIG);
+      fsdb = firebase.firestore();
+      try { fsdb.enablePersistence({ synchronizeTabs: true }).catch(() => {}); } catch (e) {}
+      this.mode = 'firebase';
+      return new Promise(resolve => {
+        firebase.auth().onAuthStateChanged(async u => {
+          if (u && !String(u.email || '').toLowerCase().endsWith('@' + DOMINIO_PERMITIDO)) {
+            document.getElementById('loginMsg').textContent = 'Use uma conta @' + DOMINIO_PERMITIDO;
+            await firebase.auth().signOut(); return;
+          }
+          user = u;
+          document.getElementById('loginScreen').classList.toggle('hidden', !!u);
+          if (u) { document.getElementById('userInfo').textContent = u.email; document.getElementById('btnLogout').classList.remove('hidden'); await this.load(); resolve(); }
+        });
+        document.getElementById('btnLogin').onclick = () => { const p = new firebase.auth.GoogleAuthProvider(); p.setCustomParameters({ hd: DOMINIO_PERMITIDO }); firebase.auth().signInWithPopup(p).catch(e => document.getElementById('loginMsg').textContent = e.message); };
+        document.getElementById('btnLogout').onclick = () => firebase.auth().signOut().then(() => location.reload());
+      });
+    } else { await this.load(); }
+  },
+  async load() {
+    const base = C.emptyDB();
+    if (this.mode === 'firebase') {
+      const snaps = await Promise.all(DATASETS.map(k => fsdb.collection(COLECAO).doc(k).get()));
+      snaps.forEach((s, i) => { const k = DATASETS[i]; if (s.exists) { const d = s.data(); if (k === 'settings') base.settings = { ...base.settings, ...d.v, cambio: { ...base.settings.cambio, ...(d.v?.cambio || {}) } }; else if (k === 'meta') base.estoqueAtualizadoEm = d.v?.estoqueAtualizadoEm || null; else base[k] = d.v || []; } });
+    } else {
+      try { const raw = localStorage.getItem(LOCAL_KEY); if (raw) { const d = JSON.parse(raw); Object.assign(base, d); base.settings = { ...C.emptyDB().settings, ...d.settings, cambio: { ...C.emptyDB().settings.cambio, ...(d.settings?.cambio || {}) } }; } } catch (e) { console.warn(e); }
+    }
+    DB = base;
+  },
+  _pending: new Set(), _timer: null,
+  save(...keys) {
+    (keys.length ? keys : DATASETS).forEach(k => this._pending.add(k));
+    clearTimeout(this._timer);
+    setSaveInfo('Salvando…', 'text-amber-600');
+    this._timer = setTimeout(() => this.flush(), 600);
+  },
+  async flush() {
+    const keys = [...this._pending]; this._pending.clear();
+    try {
+      if (this.mode === 'firebase') {
+        const batch = fsdb.batch();
+        keys.forEach(k => {
+          const v = k === 'meta' ? { estoqueAtualizadoEm: DB.estoqueAtualizadoEm } : DB[k];
+          batch.set(fsdb.collection(COLECAO).doc(k), { v: JSON.parse(JSON.stringify(v ?? null)), em: firebase.firestore.FieldValue.serverTimestamp(), por: user?.email || '' });
+        });
+        await batch.commit();
+      } else {
+        localStorage.setItem(LOCAL_KEY, JSON.stringify(DB));
+      }
+      setSaveInfo('Salvo ✓', 'text-emerald-600');
+    } catch (e) { console.error(e); setSaveInfo('Erro ao salvar: ' + e.message, 'text-red-600'); }
+  }
+};
+function setSaveInfo(t, cls) { const el = document.getElementById('saveInfo'); el.textContent = t; el.className = cls; }
+
+/* ================= HELPERS ================= */
+const nf0 = new Intl.NumberFormat('pt-BR', { maximumFractionDigits: 0 });
+const nf1 = new Intl.NumberFormat('pt-BR', { maximumFractionDigits: 1 });
+const nf2 = new Intl.NumberFormat('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const brl = new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL', maximumFractionDigits: 0 });
+const f0 = v => (v === null || v === undefined || v === '' || isNaN(v)) ? '–' : nf0.format(v);
+const f1 = v => (v === null || v === undefined || v === '' || isNaN(v)) ? '–' : nf1.format(v);
+const fd = s => { if (!s) return '–'; const [y, m, d] = s.split('-'); return `${d}/${m}/${y.slice(2)}`; };
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const uid = p => p + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+const STATUS_LBL = { atrasado: 'Atrasado', comprar: 'Comprar agora', planejar: 'Planejar', ok: 'OK', sem_demanda: 'Sem demanda' };
+const badge = s => `<span class="badge b-${s}">${STATUS_LBL[s] || s}</span>`;
+const ORD_STATUS = ['Planejada', 'Simulação', 'Em produção', 'Em trânsito', 'Recebido', 'Cancelado'];
+const ordBadge = s => { const m = { 'Planejada': 'bg-violet-100 text-violet-700', 'Simulação': 'bg-slate-100 text-slate-600', 'Em produção': 'bg-amber-100 text-amber-700', 'Em trânsito': 'bg-sky-100 text-sky-700', 'Recebido': 'bg-emerald-100 text-emerald-700', 'Cancelado': 'bg-red-100 text-red-600' }; return `<span class="badge ${m[s] || 'bg-slate-100'}">${esc(s)}</span>`; };
+function toast(msg, ms = 2500) { const t = document.getElementById('toast'); t.textContent = msg; t.style.opacity = 1; clearTimeout(t._h); t._h = setTimeout(() => t.style.opacity = 0, ms); }
+function openModal(title, html, width = 'max-w-5xl') { document.getElementById('modalTitle').innerHTML = title; document.getElementById('modalBody').innerHTML = html; const b = document.getElementById('modalBox'); b.className = 'bg-white rounded-xl shadow-2xl w-full mx-4 ' + width; document.getElementById('modal').classList.remove('hidden'); }
+function closeModal() { document.getElementById('modal').classList.add('hidden'); Object.keys(charts).filter(k => k.startsWith('m_')).forEach(k => { charts[k].destroy(); delete charts[k]; }); }
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+const uniq = arr => [...new Set(arr.filter(Boolean))].sort((a, b) => String(a).localeCompare(String(b)));
+const opt = (v, sel, lbl) => `<option value="${esc(v)}" ${String(v) === String(sel) ? 'selected' : ''}>${esc(lbl ?? v)}</option>`;
+function hoje() { return R?.opts.today || C.todayISO(); }
+function sortRows(key, rows, getters) {
+  const s = ui.sort[key]; if (!s || !getters[s.col]) return rows;
+  const g = getters[s.col];
+  return [...rows].sort((a, b) => { let x = g(a), y = g(b); if (x === null || x === undefined || x === '') x = s.dir > 0 ? Infinity : -Infinity; if (y === null || y === undefined || y === '') y = s.dir > 0 ? Infinity : -Infinity; return (x > y ? 1 : x < y ? -1 : 0) * s.dir; });
+}
+function th(key, col, label, cls = '') { const s = ui.sort[key]; const arrow = s && s.col === col ? (s.dir > 0 ? ' ▲' : ' ▼') : ''; return `<th class="px-2 py-2 font-semibold text-slate-600 cursor-pointer select-none hover:text-sky-700 ${cls}" onclick="setSort('${key}','${col}')">${label}${arrow}</th>`; }
+function setSort(key, col) { const s = ui.sort[key]; ui.sort[key] = s && s.col === col ? { col, dir: -s.dir } : { col, dir: 1 }; render(); }
+function download(name, content, type = 'application/json') { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([content], { type })); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); }
+
+/* ================= CÁLCULO ================= */
+function recalc() { R = C.computeAll(DB); }
+function prodByCod(cod) { return DB.produtos.find(p => p.cod === cod); }
+
+/* ================= NAVEGAÇÃO ================= */
+const ICON = {
+  painel: 'M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z',
+  mrp: 'M3 3v18h18M7 15l4-4 3 3 5-6',
+  sugestoes: 'M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.3 2.3c-.6.6-.2 1.7.7 1.7H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z',
+  ordens: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4',
+  embarques: 'M3 17l2 3h14l2-3M5 17V9h14v8M9 9V5h6v4',
+  previsao: 'M7 12l3-3 3 3 4-4M8 21l4-4 4 4M3 4h18M4 4h16v12a1 1 0 01-1 1H5a1 1 0 01-1-1V4z',
+  cadastros: 'M4 6h16M4 10h16M4 14h16M4 18h16',
+  importar: 'M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12',
+  ia: 'M9.7 17L9 20l-1 1h8l-1-1-.8-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z',
+  config: 'M10.3 4.3c.4-1.8 3-1.8 3.4 0a1.7 1.7 0 002.6 1.1c1.5-.9 3.3.8 2.4 2.4a1.7 1.7 0 001 2.5c1.8.5 1.8 3 0 3.5a1.7 1.7 0 00-1 2.5c.9 1.5-.9 3.3-2.4 2.4a1.7 1.7 0 00-2.6 1c-.4 1.8-3 1.8-3.4 0a1.7 1.7 0 00-2.6-1c-1.5.9-3.3-.9-2.4-2.4a1.7 1.7 0 00-1-2.5c-1.8-.5-1.8-3 0-3.5a1.7 1.7 0 001-2.5c-.9-1.6.9-3.3 2.4-2.4 1 .6 2.3.1 2.6-1.1zM15 12a3 3 0 11-6 0 3 3 0 016 0z'
+};
+const PAGES = [
+  ['painel', 'Painel'], ['mrp', 'MRP por item'], ['sugestoes', 'Sugestões de compra'], ['ordens', 'Ordens de compra'], ['embarques', 'Embarques'],
+  ['previsao', 'Previsão de demanda'], ['cadastros', 'Cadastros'], ['importar', 'Importar / Exportar'], ['ia', 'Assistente IA'], ['config', 'Configurações']
+];
+function renderNav() {
+  document.getElementById('nav').innerHTML = PAGES.map(([k, l]) => {
+    let extra = '';
+    if (k === 'sugestoes' && R) { const n = R.itens.filter(x => x.status === 'atrasado' || x.status === 'comprar').length; if (n) extra = `<span class="ml-auto bg-red-500 text-white text-[10px] rounded-full px-1.5">${n}</span>`; }
+    return `<button class="nav-btn w-full flex items-center gap-2.5 px-3 py-2 rounded-lg hover:bg-slate-800 hover:text-white text-left ${page === k ? 'active' : ''}" onclick="go('${k}')">
+    <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="${ICON[k]}"/></svg><span>${l}</span>${extra}</button>`;
+  }).join('');
+}
+function go(p) { page = p; location.hash = p; render(); }
+function render() {
+  Object.keys(charts).filter(k => !k.startsWith('m_')).forEach(k => { charts[k].destroy(); delete charts[k]; });
+  renderNav();
+  const t = PAGES.find(x => x[0] === page); document.getElementById('pageTitle').textContent = t ? t[1] : '';
+  document.getElementById('pageSub').textContent = '';
+  document.getElementById('emptyBanner').classList.toggle('hidden', DB.produtos.length > 0 || page === 'importar');
+  const base = DB.settings.dataBase ? `<span class="text-amber-600 font-semibold">Data-base simulada: ${fd(DB.settings.dataBase)}</span>` : `Data-base: hoje (${fd(hoje())})`;
+  document.getElementById('baseInfo').innerHTML = base + (DB.estoqueAtualizadoEm ? ` · Estoque atualizado em ${fd(DB.estoqueAtualizadoEm)}` : (DB.produtos.length ? ' · <span class="text-amber-600">Estoque da planilha importada</span>' : ''));
+  document.getElementById('modeInfo').innerHTML = Store.mode === 'firebase' ? '<span class="text-emerald-400">● Nuvem (Firebase)</span>' : '<span class="text-amber-400">● Modo local (este navegador)</span>';
+  const fn = { painel: pgPainel, mrp: pgMRP, sugestoes: pgSugestoes, ordens: pgOrdens, embarques: pgEmbarques, previsao: pgPrevisao, cadastros: pgCadastros, importar: pgImportar, ia: pgIA, config: pgConfig }[page] || pgPainel;
+  fn(document.getElementById('page'));
+}
+function changed(...keys) { recalc(); Store.save(...keys); render(); }
+
+/* ================= PAINEL ================= */
+function kpi(label, value, sub = '', color = 'text-slate-800', onclick = '') {
+  return `<div class="bg-white rounded-xl p-4 shadow-sm border ${onclick ? 'cursor-pointer hover:border-sky-300' : ''}" ${onclick ? `onclick="${onclick}"` : ''}><div class="text-xs text-slate-500">${label}</div><div class="text-2xl font-bold ${color} mt-1">${value}</div><div class="text-[11px] text-slate-400 mt-0.5">${sub}</div></div>`;
+}
+function pgPainel(el) {
+  if (!DB.produtos.length) { el.innerHTML = ''; return; }
+  const I = R.itens, t = hoje();
+  const atras = I.filter(x => x.status === 'atrasado'), comprar = I.filter(x => x.status === 'comprar'), plan = I.filter(x => x.status === 'planejar');
+  const zerados = I.filter(x => C.num(x.produto.estoque) <= 0 && x.avg30 > 0);
+  const rupt30 = I.filter(x => x.rupturaDia >= 0 && x.rupturaDia <= 30);
+  const abertas = DB.ordens.filter(o => !['Recebido', 'Cancelado'].includes(o.status));
+  const transito = abertas.filter(o => o.status === 'Em trânsito');
+  const valOrd = os => os.reduce((s, o) => { const p = prodByCod(o.item); const cu = C.num(o.custoUnit) || C.num(p?.custo); const mo = o.custoUnit ? o.moeda : p?.moeda; return s + (C.num(o.qtd) - C.num(o.qtdRecebida)) * cu * C.num(DB.settings.cambio[mo || 'USD'] ?? 1); }, 0);
+  const estoqueValor = I.reduce((s, x) => s + x.estoqueValor, 0);
+  const prox = abertas.map(o => ({ o, d: o.dataChegada })).filter(x => x.d).sort((a, b) => a.d.localeCompare(b.d));
+  const proxPO = {}; prox.forEach(({ o }) => { const k = (o.po || '—') + '|' + o.fornecedor; if (!proxPO[k]) proxPO[k] = { po: o.po, forn: o.fornecedor, chegada: o.dataChegada, status: o.status, itens: 0, qtd: 0 }; proxPO[k].itens++; proxPO[k].qtd += C.num(o.qtd) - C.num(o.qtdRecebida); });
+  const proxList = Object.values(proxPO).sort((a, b) => a.chegada.localeCompare(b.chegada)).slice(0, 8);
+  const riscos = I.filter(x => x.ruptura).sort((a, b) => a.rupturaDia - b.rupturaDia).slice(0, 12);
+  el.innerHTML = `
+  <div class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
+    ${kpi('Itens planejados', f0(I.length), `${DB.previsao.length} produtos de venda`)}
+    ${kpi('Pedido atrasado', f0(atras.length), 'já passou da data ideal de compra', 'text-red-600', "ui.sugFiltro.status='atrasado';go('sugestoes')")}
+    ${kpi('Comprar em 7 dias', f0(comprar.length), `+ ${plan.length} para planejar (30 dias)`, 'text-orange-600', "ui.sugFiltro.status='acao';go('sugestoes')")}
+    ${kpi('Ruptura em 30 dias', f0(rupt30.length), `${zerados.length} já sem estoque`, 'text-rose-600', "ui.mrpFiltro.status='ruptura30';go('mrp')")}
+    ${kpi('Em aberto (ordens)', brl.format(valOrd(abertas)), `${uniq(abertas.map(o => o.po)).length} POs · ${brl.format(valOrd(transito))} em trânsito`, 'text-sky-700', "go('ordens')")}
+    ${kpi('Estoque (custo)', brl.format(estoqueValor), 'custo FOB × câmbio')}
+  </div>
+  <div class="grid grid-cols-1 xl:grid-cols-3 gap-4 mt-4">
+    <div class="bg-white rounded-xl shadow-sm border p-4 xl:col-span-2">
+      <div class="font-semibold mb-2">Itens com ruptura mais próxima</div>
+      <div class="scroll-x"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="px-2 py-1.5">Item</th><th class="px-2">Família</th><th class="px-2 num">Estoque</th><th class="px-2 num">Dem./dia</th><th class="px-2">Ruptura</th><th class="px-2">Próx. chegada</th><th class="px-2">Status</th></tr></thead><tbody>
+      ${riscos.map(x => { const pc = x.abertas.slice().sort((a, b) => a.chegadaEfetiva.localeCompare(b.chegadaEfetiva))[0]; return `<tr class="border-t hover:bg-sky-50 cursor-pointer" onclick="openItem('${esc(x.cod)}')"><td class="px-2 py-1.5 font-medium">${esc(x.cod)}</td><td class="px-2">${esc(x.produto.familia)}</td><td class="px-2 num">${f0(x.produto.estoque)}</td><td class="px-2 num">${f1(x.avg30)}</td><td class="px-2 ${x.rupturaDia <= 30 ? 'text-red-600 font-semibold' : ''}">${fd(x.ruptura)} <span class="text-slate-400">(${x.rupturaDia}d)</span></td><td class="px-2">${pc ? fd(pc.chegadaEfetiva) + ' · ' + f0(pc.aberto) : '–'}</td><td class="px-2">${badge(x.status)}</td></tr>`; }).join('') || '<tr><td class="p-3 text-slate-400" colspan=7>Nenhuma ruptura no horizonte 🎉</td></tr>'}
+      </tbody></table></div>
+    </div>
+    <div class="bg-white rounded-xl shadow-sm border p-4">
+      <div class="font-semibold mb-2">Situação dos itens</div>
+      <div class="h-56"><canvas id="chStatus"></canvas></div>
+    </div>
+  </div>
+  <div class="grid grid-cols-1 xl:grid-cols-3 gap-4 mt-4">
+    <div class="bg-white rounded-xl shadow-sm border p-4">
+      <div class="font-semibold mb-2">Próximas chegadas (por PO)</div>
+      <table class="w-full text-xs"><tbody>
+      ${proxList.map(p => `<tr class="border-t"><td class="py-1.5 ${p.chegada < t ? 'text-red-600 font-semibold' : ''}">${fd(p.chegada)}</td><td>${esc(p.po || '—')}<div class="text-slate-400">${esc(p.forn)}</div></td><td class="num">${p.itens} itens<div class="text-slate-400">${f0(p.qtd)} pç</div></td><td class="pl-2">${ordBadge(p.status)}</td></tr>`).join('') || '<tr><td class="text-slate-400 py-2">Sem ordens em aberto</td></tr>'}
+      </tbody></table>
+      ${prox.some(x => x.d < t) ? '<div class="text-[11px] text-red-600 mt-2">Datas em vermelho já passaram e o item não foi marcado como recebido — o cálculo considera que chegam hoje.</div>' : ''}
+    </div>
+    <div class="bg-white rounded-xl shadow-sm border p-4 xl:col-span-2">
+      <div class="font-semibold mb-2">Cobertura média por família (dias de estoque atual)</div>
+      <div class="h-64"><canvas id="chFam"></canvas></div>
+    </div>
+  </div>`;
+  const cnt = k => I.filter(x => x.status === k).length;
+  charts.st = new Chart(document.getElementById('chStatus'), { type: 'doughnut', data: { labels: ['Atrasado', 'Comprar agora', 'Planejar', 'OK', 'Sem demanda'], datasets: [{ data: ['atrasado', 'comprar', 'planejar', 'ok', 'sem_demanda'].map(cnt), backgroundColor: ['#ef4444', '#f97316', '#eab308', '#22c55e', '#cbd5e1'] }] }, options: { maintainAspectRatio: false, plugins: { legend: { position: 'right' } } } });
+  const fams = uniq(I.map(x => x.produto.familia));
+  const famData = fams.map(f => { const xs = I.filter(x => x.produto.familia === f && x.avg30 > 0); const s = xs.reduce((a, x) => a + C.num(x.produto.estoque), 0), d = xs.reduce((a, x) => a + x.avg30, 0); return d ? Math.round(s / d) : 0; });
+  charts.fam = new Chart(document.getElementById('chFam'), { type: 'bar', data: { labels: fams, datasets: [{ label: 'dias', data: famData, backgroundColor: famData.map(v => v < 60 ? '#f97316' : v < 120 ? '#0ea5e9' : '#94a3b8') }] }, options: { maintainAspectRatio: false, indexAxis: 'y', plugins: { legend: { display: false } } } });
+}
+
+/* ================= MRP POR ITEM ================= */
+function pgMRP(el) {
+  const F = ui.mrpFiltro;
+  let rows = R ? R.itens : [];
+  const q = F.q.toLowerCase();
+  rows = rows.filter(x => (!q || (x.cod + ' ' + x.produto.desc).toLowerCase().includes(q)) && (!F.familia || x.produto.familia === F.familia) && (!F.fornecedor || x.produto.fornecedor === F.fornecedor)
+    && (!F.status || (F.status === 'ruptura30' ? (x.rupturaDia >= 0 && x.rupturaDia <= 30) : F.status === 'ruptura' ? x.rupturaDia >= 0 : x.status === F.status)));
+  rows = sortRows('mrp', rows, { cod: x => x.cod, fam: x => x.produto.familia, forn: x => x.produto.fornecedor, est: x => C.num(x.produto.estoque), dem: x => x.avg30, dias: x => x.diasEstoque, aberto: x => x.totalAberto, rupt: x => x.rupturaDia >= 0 ? x.rupturaDia : 99999, ped: x => x.prox ? x.prox.dataPedidoIdeal : 'zzz', qtd: x => x.prox?.qtd, st: x => ['atrasado', 'comprar', 'planejar', 'ok', 'sem_demanda'].indexOf(x.status) });
+  if (!ui.sort.mrp) rows = [...rows].sort((a, b) => (a.rupturaDia >= 0 ? a.rupturaDia : 99999) - (b.rupturaDia >= 0 ? b.rupturaDia : 99999));
+  el.innerHTML = `
+  <div class="flex flex-wrap gap-2 mb-3 items-center">
+    <input id="fq" placeholder="Buscar código ou descrição" value="${esc(F.q)}" class="border rounded-lg px-3 py-1.5 w-64">
+    <select id="ffam" class="border rounded-lg px-2 py-1.5"><option value="">Todas as famílias</option>${uniq(DB.produtos.map(p => p.familia)).map(f => opt(f, F.familia)).join('')}</select>
+    <select id="fforn" class="border rounded-lg px-2 py-1.5"><option value="">Todos os fornecedores</option>${uniq(DB.produtos.map(p => p.fornecedor)).map(f => opt(f, F.fornecedor)).join('')}</select>
+    <select id="fst" class="border rounded-lg px-2 py-1.5">${[['', 'Todas as situações'], ['ruptura30', 'Ruptura em 30 dias'], ['ruptura', 'Com ruptura no horizonte'], ['atrasado', 'Pedido atrasado'], ['comprar', 'Comprar agora'], ['planejar', 'Planejar'], ['ok', 'OK'], ['sem_demanda', 'Sem demanda']].map(([v, l]) => opt(v, F.status, l)).join('')}</select>
+    <span class="text-slate-500 text-xs ml-1">${rows.length} itens</span>
+    <button onclick="exportMRP()" class="ml-auto border rounded-lg px-3 py-1.5 bg-white hover:bg-slate-50">Exportar Excel</button>
+  </div>
+  <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 190px)"><table class="w-full tbl text-xs">
+  <thead><tr class="text-left">${th('mrp', 'cod', 'Item')}${th('mrp', 'fam', 'Família')}${th('mrp', 'forn', 'Fornecedor')}${th('mrp', 'est', 'Estoque', 'num')}${th('mrp', 'dem', 'Dem./dia', 'num')}${th('mrp', 'dias', 'Dias estoque', 'num')}${th('mrp', 'aberto', 'Em aberto', 'num')}${th('mrp', 'rupt', 'Ruptura projetada')}${th('mrp', 'ped', 'Pedir até')}${th('mrp', 'qtd', 'Qtd sugerida', 'num')}<th class="px-2">Chegada sugerida</th>${th('mrp', 'st', 'Situação')}</tr></thead>
+  <tbody>${rows.map(x => `<tr class="border-t hover:bg-sky-50 cursor-pointer" onclick="openItem('${esc(x.cod)}')">
+    <td class="px-2 py-1.5"><div class="font-semibold">${esc(x.cod)}</div><div class="text-slate-400 truncate max-w-[260px]" title="${esc(x.produto.desc)}">${esc(x.produto.desc)}</div></td>
+    <td class="px-2">${esc(x.produto.familia)}</td><td class="px-2">${esc(x.produto.fornecedor)}</td>
+    <td class="px-2 num ${C.num(x.produto.estoque) <= 0 ? 'text-red-600 font-semibold' : ''}">${f0(x.produto.estoque)}</td>
+    <td class="px-2 num">${f1(x.avg30)}</td><td class="px-2 num">${x.diasEstoque === null ? '–' : (x.diasEstoque >= R.opts.horizonte ? '>' + R.opts.horizonte : f0(x.diasEstoque))}</td>
+    <td class="px-2 num">${x.totalAberto ? f0(x.totalAberto) : '–'}${x.atrasadas ? ' <span class="text-red-500" title="chegada vencida">⚠</span>' : ''}</td>
+    <td class="px-2 ${x.rupturaDia >= 0 && x.rupturaDia <= 30 ? 'text-red-600 font-semibold' : ''}">${x.ruptura ? fd(x.ruptura) + ` <span class="text-slate-400">(${x.rupturaDia}d)</span>` : '<span class="text-slate-400">sem ruptura</span>'}</td>
+    <td class="px-2 ${x.prox?.atrasado ? 'text-red-600 font-semibold' : ''}">${x.prox ? fd(x.prox.dataPedidoIdeal) : '–'}</td>
+    <td class="px-2 num font-semibold">${x.prox ? f0(x.prox.qtd) : '–'}</td><td class="px-2">${x.prox ? fd(x.prox.dataChegada) : '–'}</td>
+    <td class="px-2">${badge(x.status)}</td></tr>`).join('')}</tbody></table></div>`;
+  const bind = (id, k) => document.getElementById(id).addEventListener(id === 'fq' ? 'input' : 'change', e => { F[k] = e.target.value; if (id === 'fq') { clearTimeout(bind._t); bind._t = setTimeout(() => { render(); const i = document.getElementById('fq'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }, 250); } else render(); });
+  bind('fq', 'q'); bind('ffam', 'familia'); bind('fforn', 'fornecedor'); bind('fst', 'status');
+}
+
+/* ===== Detalhe do item ===== */
+function openItem(cod) {
+  const x = R.byCod.get(cod); if (!x) return;
+  const p = x.produto, t = R.opts.today, H = R.opts.horizonte;
+  // semanas
+  const weeks = [];
+  const planArr = new Array(H + 1).fill(0); x.plano.forEach(pl => { const d = C.diffDays(t, pl.dataChegada); if (d >= 0 && d <= H) planArr[d] += pl.qtd; });
+  let sPlan = C.num(p.estoque);
+  const SP = []; for (let d = 0; d <= H; d++) { sPlan = Math.max(0, sPlan + x.arr[d] + planArr[d] - x.rates[d]); SP.push(sPlan); }
+  for (let w = 0; w * 7 <= H; w++) {
+    const a = w * 7, b = Math.min(H, a + 6);
+    let dem = 0, che = 0, sug = 0, falta = 0; for (let d = a; d <= b; d++) { dem += x.rates[d]; che += x.arr[d]; sug += planArr[d]; falta += x.lost[d]; }
+    weeks.push({ ini: C.addDays(t, a), dem, che, sug, falta, fim: x.S[b], fimPlan: SP[b] });
+  }
+  const ssQ = x.prm.seg * x.avg30;
+  const parents = DB.estrutura.filter(e => e.mp === cod);
+  openModal(`${esc(cod)} <span class="font-normal text-slate-500 text-sm">· ${esc(p.desc)}</span>`, `
+  <div class="grid grid-cols-2 md:grid-cols-6 gap-2 mb-4 text-xs">
+    ${[['Estoque', f0(p.estoque)], ['Demanda/dia (30d)', f1(x.avg30)], ['Dias de estoque', x.diasEstoque === null ? '–' : f0(x.diasEstoque)], ['Em aberto', f0(x.totalAberto)], ['Ruptura projetada', x.ruptura ? fd(x.ruptura) : 'sem ruptura'], ['Situação', badge(x.status)]].map(([l, v]) => `<div class="bg-slate-50 rounded-lg p-2"><div class="text-slate-500">${l}</div><div class="font-bold text-base">${v}</div></div>`).join('')}
+  </div>
+  <div class="h-64 mb-4"><canvas id="chItem"></canvas></div>
+  <div class="grid md:grid-cols-2 gap-4">
+    <div>
+      <div class="font-semibold mb-1">Parâmetros de compra</div>
+      <div class="grid grid-cols-3 gap-2 text-xs">
+        ${[['leadTime', 'Lead time produção (d)', x.prm.leadTime], ['transitTime', 'Trânsito (d)', x.prm.transitTime], ['multiplo', 'Múltiplo de compra', x.prm.mult], ['segurancaDias', 'Estoque segurança (dias)', x.prm.seg], ['coberturaDias', 'Cobertura por pedido (dias)', x.prm.cob], ['estoque', 'Estoque atual', p.estoque]].map(([k, l, v]) => `<label class="block"><span class="text-slate-500">${l}</span><input type="number" step="any" class="w-full border rounded px-2 py-1" value="${v ?? ''}" onchange="setItemParam('${esc(cod)}','${k}',this.value)"></label>`).join('')}
+      </div>
+      ${(p.cotacoes || []).length > 1 ? `<div class="text-[11px] text-slate-600 mt-2">Cotações: ${p.cotacoes.map(c => `<span class="${c.fornecedor === p.fornecedor ? 'font-semibold' : ''}">${esc(c.fornecedor)} ${c.moeda} ${nf2.format(c.custo)}</span>`).join(' · ')}</div>` : ''}
+      <div class="text-[11px] text-slate-400 mt-1">Lead time total considerado: ${x.prm.LT} dias (produção + trânsito${x.prm.desembaraco ? ' + desembaraço' : ''}). Estoque de segurança ≈ ${f0(ssQ)} pç.</div>
+      <div class="font-semibold mt-4 mb-1">Plano de compras sugerido</div>
+      <table class="w-full text-xs"><thead><tr class="text-left text-slate-500"><th>Pedir até</th><th>Chegada</th><th class="num">Qtd</th><th></th></tr></thead><tbody>
+      ${x.plano.map((pl, i) => `<tr class="border-t"><td class="py-1 ${pl.atrasado ? 'text-red-600 font-semibold' : ''}">${fd(pl.dataPedidoIdeal)}${pl.atrasado ? ' (atrasado)' : ''}</td><td>${fd(pl.dataChegada)}${pl.rupturaAntes ? ' <span class="text-red-500" title="há falta antes desta chegada">⚠</span>' : ''}</td><td class="num font-semibold">${f0(pl.qtd)}</td><td class="text-right">${i === 0 ? `<button class="text-sky-700 underline" onclick="criarPlanejada(['${esc(cod)}'])">criar ordem</button>` : ''}</td></tr>`).join('') || '<tr><td class="text-slate-400 py-1" colspan=4>Nenhuma compra necessária no horizonte</td></tr>'}
+      </tbody></table>
+      ${x.prox?.faltaAntes >= 1 ? `<div class="mt-2 text-[11px] text-red-600">Mesmo comprando hoje, faltam ≈ ${f0(x.prox.faltaAntes)} pç até a chegada (venda perdida). Avalie embarque aéreo, antecipar uma PO em aberto ou substituto.</div>` : ''}
+      <div class="font-semibold mt-4 mb-1">Ordens em aberto</div>
+      <table class="w-full text-xs"><tbody>${x.abertas.map(o => `<tr class="border-t"><td class="py-1">${esc(o.po || '—')}</td><td>${ordBadge(o.status)}</td><td>${fd(o.dataChegada)}${o.dataChegada && o.dataChegada < t ? ' <span class="text-red-500">vencida</span>' : ''}</td><td class="num">${f0(o.aberto)}</td></tr>`).join('') || '<tr><td class="text-slate-400 py-1">Nenhuma</td></tr>'}</tbody></table>
+      <div class="font-semibold mt-4 mb-1">Usado nos produtos de venda</div>
+      <div class="text-xs text-slate-600">${parents.map(e => { const f = DB.previsao.find(z => z.pa === e.pa); return `<span class="inline-block bg-slate-100 rounded px-2 py-0.5 mr-1 mb-1">${esc(e.pa)} ×${e.qtd}${f ? ` · ${f1(f.padrao)}/dia` : ''}</span>`; }).join('') || (DB.previsao.some(f => f.pa === cod) ? 'Vendido diretamente (previsão própria)' : 'Sem vínculo com produto de venda — sem demanda')}</div>
+    </div>
+    <div>
+      <div class="font-semibold mb-1">Projeção semanal</div>
+      <div class="scroll-x" style="max-height:420px"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="px-1 py-1">Semana</th><th class="px-1 num">Demanda</th><th class="px-1 num">Chegadas</th><th class="px-1 num">Sugerido</th><th class="px-1 num">Estoque fim</th><th class="px-1 num" title="Demanda não atendida (venda perdida) com as ordens atuais">Falta</th><th class="px-1 num">c/ sugestão</th></tr></thead><tbody>
+      ${weeks.map(w => `<tr class="border-t"><td class="px-1 py-0.5">${fd(w.ini)}</td><td class="px-1 num">${f0(w.dem)}</td><td class="px-1 num ${w.che ? 'text-sky-700 font-semibold' : ''}">${w.che ? f0(w.che) : ''}</td><td class="px-1 num ${w.sug ? 'text-violet-700 font-semibold' : ''}">${w.sug ? f0(w.sug) : ''}</td><td class="px-1 num ${w.fim <= 0 && w.dem > 0 ? 'text-red-600 font-semibold' : ''}">${f0(w.fim)}</td><td class="px-1 num text-red-600">${w.falta >= 0.5 ? f0(w.falta) : ''}</td><td class="px-1 num text-slate-500">${f0(w.fimPlan)}</td></tr>`).join('')}
+      </tbody></table></div>
+    </div>
+  </div>`, 'max-w-6xl');
+  const labels = [], s1 = [], s2 = [], ar = [], ss = [];
+  for (let d = 0; d <= H; d += 1) { labels.push(fd(C.addDays(t, d))); s1.push(Math.round(x.S[d])); s2.push(Math.round(SP[d])); ar.push(x.arr[d] + planArr[d] || null); ss.push(Math.round(ssQ)); }
+  charts.m_item = new Chart(document.getElementById('chItem'), {
+    data: { labels, datasets: [
+      { type: 'line', label: 'Estoque projetado (ordens atuais)', data: s1, borderColor: '#0ea5e9', pointRadius: 0, borderWidth: 2, tension: .1 },
+      { type: 'line', label: 'Com compras sugeridas', data: s2, borderColor: '#8b5cf6', borderDash: [5, 4], pointRadius: 0, borderWidth: 1.5 },
+      { type: 'line', label: 'Estoque de segurança', data: ss, borderColor: '#f59e0b', pointRadius: 0, borderWidth: 1, borderDash: [2, 3] },
+      { type: 'bar', label: 'Chegadas', data: ar, backgroundColor: '#10b981', barThickness: 4 }
+    ] },
+    options: { maintainAspectRatio: false, interaction: { mode: 'index', intersect: false }, scales: { x: { ticks: { maxTicksLimit: 12 } } }, plugins: { legend: { labels: { boxWidth: 12, font: { size: 11 } } } } }
+  });
+}
+function setItemParam(cod, k, v) {
+  const p = prodByCod(cod); if (!p) return;
+  p[k] = v === '' ? null : Number(v);
+  if (k === 'estoque') DB.estoqueAtualizadoEm = C.todayISO();
+  recalc(); Store.save('produtos', 'meta'); openItem(cod); renderNav();
+}
+
+/* ================= SUGESTÕES ================= */
+function sugRows() {
+  const F = ui.sugFiltro, t = R.opts.today;
+  return R.itens.filter(x => x.prox && (F.status === 'todos' ? true : F.status === 'acao' ? ['atrasado', 'comprar'].includes(x.status) : F.status === 'janela' ? C.diffDays(t, x.prox.dataPedidoIdeal) <= F.janela : x.status === F.status) && (!F.fornecedor || x.produto.fornecedor === F.fornecedor));
+}
+function pgSugestoes(el) {
+  const F = ui.sugFiltro;
+  if (!R || !R.itens.length) { el.innerHTML = ''; return; }
+  const rows = sugRows();
+  const cbmCont = C.num(DB.settings.cbmContainer) || 68;
+  const groups = {}; rows.forEach(x => { const k = x.produto.fornecedor || '(sem fornecedor)'; (groups[k] = groups[k] || []).push(x); });
+  ui.sugQtd = ui.sugQtd || {};
+  const q = x => ui.sugQtd[x.cod] ?? x.prox.qtd;
+  el.innerHTML = `
+  <div class="flex flex-wrap gap-2 mb-3 items-center">
+    <select id="sst" class="border rounded-lg px-2 py-1.5">${[['acao', 'Ação imediata (atrasado + 7 dias)'], ['atrasado', 'Somente atrasados'], ['janela', 'Pedir nos próximos N dias'], ['todos', 'Todas as sugestões do horizonte']].map(([v, l]) => opt(v, F.status, l)).join('')}</select>
+    ${F.status === 'janela' ? `<input id="sjan" type="number" value="${F.janela}" class="border rounded-lg px-2 py-1.5 w-20"> dias` : ''}
+    <select id="sforn" class="border rounded-lg px-2 py-1.5"><option value="">Todos os fornecedores</option>${uniq(DB.produtos.map(p => p.fornecedor)).map(f => opt(f, F.fornecedor)).join('')}</select>
+    <span class="text-xs text-slate-500">${rows.length} itens · cobertura padrão ${DB.settings.coberturaDias} dias · segurança ${DB.settings.segurancaDias} dias</span>
+    <div class="ml-auto flex gap-2">
+      <button onclick="exportSug()" class="border rounded-lg px-3 py-1.5 bg-white hover:bg-slate-50">Exportar Excel</button>
+      <button onclick="criarPlanejada([...document.querySelectorAll('.sugck:checked')].map(c=>c.value))" class="rounded-lg px-3 py-1.5 bg-violet-600 text-white hover:bg-violet-700">Criar ordens planejadas (selecionados)</button>
+    </div>
+  </div>
+  <div class="text-[11px] text-slate-500 mb-3">A quantidade sugerida cobre a demanda de <b>cobertura</b> dias após a chegada + estoque de segurança, descontando o estoque projetado, arredondada para o múltiplo de compra. Você pode ajustar a quantidade antes de criar a ordem.</div>
+  ${Object.keys(groups).sort().map(g => {
+    const xs = groups[g].sort((a, b) => a.prox.dataPedidoIdeal.localeCompare(b.prox.dataPedidoIdeal));
+    const cbm = xs.reduce((s, x) => s + q(x) * x.cbmUn, 0), val = xs.reduce((s, x) => s + q(x) * x.custoBRL, 0);
+    const f = DB.fornecedores.find(z => z.nome === g);
+    return `<div class="bg-white rounded-xl shadow-sm border mb-4">
+    <div class="flex flex-wrap items-center gap-4 px-4 py-2.5 border-b bg-slate-50 rounded-t-xl">
+      <label class="flex items-center gap-2 font-bold"><input type="checkbox" onchange="this.closest('.rounded-xl').querySelectorAll('.sugck').forEach(c=>c.checked=this.checked)"> ${esc(g)}</label>
+      <span class="text-xs text-slate-500">${xs.length} itens · LT ${f?.leadTime ?? DB.settings.leadTimePadrao}+${f?.transitTime ?? DB.settings.transitPadrao} dias</span>
+      <span class="ml-auto text-xs"><b>${f1(cbm)} m³</b> ≈ ${nf2.format(cbm / cbmCont)} container(s) · <b>${brl.format(val)}</b></span>
+    </div>
+    <div class="scroll-x"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="w-8"></th><th class="px-2 py-1.5">Item</th><th class="px-2 num">Estoque</th><th class="px-2 num">Dem./dia</th><th class="px-2 num">Em aberto</th><th class="px-2">Ruptura</th><th class="px-2">Pedir até</th><th class="px-2">Chegada</th><th class="px-2 num">Qtd sugerida</th><th class="px-2 num">m³</th><th class="px-2 num">Valor</th><th class="px-2">Situação</th></tr></thead><tbody>
+    ${xs.map(x => `<tr class="border-t hover:bg-sky-50"><td class="text-center"><input type="checkbox" class="sugck" value="${esc(x.cod)}"></td>
+      <td class="px-2 py-1.5 cursor-pointer" onclick="openItem('${esc(x.cod)}')"><div class="font-semibold text-sky-800">${esc(x.cod)}</div><div class="text-slate-400 truncate max-w-[240px]">${esc(x.produto.desc)}</div></td>
+      <td class="px-2 num">${f0(x.produto.estoque)}</td><td class="px-2 num">${f1(x.avg30)}</td><td class="px-2 num">${x.totalAberto ? f0(x.totalAberto) : '–'}</td>
+      <td class="px-2">${x.ruptura ? fd(x.ruptura) : '–'}</td><td class="px-2 ${x.prox.atrasado ? 'text-red-600 font-semibold' : ''}">${fd(x.prox.dataPedidoIdeal)}</td><td class="px-2">${fd(x.prox.dataChegada)}</td>
+      <td class="px-2 num"><input type="number" class="cell-input font-semibold" value="${q(x)}" onchange="ui.sugQtd['${esc(x.cod)}']=Number(this.value);render()"></td>
+      <td class="px-2 num">${x.cbmUn ? f1(q(x) * x.cbmUn) : '–'}</td><td class="px-2 num">${x.custoBRL ? brl.format(q(x) * x.custoBRL) : '–'}</td><td class="px-2">${badge(x.status)}</td></tr>`).join('')}
+    </tbody></table></div></div>`;
+  }).join('') || '<div class="bg-white rounded-xl border p-6 text-slate-500">Nenhuma sugestão para este filtro.</div>'}`;
+  document.getElementById('sst').onchange = e => { F.status = e.target.value; render(); };
+  document.getElementById('sforn').onchange = e => { F.fornecedor = e.target.value; render(); };
+  const j = document.getElementById('sjan'); if (j) j.onchange = e => { F.janela = Number(e.target.value) || 30; render(); };
+}
+function criarPlanejada(cods) {
+  if (!cods.length) { toast('Selecione ao menos um item'); return; }
+  const t = R.opts.today; let n = 0;
+  cods.forEach(cod => {
+    const x = R.byCod.get(cod); if (!x || !x.prox) return;
+    const qtd = (ui.sugQtd || {})[cod] ?? x.prox.qtd;
+    const dp = x.prox.dataPedido < t ? t : x.prox.dataPedido;
+    DB.ordens.push({ id: uid('po'), po: 'PLAN-' + t.replace(/-/g, '').slice(2), fornecedor: x.produto.fornecedor, item: cod, qtd, dataPedido: dp, leadTime: x.prm.leadTime, dataEmbarque: C.addDays(dp, x.prm.leadTime), transitTime: x.prm.transitTime, dataChegada: C.addDays(dp, x.prm.LT), qtdRecebida: 0, status: 'Planejada', custoUnit: C.num(x.produto.custo), moeda: x.produto.moeda, responsavel: user?.email || '', obs: 'Gerada pela sugestão do MRP' });
+    delete (ui.sugQtd || {})[cod]; n++;
+  });
+  closeModal(); changed('ordens'); toast(`${n} ordem(ns) planejada(s) criada(s). Veja em Ordens de compra.`);
+}
+
+/* ================= ORDENS ================= */
+function pgOrdens(el) {
+  const F = ui.ordFiltro, t = hoje();
+  let rows = DB.ordens.filter(o => (F.status === 'abertas' ? !['Recebido', 'Cancelado'].includes(o.status) : !F.status || o.status === F.status) && (!F.fornecedor || o.fornecedor === F.fornecedor) && (!F.q || (o.po + ' ' + o.item).toLowerCase().includes(F.q.toLowerCase())));
+  rows = sortRows('ord', rows, { po: o => o.po, forn: o => o.fornecedor, item: o => o.item, qtd: o => C.num(o.qtd), ped: o => o.dataPedido, emb: o => o.dataEmbarque, che: o => o.dataChegada, st: o => ORD_STATUS.indexOf(o.status) });
+  if (!ui.sort.ord) rows = [...rows].sort((a, b) => (a.dataChegada || 'z').localeCompare(b.dataChegada || 'z'));
+  el.innerHTML = `
+  <div class="flex flex-wrap gap-2 mb-3 items-center">
+    <input id="oq" placeholder="Buscar PO ou item" value="${esc(F.q)}" class="border rounded-lg px-3 py-1.5 w-56">
+    <select id="ost" class="border rounded-lg px-2 py-1.5">${opt('abertas', F.status, 'Em aberto')}${opt('', F.status, 'Todos os status')}${ORD_STATUS.map(s => opt(s, F.status)).join('')}</select>
+    <select id="ofo" class="border rounded-lg px-2 py-1.5"><option value="">Todos os fornecedores</option>${uniq(DB.ordens.map(o => o.fornecedor)).map(f => opt(f, F.fornecedor)).join('')}</select>
+    <span class="text-xs text-slate-500">${rows.length} linhas · ${f0(rows.reduce((s, o) => s + C.num(o.qtd) - C.num(o.qtdRecebida), 0))} pç em aberto</span>
+    <div class="ml-auto flex gap-2">
+      <button onclick="bulkStatus()" class="border rounded-lg px-3 py-1.5 bg-white hover:bg-slate-50">Alterar status dos selecionados</button>
+      <button onclick="editOrdem()" class="rounded-lg px-3 py-1.5 bg-sky-600 text-white hover:bg-sky-700">+ Nova linha de ordem</button>
+    </div>
+  </div>
+  <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 190px)"><table class="w-full tbl text-xs">
+  <thead><tr class="text-left"><th class="w-8 text-center"><input type="checkbox" onchange="document.querySelectorAll('.ordck').forEach(c=>c.checked=this.checked)"></th>${th('ord', 'po', 'PO')}${th('ord', 'forn', 'Fornecedor')}${th('ord', 'item', 'Item')}${th('ord', 'qtd', 'Qtd', 'num')}<th class="px-2 num">Recebido</th>${th('ord', 'ped', 'Pedido')}${th('ord', 'emb', 'Embarque')}${th('ord', 'che', 'Chegada')}<th class="px-2 num">Valor</th>${th('ord', 'st', 'Status')}<th></th></tr></thead>
+  <tbody>${rows.map(o => { const p = prodByCod(o.item); const cu = C.num(o.custoUnit) || C.num(p?.custo); const mo = o.custoUnit ? o.moeda : p?.moeda; const venc = o.dataChegada && o.dataChegada < t && !['Recebido', 'Cancelado'].includes(o.status);
+    return `<tr class="border-t hover:bg-sky-50"><td class="text-center"><input type="checkbox" class="ordck" value="${o.id}"></td><td class="px-2 py-1.5 font-medium">${esc(o.po || '—')}</td><td class="px-2">${esc(o.fornecedor)}</td>
+    <td class="px-2"><span class="text-sky-800 cursor-pointer hover:underline" onclick="openItem('${esc(o.item)}')">${esc(o.item)}</span></td><td class="px-2 num">${f0(o.qtd)}</td><td class="px-2 num">${C.num(o.qtdRecebida) ? f0(o.qtdRecebida) : ''}</td>
+    <td class="px-2">${fd(o.dataPedido)}</td><td class="px-2">${fd(o.dataEmbarque)}</td><td class="px-2 ${venc ? 'text-red-600 font-semibold' : ''}">${fd(o.dataChegada)}${venc ? ' ⚠' : ''}</td>
+    <td class="px-2 num">${cu ? brl.format(C.num(o.qtd) * cu * C.num(DB.settings.cambio[mo || 'USD'] ?? 1)) : '–'}</td><td class="px-2">${ordBadge(o.status)}</td>
+    <td class="px-2 text-right"><button class="text-sky-700 hover:underline" onclick="editOrdem('${o.id}')">editar</button></td></tr>`; }).join('') || '<tr><td colspan=12 class="p-4 text-slate-400">Nenhuma ordem</td></tr>'}</tbody></table></div>`;
+  document.getElementById('oq').oninput = e => { F.q = e.target.value; clearTimeout(pgOrdens._t); pgOrdens._t = setTimeout(() => { render(); const i = document.getElementById('oq'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }, 250); };
+  document.getElementById('ost').onchange = e => { F.status = e.target.value; render(); };
+  document.getElementById('ofo').onchange = e => { F.fornecedor = e.target.value; render(); };
+}
+function editOrdem(id) {
+  const o = id ? DB.ordens.find(x => x.id === id) : { id: '', po: '', fornecedor: '', item: '', qtd: '', dataPedido: C.todayISO(), leadTime: DB.settings.leadTimePadrao, dataEmbarque: '', transitTime: DB.settings.transitPadrao, dataChegada: '', qtdRecebida: 0, status: 'Em produção', custoUnit: '', moeda: 'USD', responsavel: user?.email || '', obs: '' };
+  const fld = (k, l, type = 'text', extra = '') => `<label class="block"><span class="text-xs text-slate-500">${l}</span><input id="of_${k}" type="${type}" ${type === 'number' ? 'step="any"' : ''} value="${esc(o[k] ?? '')}" class="w-full border rounded px-2 py-1.5" ${extra}></label>`;
+  openModal(id ? 'Editar linha de ordem' : 'Nova linha de ordem', `
+  <datalist id="dlItens">${DB.produtos.map(p => `<option value="${esc(p.cod)}">${esc(p.desc)}</option>`).join('')}</datalist>
+  <datalist id="dlForn">${DB.fornecedores.map(f => `<option value="${esc(f.nome)}">`).join('')}</datalist>
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+    ${fld('po', 'Nº PO')}${fld('fornecedor', 'Fornecedor', 'text', 'list="dlForn"')}${fld('item', 'Item', 'text', 'list="dlItens"')}${fld('qtd', 'Quantidade', 'number')}
+    ${fld('dataPedido', 'Data do pedido', 'date')}${fld('leadTime', 'Lead time produção (d)', 'number')}${fld('dataEmbarque', 'Data de embarque', 'date')}${fld('transitTime', 'Trânsito (d)', 'number')}
+    ${fld('dataChegada', 'Previsão de chegada', 'date')}${fld('qtdRecebida', 'Qtd recebida', 'number')}
+    <label class="block"><span class="text-xs text-slate-500">Status</span><select id="of_status" class="w-full border rounded px-2 py-1.5">${ORD_STATUS.map(s => opt(s, o.status)).join('')}</select></label>
+    ${fld('responsavel', 'Responsável')}${fld('custoUnit', 'Custo unitário', 'number')}
+    <label class="block"><span class="text-xs text-slate-500">Moeda</span><select id="of_moeda" class="w-full border rounded px-2 py-1.5">${['USD', 'CNY', 'BRL'].map(s => opt(s, o.moeda)).join('')}</select></label>
+    <label class="block col-span-2"><span class="text-xs text-slate-500">Observação</span><input id="of_obs" value="${esc(o.obs || '')}" class="w-full border rounded px-2 py-1.5"></label>
+  </div>
+  <div class="text-[11px] text-slate-500 mt-2">Ao mudar data do pedido, lead time ou trânsito, as datas de embarque e chegada são recalculadas (você pode sobrescrever).</div>
+  <div class="flex gap-2 mt-4">${id ? `<button onclick="delOrdem('${id}')" class="text-red-600 border border-red-200 rounded-lg px-3 py-1.5">Excluir</button>` : ''}<button onclick="closeModal()" class="ml-auto border rounded-lg px-3 py-1.5">Cancelar</button><button onclick="saveOrdem('${id || ''}')" class="bg-sky-600 text-white rounded-lg px-4 py-1.5">Salvar</button></div>`, 'max-w-3xl');
+  const g = k => document.getElementById('of_' + k);
+  const rec = () => { if (g('dataPedido').value) { g('dataEmbarque').value = C.addDays(g('dataPedido').value, Number(g('leadTime').value) || 0); g('dataChegada').value = C.addDays(g('dataEmbarque').value, Number(g('transitTime').value) || 0); } };
+  ['dataPedido', 'leadTime', 'transitTime'].forEach(k => g(k).addEventListener('change', rec));
+  g('dataEmbarque').addEventListener('change', () => { if (g('dataEmbarque').value) g('dataChegada').value = C.addDays(g('dataEmbarque').value, Number(g('transitTime').value) || 0); });
+  g('item').addEventListener('change', () => { const p = prodByCod(g('item').value); if (p) { if (!g('fornecedor').value) g('fornecedor').value = p.fornecedor; if (!g('custoUnit').value) g('custoUnit').value = p.custo || ''; g('moeda').value = p.moeda || 'USD'; const f = DB.fornecedores.find(z => z.nome === p.fornecedor); if (f?.leadTime) g('leadTime').value = f.leadTime; if (f?.transitTime) g('transitTime').value = f.transitTime; rec(); } });
+}
+function saveOrdem(id) {
+  const g = k => document.getElementById('of_' + k).value;
+  const o = { id: id || uid('po'), po: g('po').trim(), fornecedor: g('fornecedor').trim().toUpperCase(), item: g('item').trim(), qtd: Number(g('qtd')) || 0, dataPedido: g('dataPedido'), leadTime: Number(g('leadTime')) || 0, dataEmbarque: g('dataEmbarque'), transitTime: Number(g('transitTime')) || 0, dataChegada: g('dataChegada'), qtdRecebida: Number(g('qtdRecebida')) || 0, status: g('status'), custoUnit: Number(g('custoUnit')) || 0, moeda: g('moeda'), responsavel: g('responsavel'), obs: g('obs') };
+  if (!o.item || !o.qtd) { toast('Informe item e quantidade'); return; }
+  if (o.status === 'Recebido' && !o.qtdRecebida) o.qtdRecebida = o.qtd;
+  if (!prodByCod(o.item) && !confirm(`O item ${o.item} não está no cadastro. Salvar mesmo assim?`)) return;
+  const i = DB.ordens.findIndex(x => x.id === o.id); if (i >= 0) DB.ordens[i] = o; else DB.ordens.push(o);
+  closeModal(); changed('ordens'); toast('Ordem salva');
+}
+function delOrdem(id) { if (!confirm('Excluir esta linha de ordem?')) return; DB.ordens = DB.ordens.filter(o => o.id !== id); closeModal(); changed('ordens'); }
+function bulkStatus() {
+  const ids = [...document.querySelectorAll('.ordck:checked')].map(c => c.value);
+  if (!ids.length) { toast('Selecione linhas'); return; }
+  openModal('Alterar status', `<div class="text-xs mb-2">${ids.length} linha(s) selecionada(s)</div><select id="bs" class="border rounded px-2 py-1.5 w-full">${ORD_STATUS.map(s => opt(s, '')).join('')}</select>
+  <label class="block mt-3 text-xs"><span class="text-slate-500">Nova data de chegada (opcional)</span><input id="bsd" type="date" class="border rounded px-2 py-1.5 w-full"></label>
+  <div class="text-[11px] text-slate-500 mt-2">Ao marcar como "Recebido", a quantidade recebida = quantidade da ordem. Lembre-se de atualizar o estoque (importação do ERP) para não contar em dobro.</div>
+  <div class="flex mt-4"><button class="ml-auto bg-sky-600 text-white rounded-lg px-4 py-1.5" onclick="applyBulk()">Aplicar</button></div>`, 'max-w-md');
+  window.applyBulk = () => { const s = document.getElementById('bs').value, d = document.getElementById('bsd').value; DB.ordens.forEach(o => { if (ids.includes(o.id)) { o.status = s; if (s === 'Recebido') o.qtdRecebida = o.qtd; if (d) o.dataChegada = d; } }); closeModal(); changed('ordens'); };
+}
+
+/* ================= EMBARQUES ================= */
+function pgEmbarques(el) {
+  const t = hoje();
+  const rows = [...DB.embarques].sort((a, b) => (a.prevChegada || 'z').localeCompare(b.prevChegada || 'z'));
+  el.innerHTML = `
+  <div class="flex mb-3 items-center gap-2"><span class="text-xs text-slate-500">${rows.length} processos de importação</span><button onclick="editEmb()" class="ml-auto rounded-lg px-3 py-1.5 bg-sky-600 text-white hover:bg-sky-700">+ Novo processo</button></div>
+  <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 190px)"><table class="w-full tbl text-xs"><thead><tr class="text-left">
+  ${['Ref. IMP', 'PO', 'Fornecedor', 'Navio', 'Porto', 'Embarque', 'Prev. chegada', 'Atracação', 'Cntrs', 'Free time', 'Docs', 'Status do processo', ''].map(h => `<th class="px-2 py-2">${h}</th>`).join('')}</tr></thead><tbody>
+  ${rows.map(e => { const po = DB.ordens.filter(o => o.po && e.po && String(o.po) === String(e.po)); return `<tr class="border-t hover:bg-sky-50 align-top"><td class="px-2 py-1.5 font-medium">${esc(e.refImp)}</td><td class="px-2">${esc(e.po)}${po.length ? `<div class="text-slate-400">${po.length} itens</div>` : ''}</td><td class="px-2">${esc(e.fornecedor)}</td><td class="px-2">${esc(e.navio)}</td><td class="px-2">${esc(e.porto)}</td><td class="px-2">${fd(e.dataEmbarque)}</td>
+  <td class="px-2 ${e.prevChegada && e.prevChegada < t && !e.atracacao ? 'text-red-600 font-semibold' : ''}">${fd(e.prevChegada)}</td><td class="px-2">${fd(e.atracacao)}</td><td class="px-2 num">${esc(e.containers)}</td><td class="px-2 num">${esc(e.freeTime)}</td><td class="px-2">${esc(e.rastreioDocs)}</td>
+  <td class="px-2 whitespace-normal min-w-[260px]">${esc(e.status)}</td><td class="px-2"><button class="text-sky-700 hover:underline" onclick="editEmb('${e.id}')">editar</button></td></tr>`; }).join('') || '<tr><td colspan=13 class="p-4 text-slate-400">Nenhum processo</td></tr>'}
+  </tbody></table></div>`;
+}
+const EMB_F = [['refImp', 'Ref. IMP'], ['po', 'Nº PO (Ref. TBX)'], ['fornecedor', 'Fornecedor'], ['agente', 'Agente de carga'], ['navio', 'Navio'], ['porto', 'Porto destino'], ['bl', 'BL nº'], ['dataEmbarque', 'Data embarque', 'date'], ['prevChegada', 'Previsão chegada', 'date'], ['atracacao', 'Atracação', 'date'], ['containers', 'Qtd containers', 'number'], ['freeTime', 'Free time (d)', 'number'], ['rastreioDocs', 'Rastreio documentos']];
+function editEmb(id) {
+  const e = id ? DB.embarques.find(x => x.id === id) : {};
+  openModal(id ? 'Editar processo' : 'Novo processo de importação', `<div class="grid grid-cols-2 md:grid-cols-3 gap-3">${EMB_F.map(([k, l, ty]) => `<label class="block"><span class="text-xs text-slate-500">${l}</span><input id="ef_${k}" type="${ty || 'text'}" value="${esc(e[k] ?? '')}" class="w-full border rounded px-2 py-1.5"></label>`).join('')}
+  <label class="block col-span-full"><span class="text-xs text-slate-500">Status do processo</span><textarea id="ef_status" rows="2" class="w-full border rounded px-2 py-1.5">${esc(e.status || '')}</textarea></label></div>
+  <label class="flex items-center gap-2 mt-3 text-xs"><input type="checkbox" id="ef_sync" checked> Atualizar a data de chegada das ordens desta PO com a previsão de chegada</label>
+  <div class="flex gap-2 mt-4">${id ? `<button onclick="if(confirm('Excluir?')){DB.embarques=DB.embarques.filter(x=>x.id!=='${id}');closeModal();changed('embarques')}" class="text-red-600 border border-red-200 rounded-lg px-3 py-1.5">Excluir</button>` : ''}<button onclick="closeModal()" class="ml-auto border rounded-lg px-3 py-1.5">Cancelar</button><button onclick="saveEmb('${id || ''}')" class="bg-sky-600 text-white rounded-lg px-4 py-1.5">Salvar</button></div>`, 'max-w-3xl');
+}
+function saveEmb(id) {
+  const e = { id: id || uid('emb') }; EMB_F.forEach(([k]) => e[k] = document.getElementById('ef_' + k).value.trim()); e.status = document.getElementById('ef_status').value.trim(); e.fornecedor = e.fornecedor.toUpperCase();
+  const i = DB.embarques.findIndex(x => x.id === e.id); if (i >= 0) DB.embarques[i] = e; else DB.embarques.push(e);
+  let n = 0;
+  if (document.getElementById('ef_sync').checked && e.po) { const ch = e.atracacao || e.prevChegada; DB.ordens.forEach(o => { if (String(o.po) === String(e.po) && !['Recebido', 'Cancelado'].includes(o.status)) { if (ch) o.dataChegada = ch; if (e.dataEmbarque) { o.dataEmbarque = e.dataEmbarque; if (o.status === 'Em produção' || o.status === 'Planejada') o.status = 'Em trânsito'; } n++; } }); }
+  closeModal(); changed('embarques', 'ordens'); toast('Processo salvo' + (n ? ` · ${n} linha(s) de ordem atualizadas` : ''));
+}
+
+/* ================= PREVISÃO ================= */
+function prevMonths() { const t = hoje(); const out = []; let [y, m] = t.split('-').map(Number); for (let i = 0; i < 12; i++) { out.push(`${y}-${String(m).padStart(2, '0')}`); m++; if (m > 12) { m = 1; y++; } } return out; }
+const MES = ['jan', 'fev', 'mar', 'abr', 'mai', 'jun', 'jul', 'ago', 'set', 'out', 'nov', 'dez'];
+const ymLbl = ym => MES[Number(ym.slice(5)) - 1] + '/' + ym.slice(2, 4);
+function pgPrevisao(el) {
+  const F = ui.prevFiltro, months = prevMonths();
+  let rows = DB.previsao.filter(f => (!F.q || f.pa.toLowerCase().includes(F.q.toLowerCase())) && (!F.grupo || f.grupo === F.grupo));
+  el.innerHTML = `
+  <div class="text-xs text-slate-500 mb-3">Valores em <b>unidades vendidas por dia</b> de cada produto de venda (como na planilha atual). O MRP multiplica pela estrutura para chegar na demanda de cada componente. Meses em branco usam o valor <b>Padrão</b>.</div>
+  <div class="flex flex-wrap gap-2 mb-3 items-center">
+    <input id="pq" placeholder="Buscar produto" value="${esc(F.q)}" class="border rounded-lg px-3 py-1.5 w-48">
+    <select id="pg" class="border rounded-lg px-2 py-1.5"><option value="">Todos os grupos</option>${uniq(DB.previsao.map(f => f.grupo)).map(g => opt(g, F.grupo)).join('')}</select>
+    <span class="text-xs text-slate-500">${rows.length} produtos</span>
+    <div class="ml-auto flex items-center gap-2 bg-white border rounded-lg px-3 py-1.5">
+      <span class="text-xs">Ajuste em massa (produtos filtrados):</span>
+      <select id="ajMes" class="border rounded px-1 py-0.5 text-xs">${months.map(m => opt(m, '', ymLbl(m))).join('')}</select>
+      <input id="ajPct" type="number" value="20" class="border rounded px-1 py-0.5 w-16 text-xs">%
+      <button onclick="ajustePrev()" class="bg-sky-600 text-white rounded px-2 py-0.5 text-xs">Aplicar</button>
+    </div>
+    <button onclick="addPrev()" class="rounded-lg px-3 py-1.5 bg-white border">+ Produto</button>
+  </div>
+  <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 220px)"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="px-2 py-2">Produto de venda</th><th class="px-2">Grupo</th><th class="px-2">Componentes</th><th class="px-2 num">Padrão</th>${months.map(m => `<th class="px-1 num">${ymLbl(m)}</th>`).join('')}<th class="px-2 num">Total 12m</th></tr></thead><tbody>
+  ${rows.map((f, i) => { const comps = DB.estrutura.filter(e => e.pa === f.pa).length; let tot = 0; months.forEach(m => { const v = f.meses?.[m]; const r = (v === undefined || v === null || v === '') ? C.num(f.padrao) : C.num(v); const [y, mm] = m.split('-').map(Number); tot += r * new Date(y, mm, 0).getDate(); });
+    return `<tr class="border-t hover:bg-slate-50"><td class="px-2 py-1 font-medium">${esc(f.pa)}</td><td class="px-2">${esc(f.grupo)}</td><td class="px-2 text-slate-400">${comps || (prodByCod(f.pa) ? 'venda direta' : '<span class="text-red-500">sem estrutura</span>')}</td>
+    <td class="px-1 num"><input class="cell-input font-semibold" type="number" step="any" value="${f.padrao ?? ''}" onchange="setPrev('${esc(f.pa)}','padrao',this.value)"></td>
+    ${months.map(m => { const v = f.meses?.[m]; return `<td class="px-0.5 num"><input class="cell-input ${v === undefined || v === null || v === '' ? 'text-slate-300' : ''}" type="number" step="any" placeholder="${f.padrao ?? ''}" value="${v ?? ''}" onchange="setPrev('${esc(f.pa)}','${m}',this.value)"></td>`; }).join('')}
+    <td class="px-2 num text-slate-600">${f0(tot)}</td></tr>`; }).join('')}
+  </tbody></table></div>`;
+  document.getElementById('pq').oninput = e => { F.q = e.target.value; clearTimeout(pgPrevisao._t); pgPrevisao._t = setTimeout(() => { render(); const i = document.getElementById('pq'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }, 300); };
+  document.getElementById('pg').onchange = e => { F.grupo = e.target.value; render(); };
+}
+function setPrev(pa, k, v) {
+  const f = DB.previsao.find(x => x.pa === pa); if (!f) return;
+  if (k === 'padrao') f.padrao = v === '' ? 0 : Number(v);
+  else { f.meses = f.meses || {}; if (v === '') delete f.meses[k]; else f.meses[k] = Number(v); }
+  recalc(); Store.save('previsao'); renderNav(); setSaveInfo('Salvando…', 'text-amber-600');
+}
+function ajustePrev() {
+  const F = ui.prevFiltro, m = document.getElementById('ajMes').value, pct = Number(document.getElementById('ajPct').value) || 0;
+  const rows = DB.previsao.filter(f => (!F.q || f.pa.toLowerCase().includes(F.q.toLowerCase())) && (!F.grupo || f.grupo === F.grupo));
+  if (!confirm(`Aplicar ${pct > 0 ? '+' : ''}${pct}% em ${ymLbl(m)} para ${rows.length} produtos?`)) return;
+  rows.forEach(f => { const base = f.meses?.[m] ?? f.padrao; f.meses = f.meses || {}; f.meses[m] = Math.round(C.num(base) * (1 + pct / 100) * 100) / 100; });
+  changed('previsao'); toast('Previsão ajustada');
+}
+function addPrev() {
+  const pa = prompt('Código do produto de venda:'); if (!pa) return;
+  if (DB.previsao.some(f => f.pa === pa.trim())) { toast('Já existe'); return; }
+  const rate = Number(prompt('Venda média por dia (unidades):', '1')) || 0;
+  DB.previsao.push({ pa: pa.trim(), grupo: '', padrao: rate, meses: {} }); changed('previsao');
+}
+
+/* ================= CADASTROS ================= */
+function pgCadastros(el) {
+  const tab = ui.cadTab;
+  el.innerHTML = `<div class="flex gap-4 border-b mb-4">${[['itens', 'Itens comprados'], ['estrutura', 'Estrutura (produto → componentes)'], ['fornecedores', 'Fornecedores']].map(([k, l]) => `<button class="tab border-b-2 border-transparent px-1 pb-2 font-semibold ${tab === k ? 'active' : 'text-slate-500'}" onclick="ui.cadTab='${k}';render()">${l}</button>`).join('')}</div><div id="cadBody"></div>`;
+  const b = document.getElementById('cadBody');
+  if (tab === 'itens') {
+    b.innerHTML = `<div class="flex mb-2"><span class="text-xs text-slate-500">${DB.produtos.length} itens. Campos em branco usam o padrão do fornecedor ou das Configurações.</span><button onclick="editProd()" class="ml-auto rounded-lg px-3 py-1.5 bg-sky-600 text-white">+ Novo item</button></div>
+    <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 230px)"><table class="w-full tbl text-xs"><thead><tr class="text-left">${['Código', 'Descrição', 'Família', 'Fornecedor', 'Custo', 'Moeda', 'Múltiplo', 'Pç/cx', 'm³/cx', 'LT prod.', 'Trânsito', 'Seg. (d)', 'Cobert. (d)', 'Ativo', ''].map(h => `<th class="px-2 py-2">${h}</th>`).join('')}</tr></thead><tbody>
+    ${DB.produtos.map(p => `<tr class="border-t hover:bg-slate-50 ${p.ativo === false ? 'opacity-50' : ''}"><td class="px-2 py-1 font-medium">${esc(p.cod)}</td><td class="px-2 truncate max-w-[280px]" title="${esc(p.desc)}">${esc(p.desc)}</td><td class="px-2">${esc(p.familia)}</td><td class="px-2">${esc(p.fornecedor)}</td><td class="px-2 num">${p.custo ? nf2.format(p.custo) : '–'}</td><td class="px-2">${esc(p.moeda)}</td><td class="px-2 num">${f0(p.multiplo)}</td><td class="px-2 num">${f0(p.pcsCx)}</td><td class="px-2 num">${p.cbmCx ? nf2.format(p.cbmCx) : '–'}</td><td class="px-2 num">${p.leadTime ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2 num">${p.transitTime ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2 num">${p.segurancaDias ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2 num">${p.coberturaDias ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2">${p.ativo === false ? 'não' : 'sim'}</td><td class="px-2"><button class="text-sky-700 hover:underline" onclick="editProd('${esc(p.cod)}')">editar</button></td></tr>`).join('')}
+    </tbody></table></div>`;
+  } else if (tab === 'estrutura') {
+    const q = (ui.estQ || '').toLowerCase();
+    const rows = DB.estrutura.map((e, i) => ({ ...e, i })).filter(e => !q || (e.pa + ' ' + e.mp).toLowerCase().includes(q));
+    b.innerHTML = `<div class="flex gap-2 mb-2 items-center"><input id="eq" placeholder="Filtrar produto ou componente" value="${esc(ui.estQ || '')}" class="border rounded-lg px-3 py-1.5 w-64"><span class="text-xs text-slate-500">${rows.length} vínculos</span>
+      <div class="ml-auto flex gap-1 items-center bg-white border rounded-lg px-2 py-1"><input id="ne_pa" placeholder="Produto de venda" class="border rounded px-2 py-0.5 w-32"><input id="ne_mp" list="dlItens2" placeholder="Componente" class="border rounded px-2 py-0.5 w-32"><input id="ne_q" type="number" step="any" value="1" class="border rounded px-2 py-0.5 w-16"><button class="bg-sky-600 text-white rounded px-2 py-0.5" onclick="addEst()">Adicionar</button></div></div>
+      <datalist id="dlItens2">${DB.produtos.map(p => `<option value="${esc(p.cod)}">`).join('')}</datalist>
+      <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 230px)"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="px-2 py-2">Produto de venda</th><th class="px-2">Componente (item comprado)</th><th class="px-2">Descrição</th><th class="px-2 num">Qtd por unidade</th><th></th></tr></thead><tbody>
+      ${rows.map(e => { const p = prodByCod(e.mp); return `<tr class="border-t"><td class="px-2 py-1 font-medium">${esc(e.pa)}</td><td class="px-2 ${p ? '' : 'text-slate-400'}">${esc(e.mp)}${p ? '' : ' <span class="text-[10px]">(fora do MRP)</span>'}</td><td class="px-2 truncate max-w-[300px]">${esc(p?.desc || '')}</td><td class="px-2 num"><input class="cell-input" type="number" step="any" value="${e.qtd}" onchange="DB.estrutura[${e.i}].qtd=Number(this.value)||0;changed('estrutura')"></td><td class="px-2"><button class="text-red-500" onclick="DB.estrutura.splice(${e.i},1);changed('estrutura')">remover</button></td></tr>`; }).join('')}
+      </tbody></table></div>`;
+    document.getElementById('eq').oninput = ev => { ui.estQ = ev.target.value; clearTimeout(pgCadastros._t); pgCadastros._t = setTimeout(() => { render(); const i = document.getElementById('eq'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }, 300); };
+  } else {
+    b.innerHTML = `<div class="flex mb-2"><span class="text-xs text-slate-500">Lead time e trânsito do fornecedor valem para todos os itens dele que não tiverem valor próprio.</span><button onclick="addForn()" class="ml-auto rounded-lg px-3 py-1.5 bg-sky-600 text-white">+ Fornecedor</button></div>
+    <div class="bg-white rounded-xl shadow-sm border scroll-x"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="px-2 py-2">Fornecedor</th><th class="px-2">Linha de produtos</th><th class="px-2">Contato</th><th class="px-2 num">Lead time produção (d)</th><th class="px-2 num">Trânsito (d)</th><th class="px-2 num">Itens</th><th></th></tr></thead><tbody>
+    ${DB.fornecedores.map((f, i) => `<tr class="border-t"><td class="px-2 py-1 font-medium">${esc(f.nome)}</td>
+    <td class="px-2"><input class="border rounded px-1 py-0.5 w-48" value="${esc(f.linha || '')}" onchange="DB.fornecedores[${i}].linha=this.value;changed('fornecedores')"></td>
+    <td class="px-2"><input class="border rounded px-1 py-0.5 w-32" value="${esc(f.contato || '')}" onchange="DB.fornecedores[${i}].contato=this.value;changed('fornecedores')"></td>
+    <td class="px-2 num"><input class="cell-input" type="number" placeholder="${DB.settings.leadTimePadrao}" value="${f.leadTime ?? ''}" onchange="DB.fornecedores[${i}].leadTime=this.value===''?null:Number(this.value);changed('fornecedores')"></td>
+    <td class="px-2 num"><input class="cell-input" type="number" placeholder="${DB.settings.transitPadrao}" value="${f.transitTime ?? ''}" onchange="DB.fornecedores[${i}].transitTime=this.value===''?null:Number(this.value);changed('fornecedores')"></td>
+    <td class="px-2 num">${DB.produtos.filter(p => p.fornecedor === f.nome).length}</td>
+    <td class="px-2"><button class="text-red-500" onclick="if(confirm('Remover fornecedor ${esc(f.nome)}?')){DB.fornecedores.splice(${i},1);changed('fornecedores')}">remover</button></td></tr>`).join('')}
+    </tbody></table></div>`;
+  }
+}
+function addEst() { const pa = document.getElementById('ne_pa').value.trim(), mp = document.getElementById('ne_mp').value.trim(), q = Number(document.getElementById('ne_q').value) || 1; if (!pa || !mp) { toast('Informe produto e componente'); return; } DB.estrutura.push({ pa, mp, qtd: q }); changed('estrutura'); }
+function addForn() { const n = prompt('Nome do fornecedor:'); if (!n) return; const nome = n.trim().toUpperCase(); if (DB.fornecedores.some(f => f.nome === nome)) { toast('Já existe'); return; } DB.fornecedores.push({ nome, leadTime: null, transitTime: null, contato: '', linha: '' }); DB.fornecedores.sort((a, b) => a.nome.localeCompare(b.nome)); changed('fornecedores'); }
+const PROD_F = [['cod', 'Código'], ['desc', 'Descrição'], ['familia', 'Família'], ['fornecedor', 'Fornecedor'], ['custo', 'Custo unitário', 'number'], ['moeda', 'Moeda'], ['multiplo', 'Múltiplo de compra', 'number'], ['pcsCx', 'Peças por caixa/pallet', 'number'], ['cbmCx', 'm³ por caixa/pallet', 'number'], ['leadTime', 'Lead time produção (d)', 'number'], ['transitTime', 'Trânsito (d)', 'number'], ['segurancaDias', 'Estoque segurança (dias)', 'number'], ['coberturaDias', 'Cobertura por pedido (dias)', 'number'], ['estoque', 'Estoque atual', 'number']];
+function editProd(cod) {
+  const p = cod ? prodByCod(cod) : { moeda: 'USD', multiplo: 1, ativo: true };
+  openModal(cod ? 'Editar item ' + esc(cod) : 'Novo item', `<datalist id="dlForn2">${DB.fornecedores.map(f => `<option value="${esc(f.nome)}">`).join('')}</datalist><div class="grid grid-cols-2 md:grid-cols-3 gap-3">
+  ${PROD_F.map(([k, l, ty]) => `<label class="block ${k === 'desc' ? 'md:col-span-2' : ''}"><span class="text-xs text-slate-500">${l}</span><input id="pf_${k}" type="${ty || 'text'}" step="any" value="${esc(p[k] ?? '')}" ${k === 'cod' && cod ? 'disabled' : ''} ${k === 'fornecedor' ? 'list="dlForn2"' : ''} class="w-full border rounded px-2 py-1.5 disabled:bg-slate-100"></label>`).join('')}
+  <label class="flex items-center gap-2 mt-5"><input id="pf_ativo" type="checkbox" ${p.ativo !== false ? 'checked' : ''}> Ativo (entra no MRP)</label></div>
+  <div class="text-[11px] text-slate-500 mt-2">Deixe lead time, trânsito, segurança e cobertura em branco para usar o padrão.</div>
+  <div class="flex gap-2 mt-4">${cod ? `<button onclick="if(confirm('Excluir item?')){DB.produtos=DB.produtos.filter(x=>x.cod!=='${esc(cod)}');closeModal();changed('produtos')}" class="text-red-600 border border-red-200 rounded-lg px-3 py-1.5">Excluir</button>` : ''}<button onclick="closeModal()" class="ml-auto border rounded-lg px-3 py-1.5">Cancelar</button><button onclick="saveProd('${esc(cod || '')}')" class="bg-sky-600 text-white rounded-lg px-4 py-1.5">Salvar</button></div>`, 'max-w-3xl');
+}
+function saveProd(cod) {
+  const p = cod ? prodByCod(cod) : {};
+  PROD_F.forEach(([k, , ty]) => { if (k === 'cod' && cod) return; const v = document.getElementById('pf_' + k).value.trim(); p[k] = ty === 'number' ? (v === '' ? (['custo', 'estoque'].includes(k) ? 0 : null) : Number(v)) : v; });
+  p.ativo = document.getElementById('pf_ativo').checked; p.fornecedor = (p.fornecedor || '').toUpperCase(); p.moeda = (p.moeda || 'USD').toUpperCase();
+  if (!cod) { if (!p.cod) { toast('Informe o código'); return; } if (prodByCod(p.cod)) { toast('Código já existe'); return; } p.mrp = true; DB.produtos.push(p); }
+  closeModal(); changed('produtos'); toast('Item salvo');
+}
+
+/* ================= IMPORTAR / EXPORTAR ================= */
+function pgImportar(el) {
+  const card = (t, d, body) => `<div class="bg-white rounded-xl shadow-sm border p-5"><div class="font-bold text-base">${t}</div><div class="text-xs text-slate-500 mt-1 mb-3">${d}</div>${body}</div>`;
+  el.innerHTML = `<div class="grid md:grid-cols-2 gap-4 max-w-5xl">
+  ${card('1. Planilha MRP atual (.xlsb / .xlsx)', 'Migração completa: lê as abas MRP, Structure, Forecast, Stock_Structure, Stock_System, COSTS, Tab_CBM, Purchase_Order, Suppliers e Follow-up. <b>Substitui todos os dados do site</b> (as configurações são mantidas).', `<input type="file" id="fMRP" accept=".xlsb,.xlsx,.xlsm" class="text-xs"><div id="logMRP" class="text-xs mt-3 text-slate-600 whitespace-pre-line"></div>`)}
+  ${card('2. Atualizar estoque (export do ERP)', 'Planilha com as colunas <b>SKU</b> e <b>Total disponível</b> (formato da aba Stock_System / relatório de estoque do Olist). Atualiza só o estoque dos itens do cadastro.', `<input type="file" id="fEst" accept=".xlsx,.xls,.xlsb,.csv" class="text-xs"><div id="logEst" class="text-xs mt-3 text-slate-600 whitespace-pre-line"></div>`)}
+  ${card('3. Exportar', 'Baixe o resultado do MRP e as sugestões em Excel, ou um backup completo dos dados.', `<div class="flex flex-wrap gap-2"><button onclick="exportMRP()" class="border rounded-lg px-3 py-1.5">MRP (Excel)</button><button onclick="exportSug()" class="border rounded-lg px-3 py-1.5">Sugestões (Excel)</button><button onclick="exportGrade()" class="border rounded-lg px-3 py-1.5">Grade diária (Excel)</button><button onclick="download('backup-mrp-'+C.todayISO()+'.json',JSON.stringify(DB))" class="border rounded-lg px-3 py-1.5">Backup (JSON)</button></div>`)}
+  ${card('4. Restaurar backup', 'Carrega um arquivo de backup JSON gerado acima. Substitui todos os dados.', `<input type="file" id="fBk" accept=".json" class="text-xs">`)}
+  </div>`;
+  document.getElementById('fMRP').onchange = async e => {
+    const f = e.target.files[0]; if (!f) return;
+    if (DB.produtos.length && !confirm('Isso vai substituir itens, estrutura, previsão, ordens e embarques atuais. Continuar?')) { e.target.value = ''; return; }
+    const log = document.getElementById('logMRP'); log.textContent = 'Lendo planilha… (arquivos grandes podem levar alguns segundos)';
+    try {
+      const wb = XLSX.read(await f.arrayBuffer(), { type: 'array' });
+      const { db, log: l } = C.importWorkbook(XLSX, wb);
+      db.settings = { ...DB.settings };
+      DB = db; recalc(); Store.save(); renderNav();
+      log.innerHTML = '<b class="text-emerald-700">Importação concluída</b>\n' + l.join('\n') + `\nFornecedores: ${db.fornecedores.length}`;
+      toast('Planilha importada');
+    } catch (err) { console.error(err); log.innerHTML = '<span class="text-red-600">Erro: ' + esc(err.message) + '</span>'; }
+  };
+  document.getElementById('fEst').onchange = async e => {
+    const f = e.target.files[0]; if (!f) return; const log = document.getElementById('logEst');
+    try { const wb = XLSX.read(await f.arrayBuffer(), { type: 'array' }); const r = C.importStock(XLSX, wb, DB); recalc(); Store.save('produtos', 'meta'); renderNav();
+      log.innerHTML = `<b class="text-emerald-700">${r.atualizados} itens atualizados</b>` + (r.faltando.length ? `\nNão encontrados no arquivo (${r.faltando.length}): ${esc(r.faltando.slice(0, 40).join(', '))}${r.faltando.length > 40 ? '…' : ''}` : ''); }
+    catch (err) { log.innerHTML = '<span class="text-red-600">Erro: ' + esc(err.message) + '</span>'; }
+  };
+  document.getElementById('fBk').onchange = async e => {
+    const f = e.target.files[0]; if (!f) return; if (!confirm('Substituir todos os dados pelo backup?')) return;
+    try { const d = JSON.parse(await f.text()); DB = { ...C.emptyDB(), ...d, settings: { ...C.emptyDB().settings, ...d.settings } }; recalc(); Store.save(); render(); toast('Backup restaurado'); } catch (err) { toast('Arquivo inválido'); }
+  };
+}
+function xlsxDownload(name, sheets) { const wb = XLSX.utils.book_new(); sheets.forEach(([n, rows]) => XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), n)); XLSX.writeFile(wb, name); }
+function exportMRP() {
+  xlsxDownload(`MRP_${R.opts.today}.xlsx`, [['MRP', R.itens.map(x => ({ Item: x.cod, Descrição: x.produto.desc, Família: x.produto.familia, Fornecedor: x.produto.fornecedor, Estoque: C.num(x.produto.estoque), 'Demanda/dia': Math.round(x.avg30 * 100) / 100, 'Dias de estoque': x.diasEstoque, 'Em aberto': x.totalAberto, 'Ruptura projetada': x.ruptura || '', 'Pedir até': x.prox?.dataPedidoIdeal || '', 'Qtd sugerida': x.prox?.qtd || '', 'Chegada sugerida': x.prox?.dataChegada || '', Situação: STATUS_LBL[x.status] }))]]);
+}
+function exportSug() {
+  const q = x => (ui.sugQtd || {})[x.cod] ?? x.prox.qtd;
+  xlsxDownload(`Sugestoes_compra_${R.opts.today}.xlsx`, [['Sugestões', sugRows().map(x => ({ Fornecedor: x.produto.fornecedor, Item: x.cod, Descrição: x.produto.desc, Estoque: C.num(x.produto.estoque), 'Demanda/dia': Math.round(x.avg30 * 100) / 100, 'Em aberto': x.totalAberto, Ruptura: x.ruptura || '', 'Pedir até': x.prox.dataPedidoIdeal, 'Chegada prevista': x.prox.dataChegada, 'Qtd sugerida': q(x), 'm³': Math.round(q(x) * x.cbmUn * 100) / 100, 'Custo unit.': C.num(x.produto.custo), Moeda: x.produto.moeda, 'Valor R$': Math.round(q(x) * x.custoBRL), Situação: STATUS_LBL[x.status] }))]]);
+}
+function exportGrade() {
+  const H = R.opts.horizonte, t = R.opts.today, rows = [];
+  R.itens.forEach(x => { [['Demanda', x.rates], ['Chegadas', x.arr], ['Estoque', x.S]].forEach(([lin, arr]) => { const r = { Item: x.cod, Linha: lin }; for (let d = 0; d <= H; d++) r[fd(C.addDays(t, d))] = Math.round(arr[d] * 100) / 100; rows.push(r); }); });
+  xlsxDownload(`MRP_grade_diaria_${t}.xlsx`, [['Grade', rows]]);
+}
+
+/* ================= ASSISTENTE IA ================= */
+function contextoIA() {
+  const t = R.opts.today, I = R.itens;
+  const linhas = I.filter(x => x.status !== 'sem_demanda').sort((a, b) => (a.rupturaDia >= 0 ? a.rupturaDia : 9999) - (b.rupturaDia >= 0 ? b.rupturaDia : 9999)).slice(0, 80)
+    .map(x => [x.cod, x.produto.familia, x.produto.fornecedor, Math.round(C.num(x.produto.estoque)), Math.round(x.avg30 * 10) / 10, x.diasEstoque ?? '', Math.round(x.totalAberto), x.ruptura || '-', x.prox?.dataPedidoIdeal || '-', x.prox?.qtd || '-', STATUS_LBL[x.status]].join(';'));
+  const abertas = DB.ordens.filter(o => !['Recebido', 'Cancelado'].includes(o.status));
+  const porPO = {}; abertas.forEach(o => { const k = o.po || '—'; porPO[k] = porPO[k] || { forn: o.fornecedor, status: o.status, chegada: o.dataChegada, itens: 0 }; porPO[k].itens++; });
+  return `Data-base: ${t}. Horizonte: ${R.opts.horizonte} dias. Parâmetros padrão: estoque de segurança ${DB.settings.segurancaDias} dias, cobertura por pedido ${DB.settings.coberturaDias} dias.
+Itens (até 80, ordenados por ruptura). Colunas: item;família;fornecedor;estoque;demanda_dia;dias_estoque;em_aberto;ruptura_projetada;pedir_ate;qtd_sugerida;situação
+${linhas.join('\n')}
+Ordens em aberto por PO: ${Object.entries(porPO).map(([k, v]) => `${k} (${v.forn}, ${v.status}, chegada ${v.chegada || '?'}, ${v.itens} itens)`).join(' | ')}`;
+}
+function pgIA(el) {
+  const url = DB.settings.workerUrl;
+  el.innerHTML = `<div class="max-w-4xl">
+  <div class="bg-white rounded-xl shadow-sm border p-5">
+    <div class="font-bold text-base">Assistente de compras (Claude)</div>
+    <div class="text-xs text-slate-500 mt-1">O site envia um resumo do MRP (itens em risco, sugestões e ordens em aberto) e a IA responde com análise e recomendações. As contas continuam sendo feitas pelo MRP — a IA interpreta, prioriza e explica.</div>
+    ${url ? '' : `<div class="mt-3 p-3 rounded-lg bg-amber-50 border border-amber-200 text-amber-900 text-xs">A conexão com a IA ainda não foi configurada (URL do Cloudflare Worker em <a class="underline" href="#config" onclick="go('config')">Configurações</a>). Enquanto isso, use <b>Copiar contexto</b> e cole numa conversa com o Claude.</div>`}
+    <div class="flex flex-wrap gap-2 mt-4">
+      ${['Resuma a situação de compras de hoje e diga o que precisa ser feito esta semana.', 'Quais fornecedores devo priorizar e como agrupar os pedidos para fechar containers?', 'Quais itens têm risco de ruptura mesmo com as ordens em aberto? O que fazer?', 'Há itens com excesso de estoque ou compra exagerada?'].map(q => `<button class="text-xs border rounded-full px-3 py-1 hover:bg-sky-50" onclick="document.getElementById('iaQ').value=this.textContent">${q}</button>`).join('')}
+    </div>
+    <textarea id="iaQ" rows="3" class="w-full border rounded-lg px-3 py-2 mt-3" placeholder="Pergunte algo sobre o MRP…">Resuma a situação de compras de hoje e diga o que precisa ser feito esta semana.</textarea>
+    <div class="flex gap-2 mt-2"><button onclick="navigator.clipboard.writeText(document.getElementById('iaQ').value+'\\n\\n'+contextoIA()).then(()=>toast('Contexto copiado'))" class="border rounded-lg px-3 py-1.5">Copiar contexto</button><button id="iaBtn" onclick="perguntarIA()" class="ml-auto bg-sky-600 text-white rounded-lg px-4 py-1.5 disabled:opacity-50" ${url ? '' : 'disabled'}>Perguntar à IA</button></div>
+  </div>
+  <div id="iaOut" class="bg-white rounded-xl shadow-sm border p-5 mt-4 md hidden"></div></div>`;
+}
+function mdLite(s) {
+  s = esc(s);
+  s = s.replace(/^### (.*)$/gm, '<h3>$1</h3>').replace(/^## (.*)$/gm, '<h3>$1</h3>').replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+  s = s.replace(/(^|\n)((?:\|.*\|\n?)+)/g, (m, p, tb) => { const rows = tb.trim().split('\n').filter(r => !/^\|\s*-/.test(r)); return p + '<table>' + rows.map((r, i) => '<tr>' + r.split('|').slice(1, -1).map(c => i ? `<td>${c.trim()}</td>` : `<th>${c.trim()}</th>`).join('') + '</tr>').join('') + '</table>'; });
+  s = s.replace(/(^|\n)((?:[-*] .*(?:\n|$))+)/g, (m, p, l) => p + '<ul>' + l.trim().split('\n').map(i => `<li>${i.replace(/^[-*] /, '')}</li>`).join('') + '</ul>');
+  return s.split(/\n{2,}/).map(b => /^<(h3|ul|table)/.test(b) ? b : `<p>${b.replace(/\n/g, '<br>')}</p>`).join('');
+}
+async function perguntarIA() {
+  const out = document.getElementById('iaOut'), btn = document.getElementById('iaBtn');
+  out.classList.remove('hidden'); out.innerHTML = '<span class="text-slate-500">Analisando…</span>'; btn.disabled = true;
+  try {
+    const r = await fetch(DB.settings.workerUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pergunta: document.getElementById('iaQ').value, contexto: contextoIA() }) });
+    const j = await r.json(); if (!r.ok) throw new Error(j.error || r.statusText);
+    out.innerHTML = mdLite(j.resposta || '');
+  } catch (e) { out.innerHTML = '<span class="text-red-600">Erro ao consultar a IA: ' + esc(e.message) + '</span>'; }
+  btn.disabled = false;
+}
+
+/* ================= CONFIGURAÇÕES ================= */
+function pgConfig(el) {
+  const s = DB.settings;
+  const f = (k, l, ty = 'number', help = '') => `<label class="block"><span class="text-xs text-slate-600 font-semibold">${l}</span><input id="cf_${k}" type="${ty}" step="any" value="${esc(s[k] ?? '')}" class="w-full border rounded px-2 py-1.5"><span class="text-[11px] text-slate-400">${help}</span></label>`;
+  el.innerHTML = `<div class="max-w-3xl bg-white rounded-xl shadow-sm border p-5">
+  <div class="font-bold mb-3">Parâmetros do MRP</div>
+  <div class="grid md:grid-cols-3 gap-4">
+    ${f('horizonte', 'Horizonte de cálculo (dias)', 'number', 'Até onde o MRP projeta o estoque')}
+    ${f('segurancaDias', 'Estoque de segurança (dias)', 'number', 'Dias de demanda mantidos como colchão')}
+    ${f('coberturaDias', 'Cobertura por pedido (dias)', 'number', 'Quantos dias de venda cada compra cobre')}
+    ${f('leadTimePadrao', 'Lead time de produção padrão (dias)')}
+    ${f('transitPadrao', 'Trânsito padrão (dias)')}
+    ${f('desembaracoDias', 'Desembaraço + entrega (dias)', 'number', 'Somado ao lead time total')}
+    ${f('cbmContainer', 'm³ úteis por container', 'number', '40HC ≈ 68 m³ aproveitáveis')}
+    <label class="block"><span class="text-xs text-slate-600 font-semibold">Câmbio USD → R$</span><input id="cf_USD" type="number" step="any" value="${s.cambio.USD}" class="w-full border rounded px-2 py-1.5"></label>
+    <label class="block"><span class="text-xs text-slate-600 font-semibold">Câmbio CNY → R$</span><input id="cf_CNY" type="number" step="any" value="${s.cambio.CNY}" class="w-full border rounded px-2 py-1.5"></label>
+    ${f('dataBase', 'Data-base simulada', 'date', 'Deixe em branco para usar a data de hoje')}
+    <label class="flex items-center gap-2 mt-5 text-xs"><input id="cf_incluirSimulacoes" type="checkbox" ${s.incluirSimulacoes ? 'checked' : ''}> Considerar ordens em "Simulação" no cálculo</label>
+  </div>
+  <div class="font-bold mt-6 mb-2">Assistente IA</div>
+  ${f('workerUrl', 'URL do Cloudflare Worker', 'url', 'Ex.: https://mrp-ia.SEU-SUBDOMINIO.workers.dev — a chave da API fica guardada no Worker, nunca no site')}
+  <div class="flex mt-5"><button onclick="saveConfig()" class="ml-auto bg-sky-600 text-white rounded-lg px-4 py-1.5">Salvar configurações</button></div>
+  </div>
+  <div class="max-w-3xl bg-white rounded-xl shadow-sm border p-5 mt-4 text-xs text-slate-600">
+    <div class="font-bold text-sm text-slate-800 mb-1">Armazenamento</div>
+    ${Store.mode === 'firebase' ? 'Dados salvos no Firebase (coleção <code>' + COLECAO + '</code>), compartilhados entre os usuários @' + DOMINIO_PERMITIDO + '.' : 'Modo local: os dados ficam salvos apenas neste navegador. Para compartilhar com a equipe, preencha o <code>FIREBASE_CONFIG</code> no início do código.'}
+  </div>`;
+}
+function saveConfig() {
+  const s = DB.settings, g = k => document.getElementById('cf_' + k);
+  ['horizonte', 'segurancaDias', 'coberturaDias', 'leadTimePadrao', 'transitPadrao', 'desembaracoDias', 'cbmContainer'].forEach(k => s[k] = Number(g(k).value) || 0);
+  s.horizonte = Math.min(Math.max(s.horizonte, 30), 730);
+  s.cambio = { ...s.cambio, USD: Number(g('USD').value) || 0, CNY: Number(g('CNY').value) || 0 };
+  s.dataBase = g('dataBase').value; s.incluirSimulacoes = g('incluirSimulacoes').checked; s.workerUrl = g('workerUrl').value.trim();
+  changed('settings'); toast('Configurações salvas');
+}
+
+/* ================= INÍCIO ================= */
+(async function init() {
+  if (FIREBASE_CONFIG) document.getElementById('loginScreen').classList.remove('hidden');
+  await Store.init();
+  const h = location.hash.slice(1); if (PAGES.some(p => p[0] === h)) page = h;
+  recalc(); render();
+})();
+window.addEventListener('hashchange', () => { const h = location.hash.slice(1); if (h !== page && PAGES.some(p => p[0] === h)) { page = h; render(); } });
+
+</script>
+</body>
+</html>
