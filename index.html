@@ -120,7 +120,7 @@ const MRPCore = (function () {
       settings: {
         horizonte: 240, segurancaDias: 30, coberturaDias: 60, leadTimePadrao: 45, transitPadrao: 35,
         desembaracoDias: 0, cbmContainer: 68, incluirSimulacoes: true, dataBase: '',
-        cambio: { USD: 5.40, CNY: 0.76, BRL: 1 }, workerUrl: ''
+        cambio: { USD: 5.40, CNY: 0.76, BRL: 1 }, cambioFonte: 'comercial', cambioMargem: 0, cambioInfo: null, workerUrl: ''
       },
       produtos: [],     // itens comprados (MP)
       estrutura: [],    // {pa, mp, qtd}
@@ -317,6 +317,22 @@ const MRPCore = (function () {
     return { atualizados: n, faltando };
   }
 
+  // ---------- câmbio ----------
+  // taxa usada para previsões (câmbio atual + margem de segurança configurável)
+  function taxaPrevisao(db, moeda) {
+    moeda = moeda || 'USD'; if (moeda === 'BRL') return 1;
+    const base = num(db.settings.cambio?.[moeda]); return base * (1 + num(db.settings.cambioMargem) / 100);
+  }
+  // valor de uma linha de ordem em R$: usa o câmbio pago quando informado, senão o de previsão
+  function valorOrdem(db, o, prod) {
+    const cu = num(o.custoUnit) || num(prod?.custo);
+    const moeda = num(o.custoUnit) ? (o.moeda || 'USD') : (prod?.moeda || 'USD');
+    const pago = num(o.cambioPago) > 0 && moeda !== 'BRL';
+    const taxa = moeda === 'BRL' ? 1 : pago ? num(o.cambioPago) : taxaPrevisao(db, moeda);
+    const aberto = Math.max(0, num(o.qtd) - num(o.qtdRecebida));
+    return { cu, moeda, taxa, pago, valorTotal: num(o.qtd) * cu * taxa, valorAberto: aberto * cu * taxa, valorPrevisao: num(o.qtd) * cu * taxaPrevisao(db, moeda) };
+  }
+
   // ---------- motor MRP ----------
   function buildDemandIndex(db) {
     const fcByPa = new Map(db.previsao.map(f => [f.pa, f]));
@@ -409,7 +425,7 @@ const MRPCore = (function () {
       status = dias < 0 ? 'atrasado' : dias <= 7 ? 'comprar' : dias <= 30 ? 'planejar' : 'ok';
     }
     if (avg30 <= 0 && !rates.some(x => x > 0)) status = 'sem_demanda';
-    const custoBRL = num(p.custo) * num(db.settings.cambio?.[p.moeda] ?? 1);
+    const custoBRL = num(p.custo) * taxaPrevisao(db, p.moeda);
     const cbmUn = (num(p.cbmCx) && num(p.pcsCx)) ? num(p.cbmCx) / num(p.pcsCx) : 0;
     return {
       cod: p.cod, produto: p, prm, rates, arr, S, lost, perdaTotal, avg30, rupturaDia: rupt, ruptura: rupt >= 0 ? addDays(today, rupt) : null,
@@ -423,7 +439,7 @@ const MRPCore = (function () {
     const res = db.produtos.filter(p => p.ativo !== false).map(p => computeItem(db, idx, p, opts));
     return { opts, itens: res, byCod: new Map(res.map(r => [r.cod, r])) };
   }
-  return { emptyDB, importWorkbook, importStock, computeAll, computeItem, buildDemandIndex, itemParams, addDays, diffDays, todayISO, serialToISO, num, str };
+  return { taxaPrevisao, valorOrdem, emptyDB, importWorkbook, importStock, computeAll, computeItem, buildDemandIndex, itemParams, addDays, diffDays, todayISO, serialToISO, num, str };
 })();
 
 
@@ -574,7 +590,9 @@ function render() {
   document.getElementById('pageSub').textContent = '';
   document.getElementById('emptyBanner').classList.toggle('hidden', DB.produtos.length > 0 || page === 'importar');
   const base = DB.settings.dataBase ? `<span class="text-amber-600 font-semibold">Data-base simulada: ${fd(DB.settings.dataBase)}</span>` : `Data-base: hoje (${fd(hoje())})`;
-  document.getElementById('baseInfo').innerHTML = base + (DB.estoqueAtualizadoEm ? ` · Estoque atualizado em ${fd(DB.estoqueAtualizadoEm)}` : (DB.produtos.length ? ' · <span class="text-amber-600">Estoque da planilha importada</span>' : ''));
+  const ci = DB.settings.cambioInfo, fonteLbl = { comercial: 'comercial', ptax: 'PTAX', manual: 'manual' }[DB.settings.cambioFonte] || '';
+  const cambioTxt = ` · <span title="${ci?.em ? 'Atualizado em ' + new Date(ci.em).toLocaleString('pt-BR') : ''}${ci?.erro ? ' · ' + esc(ci.erro) : ''}">USD ${nf2.format(DB.settings.cambio.USD)} · CNY ${nf2.format(DB.settings.cambio.CNY)} <span class="${ci?.erro ? 'text-red-500' : 'text-slate-400'}">(${fonteLbl}${ci?.erro ? ' ⚠' : ''})</span></span>`;
+  document.getElementById('baseInfo').innerHTML = base + cambioTxt + (DB.estoqueAtualizadoEm ? ` · Estoque atualizado em ${fd(DB.estoqueAtualizadoEm)}` : (DB.produtos.length ? ' · <span class="text-amber-600">Estoque da planilha importada</span>' : ''));
   document.getElementById('modeInfo').innerHTML = Store.mode === 'firebase' ? '<span class="text-emerald-400">● Nuvem (Firebase)</span>' : '<span class="text-amber-400">● Modo local (este navegador)</span>';
   const fn = { painel: pgPainel, mrp: pgMRP, sugestoes: pgSugestoes, ordens: pgOrdens, embarques: pgEmbarques, previsao: pgPrevisao, cadastros: pgCadastros, importar: pgImportar, ia: pgIA, config: pgConfig }[page] || pgPainel;
   fn(document.getElementById('page'));
@@ -593,7 +611,8 @@ function pgPainel(el) {
   const rupt30 = I.filter(x => x.rupturaDia >= 0 && x.rupturaDia <= 30);
   const abertas = DB.ordens.filter(o => !['Recebido', 'Cancelado'].includes(o.status));
   const transito = abertas.filter(o => o.status === 'Em trânsito');
-  const valOrd = os => os.reduce((s, o) => { const p = prodByCod(o.item); const cu = C.num(o.custoUnit) || C.num(p?.custo); const mo = o.custoUnit ? o.moeda : p?.moeda; return s + (C.num(o.qtd) - C.num(o.qtdRecebida)) * cu * C.num(DB.settings.cambio[mo || 'USD'] ?? 1); }, 0);
+  const valOrd = os => os.reduce((s, o) => s + C.valorOrdem(DB, o, prodByCod(o.item)).valorAberto, 0);
+  const comCambio = abertas.filter(o => C.num(o.cambioPago) > 0).length;
   const estoqueValor = I.reduce((s, x) => s + x.estoqueValor, 0);
   const prox = abertas.map(o => ({ o, d: o.dataChegada })).filter(x => x.d).sort((a, b) => a.d.localeCompare(b.d));
   const proxPO = {}; prox.forEach(({ o }) => { const k = (o.po || '—') + '|' + o.fornecedor; if (!proxPO[k]) proxPO[k] = { po: o.po, forn: o.fornecedor, chegada: o.dataChegada, status: o.status, itens: 0, qtd: 0 }; proxPO[k].itens++; proxPO[k].qtd += C.num(o.qtd) - C.num(o.qtdRecebida); });
@@ -605,7 +624,7 @@ function pgPainel(el) {
     ${kpi('Pedido atrasado', f0(atras.length), 'já passou da data ideal de compra', 'text-red-600', "ui.sugFiltro.status='atrasado';go('sugestoes')")}
     ${kpi('Comprar em 7 dias', f0(comprar.length), `+ ${plan.length} para planejar (30 dias)`, 'text-orange-600', "ui.sugFiltro.status='acao';go('sugestoes')")}
     ${kpi('Ruptura em 30 dias', f0(rupt30.length), `${zerados.length} já sem estoque`, 'text-rose-600', "ui.mrpFiltro.status='ruptura30';go('mrp')")}
-    ${kpi('Em aberto (ordens)', brl.format(valOrd(abertas)), `${uniq(abertas.map(o => o.po)).length} POs · ${brl.format(valOrd(transito))} em trânsito`, 'text-sky-700', "go('ordens')")}
+    ${kpi('Em aberto (ordens)', brl.format(valOrd(abertas)), `${uniq(abertas.map(o => o.po)).length} POs · ${brl.format(valOrd(transito))} em trânsito · ${comCambio} linha(s) com câmbio fechado`, 'text-sky-700', "go('ordens')")}
     ${kpi('Estoque (custo)', brl.format(estoqueValor), 'custo FOB × câmbio')}
   </div>
   <div class="grid grid-cols-1 xl:grid-cols-3 gap-4 mt-4">
@@ -813,18 +832,19 @@ function pgOrdens(el) {
     <select id="ofo" class="border rounded-lg px-2 py-1.5"><option value="">Todos os fornecedores</option>${uniq(DB.ordens.map(o => o.fornecedor)).map(f => opt(f, F.fornecedor)).join('')}</select>
     <span class="text-xs text-slate-500">${rows.length} linhas · ${f0(rows.reduce((s, o) => s + C.num(o.qtd) - C.num(o.qtdRecebida), 0))} pç em aberto</span>
     <div class="ml-auto flex gap-2">
-      <button onclick="bulkStatus()" class="border rounded-lg px-3 py-1.5 bg-white hover:bg-slate-50">Alterar status dos selecionados</button>
+      <button onclick="bulkStatus()" class="border rounded-lg px-3 py-1.5 bg-white hover:bg-slate-50">Alterar selecionados (status / câmbio)</button>
       <button onclick="editOrdem()" class="rounded-lg px-3 py-1.5 bg-sky-600 text-white hover:bg-sky-700">+ Nova linha de ordem</button>
     </div>
   </div>
   <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 190px)"><table class="w-full tbl text-xs">
-  <thead><tr class="text-left"><th class="w-8 text-center"><input type="checkbox" onchange="document.querySelectorAll('.ordck').forEach(c=>c.checked=this.checked)"></th>${th('ord', 'po', 'PO')}${th('ord', 'forn', 'Fornecedor')}${th('ord', 'item', 'Item')}${th('ord', 'qtd', 'Qtd', 'num')}<th class="px-2 num">Recebido</th>${th('ord', 'ped', 'Pedido')}${th('ord', 'emb', 'Embarque')}${th('ord', 'che', 'Chegada')}<th class="px-2 num">Valor</th>${th('ord', 'st', 'Status')}<th></th></tr></thead>
-  <tbody>${rows.map(o => { const p = prodByCod(o.item); const cu = C.num(o.custoUnit) || C.num(p?.custo); const mo = o.custoUnit ? o.moeda : p?.moeda; const venc = o.dataChegada && o.dataChegada < t && !['Recebido', 'Cancelado'].includes(o.status);
+  <thead><tr class="text-left"><th class="w-8 text-center"><input type="checkbox" onchange="document.querySelectorAll('.ordck').forEach(c=>c.checked=this.checked)"></th>${th('ord', 'po', 'PO')}${th('ord', 'forn', 'Fornecedor')}${th('ord', 'item', 'Item')}${th('ord', 'qtd', 'Qtd', 'num')}<th class="px-2 num">Recebido</th>${th('ord', 'ped', 'Pedido')}${th('ord', 'emb', 'Embarque')}${th('ord', 'che', 'Chegada')}<th class="px-2 num" title="Câmbio pago (fechado) ou câmbio de previsão">Câmbio</th><th class="px-2 num">Valor</th>${th('ord', 'st', 'Status')}<th></th></tr></thead>
+  <tbody>${rows.map(o => { const p = prodByCod(o.item); const v = C.valorOrdem(DB, o, p); const venc = o.dataChegada && o.dataChegada < t && !['Recebido', 'Cancelado'].includes(o.status);
     return `<tr class="border-t hover:bg-sky-50"><td class="text-center"><input type="checkbox" class="ordck" value="${o.id}"></td><td class="px-2 py-1.5 font-medium">${esc(o.po || '—')}</td><td class="px-2">${esc(o.fornecedor)}</td>
     <td class="px-2"><span class="text-sky-800 cursor-pointer hover:underline" onclick="openItem('${esc(o.item)}')">${esc(o.item)}</span></td><td class="px-2 num">${f0(o.qtd)}</td><td class="px-2 num">${C.num(o.qtdRecebida) ? f0(o.qtdRecebida) : ''}</td>
     <td class="px-2">${fd(o.dataPedido)}</td><td class="px-2">${fd(o.dataEmbarque)}</td><td class="px-2 ${venc ? 'text-red-600 font-semibold' : ''}">${fd(o.dataChegada)}${venc ? ' ⚠' : ''}</td>
-    <td class="px-2 num">${cu ? brl.format(C.num(o.qtd) * cu * C.num(DB.settings.cambio[mo || 'USD'] ?? 1)) : '–'}</td><td class="px-2">${ordBadge(o.status)}</td>
-    <td class="px-2 text-right"><button class="text-sky-700 hover:underline" onclick="editOrdem('${o.id}')">editar</button></td></tr>`; }).join('') || '<tr><td colspan=12 class="p-4 text-slate-400">Nenhuma ordem</td></tr>'}</tbody></table></div>`;
+    <td class="px-2 num">${v.moeda === 'BRL' ? '–' : `${nf2.format(v.taxa)} <span class="text-[10px] ${v.pago ? 'text-emerald-700 font-semibold' : 'text-slate-400'}">${v.pago ? 'pago' : 'prev.'}</span>`}</td>
+    <td class="px-2 num" title="${v.pago ? 'Com câmbio de previsão: ' + brl.format(v.valorPrevisao) : ''}">${v.cu ? brl.format(v.valorTotal) : '–'}</td><td class="px-2">${ordBadge(o.status)}</td>
+    <td class="px-2 text-right"><button class="text-sky-700 hover:underline" onclick="editOrdem('${o.id}')">editar</button></td></tr>`; }).join('') || '<tr><td colspan=13 class="p-4 text-slate-400">Nenhuma ordem</td></tr>'}</tbody></table></div>`;
   document.getElementById('oq').oninput = e => { F.q = e.target.value; clearTimeout(pgOrdens._t); pgOrdens._t = setTimeout(() => { render(); const i = document.getElementById('oq'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }, 250); };
   document.getElementById('ost').onchange = e => { F.status = e.target.value; render(); };
   document.getElementById('ofo').onchange = e => { F.fornecedor = e.target.value; render(); };
@@ -842,9 +862,11 @@ function editOrdem(id) {
     <label class="block"><span class="text-xs text-slate-500">Status</span><select id="of_status" class="w-full border rounded px-2 py-1.5">${ORD_STATUS.map(s => opt(s, o.status)).join('')}</select></label>
     ${fld('responsavel', 'Responsável')}${fld('custoUnit', 'Custo unitário', 'number')}
     <label class="block"><span class="text-xs text-slate-500">Moeda</span><select id="of_moeda" class="w-full border rounded px-2 py-1.5">${['USD', 'CNY', 'BRL'].map(s => opt(s, o.moeda)).join('')}</select></label>
-    <label class="block col-span-2"><span class="text-xs text-slate-500">Observação</span><input id="of_obs" value="${esc(o.obs || '')}" class="w-full border rounded px-2 py-1.5"></label>
+    <label class="block"><span class="text-xs text-slate-500">Câmbio pago (R$ por 1 unid.)</span><input id="of_cambioPago" type="number" step="any" value="${esc(o.cambioPago ?? '')}" placeholder="previsão: ${nf2.format(C.taxaPrevisao(DB, o.moeda || 'USD'))}" class="w-full border rounded px-2 py-1.5"></label>
+    <label class="block col-span-2 md:col-span-1"><span class="text-xs text-slate-500">Observação</span><input id="of_obs" value="${esc(o.obs || '')}" class="w-full border rounded px-2 py-1.5"></label>
   </div>
-  <div class="text-[11px] text-slate-500 mt-2">Ao mudar data do pedido, lead time ou trânsito, as datas de embarque e chegada são recalculadas (você pode sobrescrever).</div>
+  <div class="text-[11px] text-slate-500 mt-2">Câmbio pago: preencha quando o câmbio da compra for fechado. Em branco, o valor usa o câmbio de previsão (atual${DB.settings.cambioMargem ? ' + ' + DB.settings.cambioMargem + '%' : ''}).</div>
+  <div class="text-[11px] text-slate-500 mt-1">Ao mudar data do pedido, lead time ou trânsito, as datas de embarque e chegada são recalculadas (você pode sobrescrever).</div>
   <div class="flex gap-2 mt-4">${id ? `<button onclick="delOrdem('${id}')" class="text-red-600 border border-red-200 rounded-lg px-3 py-1.5">Excluir</button>` : ''}<button onclick="closeModal()" class="ml-auto border rounded-lg px-3 py-1.5">Cancelar</button><button onclick="saveOrdem('${id || ''}')" class="bg-sky-600 text-white rounded-lg px-4 py-1.5">Salvar</button></div>`, 'max-w-3xl');
   const g = k => document.getElementById('of_' + k);
   const rec = () => { if (g('dataPedido').value) { g('dataEmbarque').value = C.addDays(g('dataPedido').value, Number(g('leadTime').value) || 0); g('dataChegada').value = C.addDays(g('dataEmbarque').value, Number(g('transitTime').value) || 0); } };
@@ -854,7 +876,7 @@ function editOrdem(id) {
 }
 function saveOrdem(id) {
   const g = k => document.getElementById('of_' + k).value;
-  const o = { id: id || uid('po'), po: g('po').trim(), fornecedor: g('fornecedor').trim().toUpperCase(), item: g('item').trim(), qtd: Number(g('qtd')) || 0, dataPedido: g('dataPedido'), leadTime: Number(g('leadTime')) || 0, dataEmbarque: g('dataEmbarque'), transitTime: Number(g('transitTime')) || 0, dataChegada: g('dataChegada'), qtdRecebida: Number(g('qtdRecebida')) || 0, status: g('status'), custoUnit: Number(g('custoUnit')) || 0, moeda: g('moeda'), responsavel: g('responsavel'), obs: g('obs') };
+  const o = { id: id || uid('po'), po: g('po').trim(), fornecedor: g('fornecedor').trim().toUpperCase(), item: g('item').trim(), qtd: Number(g('qtd')) || 0, dataPedido: g('dataPedido'), leadTime: Number(g('leadTime')) || 0, dataEmbarque: g('dataEmbarque'), transitTime: Number(g('transitTime')) || 0, dataChegada: g('dataChegada'), qtdRecebida: Number(g('qtdRecebida')) || 0, status: g('status'), custoUnit: Number(g('custoUnit')) || 0, moeda: g('moeda'), cambioPago: Number(g('cambioPago')) || null, responsavel: g('responsavel'), obs: g('obs') };
   if (!o.item || !o.qtd) { toast('Informe item e quantidade'); return; }
   if (o.status === 'Recebido' && !o.qtdRecebida) o.qtdRecebida = o.qtd;
   if (!prodByCod(o.item) && !confirm(`O item ${o.item} não está no cadastro. Salvar mesmo assim?`)) return;
@@ -865,11 +887,12 @@ function delOrdem(id) { if (!confirm('Excluir esta linha de ordem?')) return; DB
 function bulkStatus() {
   const ids = [...document.querySelectorAll('.ordck:checked')].map(c => c.value);
   if (!ids.length) { toast('Selecione linhas'); return; }
-  openModal('Alterar status', `<div class="text-xs mb-2">${ids.length} linha(s) selecionada(s)</div><select id="bs" class="border rounded px-2 py-1.5 w-full">${ORD_STATUS.map(s => opt(s, '')).join('')}</select>
+  openModal('Alterar linhas selecionadas', `<div class="text-xs mb-2">${ids.length} linha(s) selecionada(s). Campos em branco não são alterados.</div><label class="block text-xs"><span class="text-slate-500">Status</span><select id="bs" class="border rounded px-2 py-1.5 w-full"><option value="">(manter)</option>${ORD_STATUS.map(s => opt(s, '')).join('')}</select></label>
+  <label class="block mt-3 text-xs"><span class="text-slate-500">Câmbio pago (R$ por 1 USD/CNY) — use quando fechar o câmbio da PO</span><input id="bsc" type="number" step="any" class="border rounded px-2 py-1.5 w-full"></label>
   <label class="block mt-3 text-xs"><span class="text-slate-500">Nova data de chegada (opcional)</span><input id="bsd" type="date" class="border rounded px-2 py-1.5 w-full"></label>
   <div class="text-[11px] text-slate-500 mt-2">Ao marcar como "Recebido", a quantidade recebida = quantidade da ordem. Lembre-se de atualizar o estoque (importação do ERP) para não contar em dobro.</div>
   <div class="flex mt-4"><button class="ml-auto bg-sky-600 text-white rounded-lg px-4 py-1.5" onclick="applyBulk()">Aplicar</button></div>`, 'max-w-md');
-  window.applyBulk = () => { const s = document.getElementById('bs').value, d = document.getElementById('bsd').value; DB.ordens.forEach(o => { if (ids.includes(o.id)) { o.status = s; if (s === 'Recebido') o.qtdRecebida = o.qtd; if (d) o.dataChegada = d; } }); closeModal(); changed('ordens'); };
+  window.applyBulk = () => { const s = document.getElementById('bs').value, d = document.getElementById('bsd').value, c = Number(document.getElementById('bsc').value) || 0; DB.ordens.forEach(o => { if (ids.includes(o.id)) { if (s) { o.status = s; if (s === 'Recebido') o.qtdRecebida = o.qtd; } if (d) o.dataChegada = d; if (c > 0) o.cambioPago = c; } }); closeModal(); changed('ordens'); toast(`${ids.length} linha(s) atualizada(s)`); };
 }
 
 /* ================= EMBARQUES ================= */
@@ -1058,7 +1081,8 @@ function contextoIA() {
     .map(x => [x.cod, x.produto.familia, x.produto.fornecedor, Math.round(C.num(x.produto.estoque)), Math.round(x.avg30 * 10) / 10, x.diasEstoque ?? '', Math.round(x.totalAberto), x.ruptura || '-', x.prox?.dataPedidoIdeal || '-', x.prox?.qtd || '-', STATUS_LBL[x.status]].join(';'));
   const abertas = DB.ordens.filter(o => !['Recebido', 'Cancelado'].includes(o.status));
   const porPO = {}; abertas.forEach(o => { const k = o.po || '—'; porPO[k] = porPO[k] || { forn: o.fornecedor, status: o.status, chegada: o.dataChegada, itens: 0 }; porPO[k].itens++; });
-  return `Data-base: ${t}. Horizonte: ${R.opts.horizonte} dias. Parâmetros padrão: estoque de segurança ${DB.settings.segurancaDias} dias, cobertura por pedido ${DB.settings.coberturaDias} dias.
+  return `Câmbio de previsão: USD ${DB.settings.cambio.USD} · CNY ${DB.settings.cambio.CNY} (${DB.settings.cambioFonte}${DB.settings.cambioMargem ? ' + ' + DB.settings.cambioMargem + '% de margem' : ''}).
+Data-base: ${t}. Horizonte: ${R.opts.horizonte} dias. Parâmetros padrão: estoque de segurança ${DB.settings.segurancaDias} dias, cobertura por pedido ${DB.settings.coberturaDias} dias.
 Itens (até 80, ordenados por ruptura). Colunas: item;família;fornecedor;estoque;demanda_dia;dias_estoque;em_aberto;ruptura_projetada;pedir_ate;qtd_sugerida;situação
 ${linhas.join('\n')}
 Ordens em aberto por PO: ${Object.entries(porPO).map(([k, v]) => `${k} (${v.forn}, ${v.status}, chegada ${v.chegada || '?'}, ${v.itens} itens)`).join(' | ')}`;
@@ -1110,10 +1134,19 @@ function pgConfig(el) {
     ${f('transitPadrao', 'Trânsito padrão (dias)')}
     ${f('desembaracoDias', 'Desembaraço + entrega (dias)', 'number', 'Somado ao lead time total')}
     ${f('cbmContainer', 'm³ úteis por container', 'number', '40HC ≈ 68 m³ aproveitáveis')}
-    <label class="block"><span class="text-xs text-slate-600 font-semibold">Câmbio USD → R$</span><input id="cf_USD" type="number" step="any" value="${s.cambio.USD}" class="w-full border rounded px-2 py-1.5"></label>
-    <label class="block"><span class="text-xs text-slate-600 font-semibold">Câmbio CNY → R$</span><input id="cf_CNY" type="number" step="any" value="${s.cambio.CNY}" class="w-full border rounded px-2 py-1.5"></label>
     ${f('dataBase', 'Data-base simulada', 'date', 'Deixe em branco para usar a data de hoje')}
     <label class="flex items-center gap-2 mt-5 text-xs"><input id="cf_incluirSimulacoes" type="checkbox" ${s.incluirSimulacoes ? 'checked' : ''}> Considerar ordens em "Simulação" no cálculo</label>
+  </div>
+  <div class="font-bold mt-6 mb-2">Câmbio para previsões</div>
+  <div class="grid md:grid-cols-3 gap-4">
+    <label class="block"><span class="text-xs text-slate-600 font-semibold">Fonte</span><select id="cf_cambioFonte" class="w-full border rounded px-2 py-1.5" onchange="document.querySelectorAll('.cf-manual').forEach(i=>i.disabled=this.value!=='manual')">
+      ${opt('comercial', s.cambioFonte, 'Comercial em tempo real (venda)')}${opt('ptax', s.cambioFonte, 'PTAX Banco Central (fechamento)')}${opt('manual', s.cambioFonte, 'Manual')}</select>
+      <span class="text-[11px] text-slate-400">Comercial: AwesomeAPI, atualiza a cada 30 min. PTAX: taxa oficial do BCB (referência da DI).</span></label>
+    <label class="block"><span class="text-xs text-slate-600 font-semibold">USD → R$</span><input id="cf_USD" type="number" step="any" value="${s.cambio.USD}" ${s.cambioFonte === 'manual' ? '' : 'disabled'} class="cf-manual w-full border rounded px-2 py-1.5 disabled:bg-slate-100"></label>
+    <label class="block"><span class="text-xs text-slate-600 font-semibold">CNY → R$</span><input id="cf_CNY" type="number" step="any" value="${s.cambio.CNY}" ${s.cambioFonte === 'manual' ? '' : 'disabled'} class="cf-manual w-full border rounded px-2 py-1.5 disabled:bg-slate-100"></label>
+    ${f('cambioMargem', 'Margem de segurança (%)', 'number', 'Somada ao câmbio nas previsões (ex.: 3 = câmbio + 3%). Não afeta ordens com câmbio pago.')}
+    <div class="md:col-span-2 text-xs text-slate-500 self-center">${s.cambioInfo?.em ? `Última atualização: <b>${new Date(s.cambioInfo.em).toLocaleString('pt-BR')}</b> · ${esc(s.cambioInfo.ref || '')}` : 'Ainda não atualizado automaticamente.'}${s.cambioInfo?.erro ? `<div class="text-red-600">Falha na última tentativa: ${esc(s.cambioInfo.erro)}</div>` : ''}
+      <button onclick="atualizarCambio(true)" class="ml-2 border rounded px-2 py-0.5 text-sky-700">Atualizar agora</button></div>
   </div>
   <div class="font-bold mt-6 mb-2">Assistente IA</div>
   ${f('workerUrl', 'URL do Cloudflare Worker', 'url', 'Ex.: https://mrp-ia.SEU-SUBDOMINIO.workers.dev — a chave da API fica guardada no Worker, nunca no site')}
@@ -1128,9 +1161,43 @@ function saveConfig() {
   const s = DB.settings, g = k => document.getElementById('cf_' + k);
   ['horizonte', 'segurancaDias', 'coberturaDias', 'leadTimePadrao', 'transitPadrao', 'desembaracoDias', 'cbmContainer'].forEach(k => s[k] = Number(g(k).value) || 0);
   s.horizonte = Math.min(Math.max(s.horizonte, 30), 730);
-  s.cambio = { ...s.cambio, USD: Number(g('USD').value) || 0, CNY: Number(g('CNY').value) || 0 };
+  const fonteAntes = s.cambioFonte; s.cambioFonte = g('cambioFonte').value; s.cambioMargem = Number(g('cambioMargem').value) || 0;
+  if (s.cambioFonte === 'manual') { s.cambio = { ...s.cambio, USD: Number(g('USD').value) || 0, CNY: Number(g('CNY').value) || 0 }; s.cambioInfo = { fonte: 'manual', em: new Date().toISOString(), ref: 'informado manualmente' }; }
   s.dataBase = g('dataBase').value; s.incluirSimulacoes = g('incluirSimulacoes').checked; s.workerUrl = g('workerUrl').value.trim();
   changed('settings'); toast('Configurações salvas');
+  if (s.cambioFonte !== 'manual' && s.cambioFonte !== fonteAntes) atualizarCambio(true);
+}
+
+/* ================= CÂMBIO EM TEMPO REAL ================= */
+async function buscarPTAX(moeda) {
+  const d = new Date(), ini = new Date(d - 10 * 864e5), f = x => `${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}-${x.getFullYear()}`;
+  const u = `https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoMoedaPeriodo(moeda=@moeda,dataInicial=@dataInicial,dataFinalCotacao=@dataFinalCotacao)?@moeda='${moeda}'&@dataInicial='${f(ini)}'&@dataFinalCotacao='${f(d)}'&$format=json&$select=cotacaoVenda,dataHoraCotacao,tipoBoletim`;
+  const j = await fetch(u).then(r => { if (!r.ok) throw new Error('BCB ' + r.status); return r.json(); });
+  const v = j.value || []; if (!v.length) throw new Error('BCB sem cotação de ' + moeda);
+  const fech = v.filter(x => x.tipoBoletim === 'Fechamento'); const x = (fech.length ? fech : v)[(fech.length ? fech : v).length - 1];
+  return { taxa: x.cotacaoVenda, ref: `${x.tipoBoletim} ${x.dataHoraCotacao.slice(8, 10)}/${x.dataHoraCotacao.slice(5, 7)} ${x.dataHoraCotacao.slice(11, 16)}` };
+}
+async function atualizarCambio(force) {
+  const s = DB.settings; if (s.cambioFonte === 'manual') { if (force) toast('Fonte manual: informe os valores e salve'); return; }
+  if (!force && s.cambioInfo?.em && s.cambioInfo.fonte === s.cambioFonte && Date.now() - new Date(s.cambioInfo.em) < 30 * 60000) return;
+  try {
+    let USD, CNY, ref;
+    if (s.cambioFonte === 'ptax') {
+      const [u, c] = await Promise.all([buscarPTAX('USD'), buscarPTAX('CNY')]);
+      USD = u.taxa; CNY = c.taxa; ref = `PTAX venda · USD ${u.ref} · CNY ${c.ref}`;
+    } else {
+      const j = await fetch('https://economia.awesomeapi.com.br/json/last/USD-BRL,CNY-BRL').then(r => { if (!r.ok) throw new Error('AwesomeAPI ' + r.status); return r.json(); });
+      USD = Number(j.USDBRL.ask); CNY = Number(j.CNYBRL.ask); ref = `Comercial venda · cotação de ${j.USDBRL.create_date.slice(8, 10)}/${j.USDBRL.create_date.slice(5, 7)} ${j.USDBRL.create_date.slice(11, 16)}`;
+    }
+    if (!(USD > 0) || !(CNY > 0)) throw new Error('cotação inválida');
+    s.cambio = { ...s.cambio, USD: Math.round(USD * 10000) / 10000, CNY: Math.round(CNY * 10000) / 10000 };
+    s.cambioInfo = { fonte: s.cambioFonte, em: new Date().toISOString(), ref };
+    if (force) toast(`Câmbio atualizado: USD ${nf2.format(s.cambio.USD)} · CNY ${nf2.format(s.cambio.CNY)}`);
+  } catch (e) {
+    s.cambioInfo = { ...(s.cambioInfo || {}), erro: e.message };
+    toast('Não consegui atualizar o câmbio (' + e.message + '). Usando o último valor salvo.', 4000);
+  }
+  recalc(); Store.save('settings'); render();
 }
 
 /* ================= INÍCIO ================= */
@@ -1139,6 +1206,8 @@ function saveConfig() {
   await Store.init();
   const h = location.hash.slice(1); if (PAGES.some(p => p[0] === h)) page = h;
   recalc(); render();
+  atualizarCambio(false);
+  setInterval(() => atualizarCambio(false), 30 * 60000);
 })();
 window.addEventListener('hashchange', () => { const h = location.hash.slice(1); if (h !== page && PAGES.some(p => p[0] === h)) { page = h; render(); } });
 
