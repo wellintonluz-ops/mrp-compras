@@ -128,6 +128,7 @@ const MRPCore = (function () {
       ordens: [],       // linhas de ordem de compra
       embarques: [],    // follow-up de navios
       fornecedores: [], // {nome, leadTime, transitTime, moeda, contato, linha}
+      vendas: null,     // vendas efetivas agregadas por SKU/dia
       estoqueAtualizadoEm: null
     };
   }
@@ -333,6 +334,239 @@ const MRPCore = (function () {
     return { cu, moeda, taxa, pago, valorTotal: num(o.qtd) * cu * taxa, valorAberto: aberto * cu * taxa, valorPrevisao: num(o.qtd) * cu * taxaPrevisao(db, moeda) };
   }
 
+
+  // ---------- vendas efetivas ----------
+  const normH = v => str(v).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  // CSV com aspas, ; ou , e quebras de linha dentro de campos
+  function eachCSVRow(text, cb) {
+    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+    const firstLine = text.slice(0, text.indexOf('\n') > 0 ? text.indexOf('\n') : 2000);
+    const sep = (firstLine.split(';').length >= firstLine.split(',').length) ? ';' : ',';
+    let row = [], field = '', i = 0, q = false; const n = text.length;
+    while (i < n) {
+      const c = text[i];
+      if (q) {
+        if (c === '"') { if (text[i + 1] === '"') { field += '"'; i += 2; continue; } q = false; i++; continue; }
+        field += c; i++; continue;
+      }
+      if (c === '"') { q = true; i++; continue; }
+      if (c === sep) { row.push(field); field = ''; i++; continue; }
+      if (c === '\r') { i++; continue; }
+      if (c === '\n') { row.push(field); if (cb(row) === false) return; row = []; field = ''; i++; continue; }
+      field += c; i++;
+    }
+    if (field !== '' || row.length) { row.push(field); cb(row); }
+  }
+  function toISODate(v) {
+    if (typeof v === 'number') return serialToISO(v);
+    const s = str(v); let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+    if (m) return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+    m = s.match(/^(\d{4})-(\d{2})-(\d{2})/); return m ? `${m[1]}-${m[2]}-${m[3]}` : null;
+  }
+  // rowsProvider: function(cb) que chama cb(arrayDeCampos) por linha
+  function parseVendas(rowsProvider) {
+    let H = null; const out = { ini: null, fim: null, linhas: 0, canceladas: 0, invalidas: 0, b2bLinhas: 0, skus: {} };
+    const find = (hs, ...names) => { for (const nm of names) { const i = hs.indexOf(nm); if (i >= 0) return i; } return -1; };
+    rowsProvider(row => {
+      if (!H) {
+        const hs = row.map(normH);
+        if (hs.includes('sku') && (hs.includes('qtd') || hs.includes('quantidade'))) {
+          H = { data: find(hs, 'datadopedido', 'datapedido', 'data', 'dataemissao'), sku: find(hs, 'sku', 'codigo'), qtd: find(hs, 'qtd', 'quantidade'), st: find(hs, 'statusexpedicao', 'status', 'situacao'), canal: find(hs, 'canal'), fam: find(hs, 'familia'), valor: find(hs, 'valortotaldoitem', 'valortotal') };
+          if (H.data < 0) throw new Error('Coluna "Data do pedido" não encontrada.');
+        }
+        return;
+      }
+      if (row.length < 3) return;
+      const sku = str(row[H.sku]); if (!sku) return;
+      if (H.st >= 0 && /cancel/i.test(str(row[H.st]))) { out.canceladas++; return; }
+      const d = toISODate(row[H.data]); const q = num(row[H.qtd]);
+      if (!d || !q) { out.invalidas++; return; }
+      out.linhas++;
+      if (!out.ini || d < out.ini) out.ini = d; if (!out.fim || d > out.fim) out.fim = d;
+      const k = out.skus[sku] || (out.skus[sku] = { fam: H.fam >= 0 ? str(row[H.fam]) : '', dias: {}, b2b: {}, valor: 0 });
+      k.dias[d] = (k.dias[d] || 0) + q;
+      if (H.canal >= 0 && /proposta/i.test(str(row[H.canal]))) { k.b2b[d] = (k.b2b[d] || 0) + q; out.b2bLinhas++; }
+      if (H.valor >= 0) k.valor += num(String(row[H.valor]).replace(',', '.'));
+    });
+    if (!H) throw new Error('Não encontrei o cabeçalho (colunas SKU, Qtd e Data do pedido).');
+    if (!out.linhas) throw new Error('Nenhuma venda válida encontrada no arquivo.');
+    return out;
+  }
+  function parseVendasCSV(text) { return parseVendas(cb => eachCSVRow(text, cb)); }
+  function parseVendasSheet(XLSX, wb) { const ws = wb.Sheets[wb.SheetNames[0]]; const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: '' }); return parseVendas(cb => { for (const r of rows) cb(r); }); }
+  // mescla no histórico: dias do período do arquivo são substituídos, os demais mantidos
+  function mergeVendas(db, P, arquivo) {
+    const old = db.vendas;
+    const oldFim = old ? addDays(old.base, old.dias - 1) : null;
+    const base = old && old.base < P.ini ? old.base : P.ini;
+    const fim = oldFim && oldFim > P.fim ? oldFim : P.fim;
+    const dias = diffDays(base, fim) + 1;
+    const i0 = diffDays(base, P.ini), i1 = diffDays(base, P.fim);
+    const skus = {};
+    const get = sku => skus[sku] || (skus[sku] = { fam: '', q: new Array(dias).fill(0), b: {}, valor: 0 });
+    if (old) Object.entries(old.skus).forEach(([sku, o]) => {
+      const off = diffDays(base, old.base); const k = get(sku); k.fam = o.fam;
+      o.q.forEach((v, i) => { const j = i + off; if (v && (j < i0 || j > i1)) k.q[j] = v; });
+      Object.entries(o.b || {}).forEach(([d, v]) => { if (d < P.ini || d > P.fim) k.b[d] = v; });
+    });
+    Object.entries(P.skus).forEach(([sku, o]) => {
+      const k = get(sku); if (o.fam) k.fam = o.fam; k.valor += o.valor;
+      Object.entries(o.dias).forEach(([d, v]) => { k.q[diffDays(base, d)] += v; });
+      Object.entries(o.b2b).forEach(([d, v]) => { k.b[d] = (k.b[d] || 0) + v; });
+    });
+    Object.values(skus).forEach(k => { k.q = k.q.map(v => Math.round(v * 1000) / 1000); });
+    const importacoes = [...(old?.importacoes || []), { arquivo, ini: P.ini, fim: P.fim, linhas: P.linhas, em: new Date().toISOString() }].slice(-20);
+    db.vendas = { base, dias, skus, importacoes };
+    return { base, fim, dias };
+  }
+  // vínculos sugeridos para SKUs vendidos sem estrutura (ex.: pisos em pacote PBG0007-5 → PPBG0007)
+  function sugerirVinculos(db) {
+    if (!db.vendas) return [];
+    const temEstr = new Set(db.estrutura.map(e => e.pa)); const prods = new Set(db.produtos.map(p => p.cod));
+    const out = [];
+    Object.keys(db.vendas.skus).forEach(sku => {
+      if (temEstr.has(sku) || prods.has(sku)) return;
+      const m = sku.match(/^([A-Z]+\d+)-(\d+)$/); if (!m) return;
+      const mp = 'P' + m[1]; if (!prods.has(mp)) return;
+      const mkt = db.estrutura.find(e => e.pa === m[1] + '_MKT' && e.mp === mp);
+      const fator = mkt ? num(mkt.qtd) : 1;
+      out.push({ pa: sku, mp, qtd: num(m[2]) * fator, regra: mkt ? `${m[2]} × ${fator} (mesmo fator do ${m[1]}_MKT)` : `${m[2]} un.` });
+    });
+    return out;
+  }
+  // consumo real por componente e comparação com a previsão
+  function analisarVendas(db, R, o = {}) {
+    const V = db.vendas; if (!V || !R) return null;
+    const janela = Math.max(7, num(o.janela) || 60), excl = o.excluirB2B !== false, tol = (o.tolerancia ?? 25) / 100;
+    const fim = addDays(V.base, V.dias - 1);
+    const i1 = V.dias - 1, i0 = Math.max(0, i1 - janela + 1), nd = i1 - i0 + 1;
+    const dayISO = i => addDays(V.base, i);
+    const isoCache = []; for (let i = 0; i < V.dias; i++) isoCache[i] = dayISO(i);
+    const real = (k, i) => { const q = k.q[i] || 0; return excl ? q - (k.b?.[isoCache[i]] || 0) : q; };
+    const struct = new Map(); db.estrutura.forEach(e => { if (!struct.has(e.pa)) struct.set(e.pa, []); struct.get(e.pa).push({ mp: e.mp, qtd: num(e.qtd) }); });
+    const prods = new Set(db.produtos.map(p => p.cod));
+    const consumers = new Map();
+    const skus = [];
+    const idx = buildDemandIndex(db);
+    // por SKU vendido
+    Object.entries(V.skus).forEach(([sku, k]) => {
+      const comps = struct.get(sku) || (prods.has(sku) ? [{ mp: sku, qtd: 1 }] : null);
+      if (comps) comps.forEach(c => { if (!consumers.has(c.mp)) consumers.set(c.mp, []); consumers.get(c.mp).push({ sku, qtd: c.qtd }); });
+      let tot = 0, totAll = 0, r28 = 0, rPrev = 0;
+      for (let i = i0; i <= i1; i++) { tot += real(k, i); totAll += k.q[i] || 0; }
+      for (let i = Math.max(0, i1 - 27); i <= i1; i++) r28 += real(k, i);
+      const pStart = Math.max(0, i1 - 27 - 56); for (let i = pStart; i < Math.max(0, i1 - 27); i++) rPrev += real(k, i);
+      const nPrev = Math.max(0, i1 - 27) - pStart;
+      const fc = idx.fcByPa.get(sku);
+      let prev = null; if (fc) { let s = 0; for (let i = i0; i <= i1; i++) s += paRate(fc, isoCache[i].slice(0, 7)); prev = s / nd; }
+      let b2bWin = 0; Object.entries(k.b || {}).forEach(([d, v]) => { if (d >= isoCache[i0] && d <= fim) b2bWin += v; });
+      skus.push({ sku, fam: k.fam, realDia: tot / nd, total: tot, b2b: b2bWin, totalBruto: totAll, prevDia: prev, desvio: prev ? tot / nd / prev - 1 : null,
+        tendencia: nPrev >= 28 && rPrev > 0 ? (r28 / 28) / (rPrev / nPrev) - 1 : null, mapeado: !!comps, comps: comps || [] });
+    });
+    // previsões sem venda
+    db.previsao.forEach(f => { if (V.skus[f.pa]) return; let s = 0; for (let i = i0; i <= i1; i++) s += paRate(f, isoCache[i].slice(0, 7)); if (s > 0) skus.push({ sku: f.pa, fam: f.grupo, realDia: 0, total: 0, b2b: 0, totalBruto: 0, prevDia: s / nd, desvio: -1, tendencia: null, mapeado: !!struct.get(f.pa), comps: struct.get(f.pa) || [], semVendaNoArquivo: true }); });
+    // por componente
+    const itens = R.itens.map(x => {
+      const cs = consumers.get(x.cod) || [];
+      const dailyReal = i => { let s = 0; cs.forEach(c => { s += real(V.skus[c.sku], i) * c.qtd; }); return s; };
+      let tot = 0; for (let i = i0; i <= i1; i++) tot += dailyReal(i);
+      let r28 = 0; for (let i = Math.max(0, i1 - 27); i <= i1; i++) r28 += dailyReal(i);
+      const pStart = Math.max(0, i1 - 27 - 56); let rPrev = 0; for (let i = pStart; i < Math.max(0, i1 - 27); i++) rPrev += dailyReal(i);
+      const nPrev = Math.max(0, i1 - 27) - pStart;
+      let ps = 0; for (let i = i0; i <= i1; i++) ps += mpRateForMonth(idx, x.cod, isoCache[i].slice(0, 7));
+      const realDia = tot / nd, prevDia = ps / nd;
+      const desvio = prevDia > 0 ? realDia / prevDia - 1 : null;
+      let status = 'ok';
+      if (prevDia <= 0 && realDia <= 0) status = 'sem_dados';
+      else if (prevDia <= 0) status = 'sem_previsao';
+      else if (realDia <= 0) status = 'sem_venda';
+      else if (desvio > tol) status = 'acima';
+      else if (desvio < -tol) status = 'abaixo';
+      let alt = null;
+      if (cs.length && (status === 'acima' || status === 'abaixo' || status === 'sem_venda' || status === 'sem_previsao')) {
+        const a = computeItem(db, idx, x.produto, { ...R.opts, rateOverride: new Map([[x.cod, realDia]]) });
+        alt = { ruptura: a.ruptura, rupturaDia: a.rupturaDia, prox: a.prox, status: a.status, diasEstoque: a.diasEstoque };
+      }
+      const cobReal = realDia > 0 ? (num(x.produto.estoque) + x.totalAberto) / realDia : null;
+      return { cod: x.cod, x, realDia, prevDia, prevAtual: x.avg30, desvio, status, alt, consumidores: cs.map(c => c.sku), cobReal,
+        tendencia: nPrev >= 28 && rPrev > 0 ? (r28 / 28) / (rPrev / nPrev) - 1 : null };
+    });
+    // pontos de atenção
+    const alertas = [];
+    const fmt = v => (Math.abs(v) < 10 && v % 1 ? (Math.round(v * 10) / 10) : Math.round(v)).toLocaleString('pt-BR'), fd = s => s ? s.slice(8, 10) + '/' + s.slice(5, 7) + '/' + s.slice(2, 4) : '–';
+    itens.forEach(a => {
+      const x = a.x;
+      if (a.status === 'acima' && a.alt) {
+        const antes = x.rupturaDia, depois = a.alt.rupturaDia;
+        if (depois >= 0 && (antes < 0 || depois < antes - 6)) {
+          alertas.push({ tipo: 'ruptura', sev: depois <= x.prm.LT ? 3 : 2, cod: a.cod, ordem: depois,
+            titulo: `${a.cod}: vende ${Math.round(a.desvio * 100)}% acima da previsão — ruptura antecipada`,
+            texto: `Consumo real ${fmt(a.realDia)}/dia × previsto ${fmt(a.prevDia)}/dia. Pelo ritmo real o estoque acaba em ${fd(a.alt.ruptura)}${antes >= 0 ? ` (a previsão indicava ${fd(x.ruptura)})` : ' (a previsão não indicava ruptura no horizonte)'}.${a.alt.prox ? (a.alt.prox.atrasado ? ` Pelo ritmo real a compra já está atrasada: ${fmt(a.alt.prox.qtd)} pç, pedir agora (chegada ${fd(a.alt.prox.dataChegada)}).` : ` Compra sugerida pelo ritmo real: ${fmt(a.alt.prox.qtd)} pç até ${fd(a.alt.prox.dataPedidoIdeal)}.`) : ''}` });
+        }
+      }
+      if ((a.status === 'abaixo' || a.status === 'sem_venda') && a.alt) {
+        const qPrev = x.prox?.qtd || 0, qReal = a.alt.prox?.qtd || 0, dif = qPrev - qReal;
+        if (dif > 0 && x.prox) {
+          const val = dif * x.custoBRL;
+          alertas.push({ tipo: 'excesso', sev: (x.status === 'atrasado' || x.status === 'comprar') ? 3 : 2, cod: a.cod, ordem: -val,
+            titulo: `${a.cod}: previsão ${a.status === 'sem_venda' ? 'sem vendas reais' : Math.round(-a.desvio * 100) + '% acima do vendido'} — risco de comprar demais`,
+            texto: `A sugestão atual é ${fmt(qPrev)} pç (previsão ${fmt(a.prevDia)}/dia). Pelo consumo real (${fmt(a.realDia)}/dia) seria ${qReal ? fmt(qReal) + ' pç' : 'nenhuma compra no horizonte'}${val ? ` — diferença ≈ R$ ${fmt(val)}` : ''}.` });
+        }
+      }
+      if (a.cobReal !== null && a.cobReal > 240 && (x.totalAberto > 0 || x.prox)) {
+        alertas.push({ tipo: 'cobertura', sev: 1, cod: a.cod, ordem: -a.cobReal,
+          titulo: `${a.cod}: estoque + ordens em aberto cobrem ${fmt(a.cobReal)} dias pelo ritmo real`,
+          texto: `Estoque ${fmt(x.produto.estoque)} + em aberto ${fmt(x.totalAberto)} pç para um consumo real de ${fmt(a.realDia)}/dia. Avalie segurar ou reduzir novas compras.` });
+      }
+      const relevante = Math.max(a.realDia, a.prevDia) >= 2 || a.realDia * x.custoBRL >= 300;
+      if (a.tendencia !== null && Math.abs(a.tendencia) >= 0.4 && a.realDia > 0 && relevante && a.status !== 'sem_dados') {
+        const caiuZero = a.tendencia <= -0.9;
+        alertas.push({ tipo: 'tendencia', sev: caiuZero ? 2 : 1, cod: a.cod, ordem: -Math.abs(a.tendencia) * Math.max(a.realDia, a.prevDia),
+          titulo: `${a.cod}: vendas ${a.tendencia > 0 ? 'subindo' : 'caindo'} ${Math.round(Math.abs(a.tendencia) * 100)}% nas últimas 4 semanas`,
+          texto: caiuZero ? `As vendas praticamente pararam nas últimas 4 semanas. Antes de reduzir a previsão, verifique se não foi falta de estoque ou anúncio pausado — venda zero por ruptura não é queda de demanda.` : `Média das últimas 4 semanas comparada às 8 anteriores. Confirme se é tendência (ajustar previsão) ou efeito pontual (promoção, anúncio pausado, falta de estoque).` });
+      }
+    });
+    const semEstr = skus.filter(s => !s.mapeado && s.total > 0).sort((a, b) => b.total - a.total);
+    const totJan = skus.reduce((s, k) => s + k.total, 0);
+    if (semEstr.length) {
+      const q = semEstr.reduce((s, k) => s + k.total, 0);
+      alertas.push({ tipo: 'sem_estrutura', sev: q / totJan > 0.02 ? 3 : 2, cod: '', ordem: 0,
+        titulo: `${semEstr.length} SKUs vendidos não estão na estrutura — ${(q / totJan * 100).toFixed(1)}% do volume fora do MRP`,
+        texto: `O consumo desses produtos não chega aos componentes, então o MRP subestima a demanda deles. Maiores: ${semEstr.slice(0, 8).map(k => `${k.sku} (${fmt(k.total)})`).join(', ')}.` });
+    }
+    skus.filter(s => s.b2b > 0 && s.totalBruto > 0 && s.b2b / s.totalBruto >= 0.2).forEach(s => alertas.push({ tipo: 'b2b', sev: 1, cod: s.sku, ordem: -s.b2b,
+      titulo: `${s.sku}: ${Math.round(s.b2b / s.totalBruto * 100)}% do volume veio de proposta comercial`,
+      texto: `Vendas B2B pontuais (${fmt(s.b2b)} un.) ${excl ? 'foram excluídas do ritmo real' : 'estão incluídas no ritmo real'}. Não use esse volume como base de reposição sem confirmar se vai se repetir.` }));
+    const semVenda = skus.filter(s => s.prevDia > 0 && s.total <= 0);
+    if (semVenda.length) alertas.push({ tipo: 'sem_venda', sev: 1, cod: '', ordem: 0,
+      titulo: `${semVenda.length} produtos têm previsão mas não venderam nos últimos ${nd} dias`,
+      texto: `Podem ser produtos descontinuados, código de venda diferente (ex.: _MKT) ou sem anúncio ativo. ${semVenda.slice(0, 10).map(s => s.sku).join(', ')}${semVenda.length > 10 ? '…' : ''}.` });
+    const ordemTipo = { ruptura: 0, excesso: 1, sem_estrutura: 2, cobertura: 3, tendencia: 4, b2b: 5, sem_venda: 6 };
+    alertas.sort((a, b) => b.sev - a.sev || ordemTipo[a.tipo] - ordemTipo[b.tipo] || a.ordem - b.ordem);
+    return { ini: isoCache[i0], fim, nd, janela, excl, tol, itens, skus, alertas, semEstrutura: semEstr, defasagem: diffDays(fim, R.opts.today), consumers };
+  }
+  // série semanal (real × previsto) de um componente ou de um SKU vendido
+  function serieSemanal(db, cod, nivel, excl) {
+    const V = db.vendas; if (!V) return null;
+    const idx = buildDemandIndex(db);
+    const struct = new Map(); db.estrutura.forEach(e => { if (!struct.has(e.pa)) struct.set(e.pa, []); struct.get(e.pa).push(e); });
+    const prods = new Set(db.produtos.map(p => p.cod));
+    let fontes = [];
+    if (nivel === 'sku') fontes = V.skus[cod] ? [{ k: V.skus[cod], qtd: 1 }] : [];
+    else Object.entries(V.skus).forEach(([sku, k]) => { const cs = struct.get(sku) || (prods.has(sku) ? [{ mp: sku, qtd: 1 }] : []); cs.forEach(c => { if (c.mp === cod) fontes.push({ k, qtd: num(c.qtd) }); }); });
+    const weeks = [], real = [], b2b = [], prev = [];
+    for (let i = 0; i < V.dias; i += 7) {
+      let r = 0, b = 0, p = 0, n = 0;
+      for (let j = i; j < Math.min(V.dias, i + 7); j++) {
+        const d = addDays(V.base, j); n++;
+        fontes.forEach(f => { const q = f.k.q[j] || 0, bb = f.k.b?.[d] || 0; r += (excl ? q - bb : q) * f.qtd; b += bb * f.qtd; });
+        p += nivel === 'sku' ? paRate(idx.fcByPa.get(cod), d.slice(0, 7)) : mpRateForMonth(idx, cod, d.slice(0, 7));
+      }
+      weeks.push(addDays(V.base, i)); real.push(r * 7 / n); b2b.push(b * 7 / n); prev.push(p * 7 / n);
+    }
+    return { weeks, real, b2b, prev };
+  }
+
   // ---------- motor MRP ----------
   function buildDemandIndex(db) {
     const fcByPa = new Map(db.previsao.map(f => [f.pa, f]));
@@ -366,7 +600,8 @@ const MRPCore = (function () {
     // demanda diária
     const rates = new Array(H + 1);
     const cacheYM = {};
-    for (let d = 0; d <= H; d++) { const ym = addDays(today, d).slice(0, 7); if (!(ym in cacheYM)) cacheYM[ym] = mpRateForMonth(idx, p.cod, ym); rates[d] = cacheYM[ym]; }
+    const ov = opts.rateOverride ? opts.rateOverride.get(p.cod) : undefined;
+    for (let d = 0; d <= H; d++) { if (ov !== undefined) { rates[d] = ov; continue; } const ym = addDays(today, d).slice(0, 7); if (!(ym in cacheYM)) cacheYM[ym] = mpRateForMonth(idx, p.cod, ym); rates[d] = cacheYM[ym]; }
     const avg = (from, n) => { let s = 0, c = 0; for (let d = from; d < Math.min(H + 1, from + n); d++) { s += rates[d]; c++; } return c ? s / c : 0; };
     const avg30 = avg(0, 30);
     // chegadas em aberto
@@ -439,7 +674,7 @@ const MRPCore = (function () {
     const res = db.produtos.filter(p => p.ativo !== false).map(p => computeItem(db, idx, p, opts));
     return { opts, itens: res, byCod: new Map(res.map(r => [r.cod, r])) };
   }
-  return { taxaPrevisao, valorOrdem, emptyDB, importWorkbook, importStock, computeAll, computeItem, buildDemandIndex, itemParams, addDays, diffDays, todayISO, serialToISO, num, str };
+  return { parseVendasCSV, parseVendasSheet, mergeVendas, sugerirVinculos, analisarVendas, serieSemanal, taxaPrevisao, valorOrdem, emptyDB, importWorkbook, importStock, computeAll, computeItem, buildDemandIndex, itemParams, addDays, diffDays, todayISO, serialToISO, num, str };
 })();
 
 
@@ -452,7 +687,7 @@ const FIREBASE_CONFIG = null;
 const DOMINIO_PERMITIDO = 'grupotbx.com.br';
 const COLECAO = 'mrp';                 // coleção do Firestore
 const LOCAL_KEY = 'mrp_tbx_v1';
-const DATASETS = ['settings', 'produtos', 'estrutura', 'previsao', 'ordens', 'embarques', 'fornecedores', 'meta'];
+const DATASETS = ['settings', 'produtos', 'estrutura', 'previsao', 'ordens', 'embarques', 'fornecedores', 'vendas', 'meta'];
 
 /* ================= ESTADO ================= */
 const C = MRPCore;
@@ -461,7 +696,7 @@ let R = null;                 // resultado do cálculo
 let page = 'painel';
 let fsdb = null, user = null;
 const charts = {};
-const ui = { mrpFiltro: { q: '', familia: '', fornecedor: '', status: '' }, sugFiltro: { status: 'acao', janela: 30, fornecedor: '' }, ordFiltro: { q: '', status: 'abertas', fornecedor: '' }, prevFiltro: { q: '', grupo: '' }, cadTab: 'itens', sort: {} };
+const ui = { mrpFiltro: { q: '', familia: '', fornecedor: '', status: '' }, sugFiltro: { status: 'acao', janela: 30, fornecedor: '' }, ordFiltro: { q: '', status: 'abertas', fornecedor: '' }, prevFiltro: { q: '', grupo: '' }, cadTab: 'itens', sort: {}, vendOpts: { janela: 60, excluirB2B: true, tolerancia: 25 }, vend: { tab: 'comp', filtro: 'atencao', q: '', grupoAberto: {} } };
 
 /* ================= PERSISTÊNCIA ================= */
 const Store = {
@@ -491,7 +726,7 @@ const Store = {
     const base = C.emptyDB();
     if (this.mode === 'firebase') {
       const snaps = await Promise.all(DATASETS.map(k => fsdb.collection(COLECAO).doc(k).get()));
-      snaps.forEach((s, i) => { const k = DATASETS[i]; if (s.exists) { const d = s.data(); if (k === 'settings') base.settings = { ...base.settings, ...d.v, cambio: { ...base.settings.cambio, ...(d.v?.cambio || {}) } }; else if (k === 'meta') base.estoqueAtualizadoEm = d.v?.estoqueAtualizadoEm || null; else base[k] = d.v || []; } });
+      snaps.forEach((s, i) => { const k = DATASETS[i]; if (s.exists) { const d = s.data(); if (k === 'settings') base.settings = { ...base.settings, ...d.v, cambio: { ...base.settings.cambio, ...(d.v?.cambio || {}) } }; else if (k === 'meta') base.estoqueAtualizadoEm = d.v?.estoqueAtualizadoEm || null; else if (k === 'vendas') base.vendas = d.v || null; else base[k] = d.v || []; } });
     } else {
       try { const raw = localStorage.getItem(LOCAL_KEY); if (raw) { const d = JSON.parse(raw); Object.assign(base, d); base.settings = { ...C.emptyDB().settings, ...d.settings, cambio: { ...C.emptyDB().settings.cambio, ...(d.settings?.cambio || {}) } }; } } catch (e) { console.warn(e); }
     }
@@ -554,7 +789,7 @@ function setSort(key, col) { const s = ui.sort[key]; ui.sort[key] = s && s.col =
 function download(name, content, type = 'application/json') { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([content], { type })); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); }
 
 /* ================= CÁLCULO ================= */
-function recalc() { R = C.computeAll(DB); }
+function recalc() { R = C.computeAll(DB); try { R.vendas = DB.vendas ? C.analisarVendas(DB, R, ui.vendOpts) : null; } catch (e) { console.error(e); R.vendas = null; } }
 function prodByCod(cod) { return DB.produtos.find(p => p.cod === cod); }
 
 /* ================= NAVEGAÇÃO ================= */
@@ -565,6 +800,7 @@ const ICON = {
   ordens: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4',
   embarques: 'M3 17l2 3h14l2-3M5 17V9h14v8M9 9V5h6v4',
   previsao: 'M7 12l3-3 3 3 4-4M8 21l4-4 4 4M3 4h18M4 4h16v12a1 1 0 01-1 1H5a1 1 0 01-1-1V4z',
+  vendas: 'M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z',
   cadastros: 'M4 6h16M4 10h16M4 14h16M4 18h16',
   importar: 'M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12',
   ia: 'M9.7 17L9 20l-1 1h8l-1-1-.8-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z',
@@ -572,12 +808,13 @@ const ICON = {
 };
 const PAGES = [
   ['painel', 'Painel'], ['mrp', 'MRP por item'], ['sugestoes', 'Sugestões de compra'], ['ordens', 'Ordens de compra'], ['embarques', 'Embarques'],
-  ['previsao', 'Previsão de demanda'], ['cadastros', 'Cadastros'], ['importar', 'Importar / Exportar'], ['ia', 'Assistente IA'], ['config', 'Configurações']
+  ['previsao', 'Previsão de demanda'], ['vendas', 'Vendas x Previsão'], ['cadastros', 'Cadastros'], ['importar', 'Importar / Exportar'], ['ia', 'Assistente IA'], ['config', 'Configurações']
 ];
 function renderNav() {
   document.getElementById('nav').innerHTML = PAGES.map(([k, l]) => {
     let extra = '';
     if (k === 'sugestoes' && R) { const n = R.itens.filter(x => x.status === 'atrasado' || x.status === 'comprar').length; if (n) extra = `<span class="ml-auto bg-red-500 text-white text-[10px] rounded-full px-1.5">${n}</span>`; }
+    if (k === 'vendas' && R?.vendas) { const n = R.vendas.alertas.filter(a => a.sev === 3).length; if (n) extra = `<span class="ml-auto bg-amber-500 text-white text-[10px] rounded-full px-1.5" title="pontos de atenção críticos">${n}</span>`; }
     return `<button class="nav-btn w-full flex items-center gap-2.5 px-3 py-2 rounded-lg hover:bg-slate-800 hover:text-white text-left ${page === k ? 'active' : ''}" onclick="go('${k}')">
     <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="${ICON[k]}"/></svg><span>${l}</span>${extra}</button>`;
   }).join('');
@@ -594,7 +831,7 @@ function render() {
   const cambioTxt = ` · <span title="${ci?.em ? 'Atualizado em ' + new Date(ci.em).toLocaleString('pt-BR') : ''}${ci?.erro ? ' · ' + esc(ci.erro) : ''}">USD ${nf2.format(DB.settings.cambio.USD)} · CNY ${nf2.format(DB.settings.cambio.CNY)} <span class="${ci?.erro ? 'text-red-500' : 'text-slate-400'}">(${fonteLbl}${ci?.erro ? ' ⚠' : ''})</span></span>`;
   document.getElementById('baseInfo').innerHTML = base + cambioTxt + (DB.estoqueAtualizadoEm ? ` · Estoque atualizado em ${fd(DB.estoqueAtualizadoEm)}` : (DB.produtos.length ? ' · <span class="text-amber-600">Estoque da planilha importada</span>' : ''));
   document.getElementById('modeInfo').innerHTML = Store.mode === 'firebase' ? '<span class="text-emerald-400">● Nuvem (Firebase)</span>' : '<span class="text-amber-400">● Modo local (este navegador)</span>';
-  const fn = { painel: pgPainel, mrp: pgMRP, sugestoes: pgSugestoes, ordens: pgOrdens, embarques: pgEmbarques, previsao: pgPrevisao, cadastros: pgCadastros, importar: pgImportar, ia: pgIA, config: pgConfig }[page] || pgPainel;
+  const fn = { painel: pgPainel, mrp: pgMRP, sugestoes: pgSugestoes, ordens: pgOrdens, embarques: pgEmbarques, previsao: pgPrevisao, vendas: pgVendas, cadastros: pgCadastros, importar: pgImportar, ia: pgIA, config: pgConfig }[page] || pgPainel;
   fn(document.getElementById('page'));
 }
 function changed(...keys) { recalc(); Store.save(...keys); render(); }
@@ -627,6 +864,12 @@ function pgPainel(el) {
     ${kpi('Em aberto (ordens)', brl.format(valOrd(abertas)), `${uniq(abertas.map(o => o.po)).length} POs · ${brl.format(valOrd(transito))} em trânsito · ${comCambio} linha(s) com câmbio fechado`, 'text-sky-700', "go('ordens')")}
     ${kpi('Estoque (custo)', brl.format(estoqueValor), 'custo FOB × câmbio')}
   </div>
+  ${R.vendas ? (() => { const V = R.vendas, c3 = V.alertas.filter(a => a.sev === 3); const acima = V.itens.filter(a => a.status === 'acima').length, abaixo = V.itens.filter(a => a.status === 'abaixo' || a.status === 'sem_venda').length; return `<div class="mt-4 bg-white rounded-xl shadow-sm border p-4 flex flex-wrap items-center gap-4 cursor-pointer hover:border-sky-300" onclick="go('vendas')">
+    <div class="font-semibold">Vendas x Previsão <span class="font-normal text-xs text-slate-500">(${fd(V.ini)} a ${fd(V.fim)})</span></div>
+    <span class="text-xs"><b class="text-orange-600">${acima}</b> componentes vendendo acima da previsão</span><span class="text-xs"><b class="text-sky-700">${abaixo}</b> abaixo ou sem venda</span>
+    <span class="text-xs"><b class="text-red-600">${c3.length}</b> pontos de atenção críticos</span>
+    ${V.defasagem > 15 ? `<span class="text-xs text-amber-700">⚠ vendas com ${V.defasagem} dias de defasagem — importe um relatório mais recente</span>` : ''}
+    <span class="ml-auto text-sky-700 text-xs underline">ver análise</span></div>`; })() : ''}
   <div class="grid grid-cols-1 xl:grid-cols-3 gap-4 mt-4">
     <div class="bg-white rounded-xl shadow-sm border p-4 xl:col-span-2">
       <div class="font-semibold mb-2">Itens com ruptura mais próxima</div>
@@ -713,6 +956,7 @@ function openItem(cod) {
   <div class="grid grid-cols-2 md:grid-cols-6 gap-2 mb-4 text-xs">
     ${[['Estoque', f0(p.estoque)], ['Demanda/dia (30d)', f1(x.avg30)], ['Dias de estoque', x.diasEstoque === null ? '–' : f0(x.diasEstoque)], ['Em aberto', f0(x.totalAberto)], ['Ruptura projetada', x.ruptura ? fd(x.ruptura) : 'sem ruptura'], ['Situação', badge(x.status)]].map(([l, v]) => `<div class="bg-slate-50 rounded-lg p-2"><div class="text-slate-500">${l}</div><div class="font-bold text-base">${v}</div></div>`).join('')}
   </div>
+  ${(() => { const v = R.vendas?.itens.find(a => a.cod === cod); if (!v || v.status === 'sem_dados') return ''; return `<div class="mb-3 text-xs px-3 py-2 rounded-lg ${v.status === 'acima' ? 'bg-orange-50 text-orange-800' : v.status === 'ok' ? 'bg-emerald-50 text-emerald-800' : 'bg-sky-50 text-sky-800'}">Consumo real (${fd(R.vendas.ini)}–${fd(R.vendas.fim)}): <b>${f1(v.realDia)}/dia</b> × previsto <b>${f1(v.prevDia)}/dia</b>${v.desvio !== null ? ` (${v.desvio > 0 ? '+' : ''}${Math.round(v.desvio * 100)}%)` : ''} · ${vBadge(v.status)}${v.alt ? ` · pelo ritmo real: ruptura ${v.alt.ruptura ? fd(v.alt.ruptura) : 'sem ruptura'}, compra ${v.alt.prox ? f0(v.alt.prox.qtd) + ' pç até ' + fd(v.alt.prox.dataPedidoIdeal) : 'não necessária'}` : ''} <a class="underline ml-1 cursor-pointer" onclick="closeModal();openVenda('${esc(cod)}','mp')">ver gráfico</a></div>`; })()}
   <div class="h-64 mb-4"><canvas id="chItem"></canvas></div>
   <div class="grid md:grid-cols-2 gap-4">
     <div>
@@ -945,10 +1189,11 @@ function pgPrevisao(el) {
     </div>
     <button onclick="addPrev()" class="rounded-lg px-3 py-1.5 bg-white border">+ Produto</button>
   </div>
-  <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 220px)"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="px-2 py-2">Produto de venda</th><th class="px-2">Grupo</th><th class="px-2">Componentes</th><th class="px-2 num">Padrão</th>${months.map(m => `<th class="px-1 num">${ymLbl(m)}</th>`).join('')}<th class="px-2 num">Total 12m</th></tr></thead><tbody>
+  <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 220px)"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="px-2 py-2">Produto de venda</th><th class="px-2">Grupo</th><th class="px-2">Componentes</th><th class="px-2 num">Padrão</th>${R?.vendas ? `<th class="px-2 num" title="Venda real média por dia na janela da análise Vendas x Previsão">Real/dia</th>` : ''}${months.map(m => `<th class="px-1 num">${ymLbl(m)}</th>`).join('')}<th class="px-2 num">Total 12m</th></tr></thead><tbody>
   ${rows.map((f, i) => { const comps = DB.estrutura.filter(e => e.pa === f.pa).length; let tot = 0; months.forEach(m => { const v = f.meses?.[m]; const r = (v === undefined || v === null || v === '') ? C.num(f.padrao) : C.num(v); const [y, mm] = m.split('-').map(Number); tot += r * new Date(y, mm, 0).getDate(); });
     return `<tr class="border-t hover:bg-slate-50"><td class="px-2 py-1 font-medium">${esc(f.pa)}</td><td class="px-2">${esc(f.grupo)}</td><td class="px-2 text-slate-400">${comps || (prodByCod(f.pa) ? 'venda direta' : '<span class="text-red-500">sem estrutura</span>')}</td>
     <td class="px-1 num"><input class="cell-input font-semibold" type="number" step="any" value="${f.padrao ?? ''}" onchange="setPrev('${esc(f.pa)}','padrao',this.value)"></td>
+    ${R?.vendas ? (() => { const v = R.vendas.skus.find(z => z.sku === f.pa); if (!v) return '<td class="px-2 num text-slate-300">–</td>'; const dv = C.num(f.padrao) > 0 ? v.realDia / C.num(f.padrao) - 1 : null; return `<td class="px-2 num ${dv === null ? '' : dv > 0.25 ? 'text-orange-600 font-semibold' : dv < -0.25 ? 'text-sky-700 font-semibold' : 'text-emerald-700'}" title="${dv === null ? '' : (dv > 0 ? '+' : '') + Math.round(dv * 100) + '% vs padrão'}">${f1(v.realDia)} <button class="text-[10px] underline text-slate-500" onclick="usarReal(['${esc(f.pa)}'])">usar</button></td>`; })() : ''}
     ${months.map(m => { const v = f.meses?.[m]; return `<td class="px-0.5 num"><input class="cell-input ${v === undefined || v === null || v === '' ? 'text-slate-300' : ''}" type="number" step="any" placeholder="${f.padrao ?? ''}" value="${v ?? ''}" onchange="setPrev('${esc(f.pa)}','${m}',this.value)"></td>`; }).join('')}
     <td class="px-2 num text-slate-600">${f0(tot)}</td></tr>`; }).join('')}
   </tbody></table></div>`;
@@ -1033,8 +1278,9 @@ function pgImportar(el) {
   el.innerHTML = `<div class="grid md:grid-cols-2 gap-4 max-w-5xl">
   ${card('1. Planilha MRP atual (.xlsb / .xlsx)', 'Migração completa: lê as abas MRP, Structure, Forecast, Stock_Structure, Stock_System, COSTS, Tab_CBM, Purchase_Order, Suppliers e Follow-up. <b>Substitui todos os dados do site</b> (as configurações são mantidas).', `<input type="file" id="fMRP" accept=".xlsb,.xlsx,.xlsm" class="text-xs"><div id="logMRP" class="text-xs mt-3 text-slate-600 whitespace-pre-line"></div>`)}
   ${card('2. Atualizar estoque (export do ERP)', 'Planilha com as colunas <b>SKU</b> e <b>Total disponível</b> (formato da aba Stock_System / relatório de estoque do Olist). Atualiza só o estoque dos itens do cadastro.', `<input type="file" id="fEst" accept=".xlsx,.xls,.xlsb,.csv" class="text-xs"><div id="logEst" class="text-xs mt-3 text-slate-600 whitespace-pre-line"></div>`)}
-  ${card('3. Exportar', 'Baixe o resultado do MRP e as sugestões em Excel, ou um backup completo dos dados.', `<div class="flex flex-wrap gap-2"><button onclick="exportMRP()" class="border rounded-lg px-3 py-1.5">MRP (Excel)</button><button onclick="exportSug()" class="border rounded-lg px-3 py-1.5">Sugestões (Excel)</button><button onclick="exportGrade()" class="border rounded-lg px-3 py-1.5">Grade diária (Excel)</button><button onclick="download('backup-mrp-'+C.todayISO()+'.json',JSON.stringify(DB))" class="border rounded-lg px-3 py-1.5">Backup (JSON)</button></div>`)}
-  ${card('4. Restaurar backup', 'Carrega um arquivo de backup JSON gerado acima. Substitui todos os dados.', `<input type="file" id="fBk" accept=".json" class="text-xs">`)}
+  ${card('3. Relatório de vendas (efetivo)', 'Export de vendas do e-commerce (CSV ou Excel) com as colunas <b>Data do pedido</b>, <b>SKU</b>, <b>Qtd</b>, <b>Status expedição</b> e <b>Canal</b>. Pedidos cancelados são ignorados; vendas de "Proposta comercial" ficam separadas. Só os totais por SKU e dia são guardados (nenhum dado de cliente). Importar um novo período substitui apenas os dias daquele período.', `<input type="file" id="fVend" accept=".csv,.txt,.xlsx,.xls" class="text-xs"><div id="logVend" class="text-xs mt-3 text-slate-600 whitespace-pre-line">${DB.vendas ? `Histórico no site: ${fd(DB.vendas.base)} a ${fd(C.addDays(DB.vendas.base, DB.vendas.dias - 1))} · ${Object.keys(DB.vendas.skus).length} SKUs` : ''}</div><div id="vincBox"></div>`)}
+  ${card('4. Exportar', 'Baixe o resultado do MRP e as sugestões em Excel, ou um backup completo dos dados.', `<div class="flex flex-wrap gap-2"><button onclick="exportMRP()" class="border rounded-lg px-3 py-1.5">MRP (Excel)</button><button onclick="exportSug()" class="border rounded-lg px-3 py-1.5">Sugestões (Excel)</button><button onclick="exportGrade()" class="border rounded-lg px-3 py-1.5">Grade diária (Excel)</button><button onclick="download('backup-mrp-'+C.todayISO()+'.json',JSON.stringify(DB))" class="border rounded-lg px-3 py-1.5">Backup (JSON)</button></div>`)}
+  ${card('5. Restaurar backup', 'Carrega um arquivo de backup JSON gerado acima. Substitui todos os dados.', `<input type="file" id="fBk" accept=".json" class="text-xs">`)}
   </div>`;
   document.getElementById('fMRP').onchange = async e => {
     const f = e.target.files[0]; if (!f) return;
@@ -1055,6 +1301,20 @@ function pgImportar(el) {
       log.innerHTML = `<b class="text-emerald-700">${r.atualizados} itens atualizados</b>` + (r.faltando.length ? `\nNão encontrados no arquivo (${r.faltando.length}): ${esc(r.faltando.slice(0, 40).join(', '))}${r.faltando.length > 40 ? '…' : ''}` : ''); }
     catch (err) { log.innerHTML = '<span class="text-red-600">Erro: ' + esc(err.message) + '</span>'; }
   };
+  document.getElementById('fVend').onchange = async e => {
+    const f = e.target.files[0]; if (!f) return; const log = document.getElementById('logVend');
+    log.textContent = 'Lendo relatório… (arquivos grandes levam alguns segundos)';
+    await new Promise(r => setTimeout(r, 30));
+    try {
+      const P = /\.xlsx?$/i.test(f.name) ? C.parseVendasSheet(XLSX, XLSX.read(await f.arrayBuffer(), { type: 'array' })) : C.parseVendasCSV(await f.text());
+      const m = C.mergeVendas(DB, P, f.name); recalc(); Store.save('vendas'); renderNav();
+      const sem = R.vendas?.semEstrutura || [];
+      log.innerHTML = `<b class="text-emerald-700">Vendas importadas</b>\nPeríodo do arquivo: ${fd(P.ini)} a ${fd(P.fim)} · ${f0(P.linhas)} linhas · ${Object.keys(P.skus).length} SKUs\nIgnoradas: ${f0(P.canceladas)} canceladas${P.invalidas ? ', ' + f0(P.invalidas) + ' sem data/quantidade' : ''} · ${f0(P.b2bLinhas)} linhas de proposta comercial separadas\nHistórico no site: ${fd(m.base)} a ${fd(m.fim)}\n${sem.length ? `<span class="text-amber-700">${sem.length} SKUs vendidos sem estrutura (consumo não chega aos componentes).</span>` : ''}\n<a class="text-sky-700 underline cursor-pointer" onclick="go('vendas')">Abrir Vendas x Previsão →</a>`;
+      renderVinculos();
+      toast('Relatório de vendas importado');
+    } catch (err) { console.error(err); log.innerHTML = '<span class="text-red-600">Erro: ' + esc(err.message) + '</span>'; }
+  };
+  renderVinculos();
   document.getElementById('fBk').onchange = async e => {
     const f = e.target.files[0]; if (!f) return; if (!confirm('Substituir todos os dados pelo backup?')) return;
     try { const d = JSON.parse(await f.text()); DB = { ...C.emptyDB(), ...d, settings: { ...C.emptyDB().settings, ...d.settings } }; recalc(); Store.save(); render(); toast('Backup restaurado'); } catch (err) { toast('Arquivo inválido'); }
@@ -1085,7 +1345,7 @@ function contextoIA() {
 Data-base: ${t}. Horizonte: ${R.opts.horizonte} dias. Parâmetros padrão: estoque de segurança ${DB.settings.segurancaDias} dias, cobertura por pedido ${DB.settings.coberturaDias} dias.
 Itens (até 80, ordenados por ruptura). Colunas: item;família;fornecedor;estoque;demanda_dia;dias_estoque;em_aberto;ruptura_projetada;pedir_ate;qtd_sugerida;situação
 ${linhas.join('\n')}
-Ordens em aberto por PO: ${Object.entries(porPO).map(([k, v]) => `${k} (${v.forn}, ${v.status}, chegada ${v.chegada || '?'}, ${v.itens} itens)`).join(' | ')}`;
+${R.vendas ? `Vendas reais ${R.vendas.ini} a ${R.vendas.fim} (defasagem ${R.vendas.defasagem} dias). Pontos de atenção (previsão x real):\n${R.vendas.alertas.slice(0, 20).map(a => '- ' + a.titulo + ': ' + a.texto).join('\n')}\n` : 'Sem relatório de vendas reais importado.\n'}Ordens em aberto por PO: ${Object.entries(porPO).map(([k, v]) => `${k} (${v.forn}, ${v.status}, chegada ${v.chegada || '?'}, ${v.itens} itens)`).join(' | ')}`;
 }
 function pgIA(el) {
   const url = DB.settings.workerUrl;
@@ -1118,6 +1378,161 @@ async function perguntarIA() {
     out.innerHTML = mdLite(j.resposta || '');
   } catch (e) { out.innerHTML = '<span class="text-red-600">Erro ao consultar a IA: ' + esc(e.message) + '</span>'; }
   btn.disabled = false;
+}
+
+/* ================= VENDAS x PREVISÃO ================= */
+const V_LBL = { acima: 'Vende acima', abaixo: 'Vende abaixo', sem_venda: 'Sem venda', sem_previsao: 'Sem previsão', ok: 'Coerente', sem_dados: 'Sem dados' };
+const V_CLS = { acima: 'bg-orange-100 text-orange-700', abaixo: 'bg-sky-100 text-sky-700', sem_venda: 'bg-rose-100 text-rose-700', sem_previsao: 'bg-violet-100 text-violet-700', ok: 'bg-emerald-100 text-emerald-700', sem_dados: 'bg-slate-100 text-slate-500' };
+const vBadge = s => `<span class="badge ${V_CLS[s] || ''}">${V_LBL[s] || s}</span>`;
+const pct = v => v === null || v === undefined || !isFinite(v) ? '–' : `${v > 0 ? '+' : ''}${Math.round(v * 100)}%`;
+const pctCls = (v, tol) => v === null || v === undefined ? '' : v > tol ? 'text-orange-600 font-semibold' : v < -tol ? 'text-sky-700 font-semibold' : 'text-emerald-700';
+const A_TIPO = { ruptura: ['Risco de ruptura antes do previsto', 'bg-red-500'], excesso: ['Risco de comprar demais', 'bg-sky-500'], sem_estrutura: ['Vendas fora da estrutura', 'bg-amber-500'], cobertura: ['Cobertura excessiva', 'bg-indigo-400'], tendencia: ['Mudança de tendência', 'bg-violet-400'], b2b: ['Vendas pontuais (proposta comercial)', 'bg-slate-400'], sem_venda: ['Previsão sem venda', 'bg-rose-400'] };
+
+function vendasAtencao(a) { return a.status === 'acima' || a.status === 'abaixo' || a.status === 'sem_venda' || a.status === 'sem_previsao'; }
+function setVendOpt(k, v) { ui.vendOpts[k] = v; recalc(); render(); }
+
+function pgVendas(el) {
+  const V = R?.vendas, O = ui.vendOpts, F = ui.vend;
+  if (!V) { el.innerHTML = `<div class="bg-white rounded-xl border p-6 max-w-2xl"><div class="font-bold text-base">Nenhum relatório de vendas importado</div><div class="text-slate-600 mt-2">Importe o relatório de vendas efetivas em <a class="text-sky-700 underline cursor-pointer" onclick="go('importar')">Importar / Exportar → card 5</a>. O site soma as vendas de cada produto acabado, explode pela estrutura até os componentes comprados e compara com a previsão usada no MRP.</div></div>`; return; }
+  const tol = O.tolerancia / 100;
+  const cnt = s => V.itens.filter(a => a.status === s).length;
+  const volTot = V.skus.reduce((s, k) => s + k.total, 0), volSem = V.semEstrutura.reduce((s, k) => s + k.total, 0);
+  const grupos = {}; V.alertas.forEach(a => (grupos[a.tipo] = grupos[a.tipo] || []).push(a));
+  el.innerHTML = `
+  <div class="flex flex-wrap items-center gap-3 mb-3">
+    <label class="text-xs">Janela analisada <select class="border rounded-lg px-2 py-1 ml-1" onchange="setVendOpt('janela',Number(this.value))">${[30, 60, 90, 120, 180].map(d => opt(d, O.janela, `últimos ${d} dias`)).join('')}</select></label>
+    <label class="text-xs">Tolerância <input type="number" value="${O.tolerancia}" class="border rounded-lg px-2 py-1 w-16" onchange="setVendOpt('tolerancia',Number(this.value)||25)">%</label>
+    <label class="text-xs flex items-center gap-1"><input type="checkbox" ${O.excluirB2B ? 'checked' : ''} onchange="setVendOpt('excluirB2B',this.checked)"> Excluir propostas comerciais (B2B)</label>
+    <span class="text-xs text-slate-500">Vendas no site: ${fd(DB.vendas.base)} a ${fd(V.fim)} · janela: ${fd(V.ini)} a ${fd(V.fim)} (${V.nd} dias)</span>
+  </div>
+  ${V.defasagem > 15 ? `<div class="mb-3 p-3 rounded-lg bg-amber-50 border border-amber-200 text-amber-900 text-xs">⚠ As vendas mais recentes são de <b>${fd(V.fim)}</b> (${V.defasagem} dias atrás). A comparação mostra o comportamento daquele período — importe um relatório mais recente antes de decidir compras.</div>` : ''}
+  <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
+    ${kpi('Componentes coerentes', f0(cnt('ok')), `dentro de ±${O.tolerancia}% da previsão`, 'text-emerald-700', "ui.vend.tab='comp';ui.vend.filtro='ok';render()")}
+    ${kpi('Vendendo acima', f0(cnt('acima')), 'previsão subestimada → risco de ruptura', 'text-orange-600', "ui.vend.tab='comp';ui.vend.filtro='acima';render()")}
+    ${kpi('Vendendo abaixo', f0(cnt('abaixo')), 'previsão superestimada → risco de excesso', 'text-sky-700', "ui.vend.tab='comp';ui.vend.filtro='abaixo';render()")}
+    ${kpi('Com previsão e sem venda', f0(cnt('sem_venda')), 'nenhum consumo real na janela', 'text-rose-600', "ui.vend.tab='comp';ui.vend.filtro='sem_venda';render()")}
+    ${kpi('Volume fora da estrutura', (volTot ? (volSem / volTot * 100).toFixed(1) : 0) + '%', `${V.semEstrutura.length} SKUs vendidos sem vínculo`, volSem / volTot > 0.02 ? 'text-amber-600' : 'text-slate-700', "ui.vend.tab='sku';ui.vend.filtro='sem_estrutura';render()")}
+  </div>
+  <div class="bg-white rounded-xl shadow-sm border p-4 mt-4">
+    <div class="font-semibold mb-1">Pontos de atenção para as compras</div>
+    <div class="text-[11px] text-slate-500 mb-3">Ordenados por gravidade. "Ritmo real" = média diária vendida na janela, convertida em consumo de componentes pela estrutura${O.excluirB2B ? ', sem propostas comerciais' : ''}.</div>
+    ${Object.keys(A_TIPO).filter(t => grupos[t]).map(t => { const g = grupos[t], aberto = F.grupoAberto[t], show = aberto ? g : g.slice(0, 4);
+      return `<div class="mb-3"><div class="flex items-center gap-2 text-sm font-semibold"><span class="w-2.5 h-2.5 rounded-full ${A_TIPO[t][1]}"></span>${A_TIPO[t][0]} <span class="text-xs font-normal text-slate-500">(${g.length})</span></div>
+      <div class="mt-1 space-y-1">${show.map(a => `<div class="pl-4 border-l-2 ${a.sev === 3 ? 'border-red-400' : a.sev === 2 ? 'border-amber-300' : 'border-slate-200'} py-1"><div class="text-xs font-semibold ${a.cod ? 'text-sky-800 cursor-pointer hover:underline' : ''}" ${a.cod ? `onclick="openVenda('${esc(a.cod)}','${a.tipo === 'b2b' ? 'sku' : 'mp'}')"` : ''}>${esc(a.titulo)}</div><div class="text-[11px] text-slate-600">${esc(a.texto)}</div></div>`).join('')}
+      ${g.length > 4 ? `<button class="pl-4 text-xs text-sky-700 underline" onclick="ui.vend.grupoAberto['${t}']=${!aberto};render()">${aberto ? 'mostrar menos' : `ver todos os ${g.length}`}</button>` : ''}</div></div>`; }).join('') || '<div class="text-slate-500 text-sm">Nenhum ponto de atenção — previsão coerente com as vendas.</div>'}
+  </div>
+  <div class="flex gap-4 border-b mt-5 mb-3">${[['comp', 'Componentes (itens comprados)'], ['sku', 'Produtos vendidos (SKU)']].map(([k, l]) => `<button class="tab border-b-2 border-transparent px-1 pb-2 font-semibold ${F.tab === k ? 'active' : 'text-slate-500'}" onclick="ui.vend.tab='${k}';ui.vend.filtro='atencao';render()">${l}</button>`).join('')}</div>
+  <div id="vendTab"></div>`;
+  (F.tab === 'comp' ? vendTabComp : vendTabSku)(document.getElementById('vendTab'), V, tol);
+}
+function vendFiltroBar(opts, V) {
+  const F = ui.vend;
+  return `<div class="flex flex-wrap gap-2 mb-2 items-center"><input id="vq" placeholder="Buscar código" value="${esc(F.q)}" class="border rounded-lg px-3 py-1.5 w-48">
+  <select class="border rounded-lg px-2 py-1.5" onchange="ui.vend.filtro=this.value;render()">${opts.map(([v, l]) => opt(v, F.filtro, l)).join('')}</select><span class="text-xs text-slate-500" id="vcount"></span><span class="ml-auto flex gap-2" id="vacts"></span></div>`;
+}
+function bindVq() { const i = document.getElementById('vq'); i.oninput = e => { ui.vend.q = e.target.value; clearTimeout(bindVq._t); bindVq._t = setTimeout(() => { render(); const j = document.getElementById('vq'); j.focus(); j.setSelectionRange(j.value.length, j.value.length); }, 250); }; }
+function vendTabComp(el, V, tol) {
+  const F = ui.vend, q = F.q.toLowerCase();
+  let rows = V.itens.filter(a => (!q || (a.cod + ' ' + a.x.produto.desc).toLowerCase().includes(q)) && (F.filtro === 'todos' ? true : F.filtro === 'atencao' ? vendasAtencao(a) : a.status === F.filtro));
+  rows = sortRows('vcomp', rows, { cod: a => a.cod, fam: a => a.x.produto.familia, real: a => a.realDia, prev: a => a.prevDia, desv: a => a.desvio ?? -9, tend: a => a.tendencia ?? -9, cob: a => a.cobReal ?? 1e9, st: a => a.status });
+  if (!ui.sort.vcomp) rows = [...rows].sort((a, b) => Math.abs(b.desvio ?? 0) * (b.prevDia + b.realDia) - Math.abs(a.desvio ?? 0) * (a.prevDia + a.realDia));
+  el.innerHTML = vendFiltroBar([['atencao', 'Com desvio (atenção)'], ['acima', 'Vende acima'], ['abaixo', 'Vende abaixo'], ['sem_venda', 'Sem venda'], ['sem_previsao', 'Sem previsão'], ['ok', 'Coerente'], ['todos', 'Todos']]) + `
+  <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 220px)"><table class="w-full tbl text-xs"><thead><tr class="text-left">
+  ${th('vcomp', 'cod', 'Componente')}${th('vcomp', 'fam', 'Família')}${th('vcomp', 'real', 'Real/dia', 'num')}${th('vcomp', 'prev', 'Previsto/dia', 'num')}${th('vcomp', 'desv', 'Desvio', 'num')}${th('vcomp', 'tend', 'Tendência 4 sem.', 'num')}<th class="px-2 num" title="Previsão usada hoje no MRP (próximos 30 dias)">Previsão MRP/dia</th>${th('vcomp', 'cob', 'Cobertura real (dias)', 'num')}<th class="px-2">Ruptura: previsão → real</th><th class="px-2 num">Compra: previsão → real</th>${th('vcomp', 'st', 'Situação')}</tr></thead><tbody>
+  ${rows.map(a => { const x = a.x; return `<tr class="border-t hover:bg-sky-50 cursor-pointer" onclick="openVenda('${esc(a.cod)}','mp')">
+    <td class="px-2 py-1.5"><div class="font-semibold">${esc(a.cod)}</div><div class="text-slate-400 truncate max-w-[220px]">${esc(x.produto.desc)}</div></td><td class="px-2">${esc(x.produto.familia)}</td>
+    <td class="px-2 num font-semibold">${f1(a.realDia)}</td><td class="px-2 num">${f1(a.prevDia)}</td><td class="px-2 num ${pctCls(a.desvio, tol)}">${a.status === 'sem_venda' ? '−100%' : pct(a.desvio)}</td>
+    <td class="px-2 num ${a.tendencia > 0.2 ? 'text-orange-600' : a.tendencia < -0.2 ? 'text-sky-700' : ''}">${pct(a.tendencia)}</td><td class="px-2 num text-slate-500">${f1(a.prevAtual)}</td>
+    <td class="px-2 num">${a.cobReal === null ? '–' : f0(a.cobReal)}</td>
+    <td class="px-2">${x.ruptura ? fd(x.ruptura) : '<span class="text-slate-400">sem</span>'}${a.alt ? ` → <b class="${a.alt.rupturaDia >= 0 && (x.rupturaDia < 0 || a.alt.rupturaDia < x.rupturaDia) ? 'text-red-600' : ''}">${a.alt.ruptura ? fd(a.alt.ruptura) : 'sem'}</b>` : ''}</td>
+    <td class="px-2 num">${x.prox ? f0(x.prox.qtd) : '–'}${a.alt ? ` → <b>${a.alt.prox ? f0(a.alt.prox.qtd) : '0'}</b>` : ''}</td><td class="px-2">${vBadge(a.status)}</td></tr>`; }).join('') || '<tr><td colspan=11 class="p-4 text-slate-400">Nenhum componente neste filtro</td></tr>'}
+  </tbody></table></div>`;
+  document.getElementById('vcount').textContent = rows.length + ' componentes';
+  bindVq();
+}
+function vendTabSku(el, V, tol) {
+  const F = ui.vend, q = F.q.toLowerCase();
+  let rows = V.skus.filter(s => (!q || s.sku.toLowerCase().includes(q)) && (F.filtro === 'todos' ? true : F.filtro === 'atencao' ? (!s.mapeado && s.total > 0) || (s.desvio !== null && Math.abs(s.desvio) > tol) || (s.prevDia === null && s.total > 0) : F.filtro === 'sem_estrutura' ? !s.mapeado && s.total > 0 : F.filtro === 'sem_previsao' ? s.prevDia === null && s.total > 0 : F.filtro === 'acima' ? s.desvio > tol : F.filtro === 'abaixo' ? s.desvio !== null && s.desvio < -tol : F.filtro === 'b2b' ? s.b2b > 0 : true));
+  rows = sortRows('vsku', rows, { sku: s => s.sku, fam: s => s.fam, real: s => s.realDia, prev: s => s.prevDia ?? -1, desv: s => s.desvio ?? -9, tend: s => s.tendencia ?? -9, b2b: s => s.b2b });
+  if (!ui.sort.vsku) rows = [...rows].sort((a, b) => b.realDia - a.realDia || (b.prevDia || 0) - (a.prevDia || 0));
+  el.innerHTML = vendFiltroBar([['atencao', 'Com desvio ou sem vínculo'], ['acima', 'Vende acima'], ['abaixo', 'Vende abaixo'], ['sem_previsao', 'Vendido sem previsão'], ['sem_estrutura', 'Vendido sem estrutura'], ['b2b', 'Com proposta comercial'], ['todos', 'Todos']]) + `
+  <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 220px)"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="w-8 text-center"><input type="checkbox" onchange="document.querySelectorAll('.vsk').forEach(c=>c.checked=this.checked)"></th>
+  ${th('vsku', 'sku', 'SKU vendido')}${th('vsku', 'fam', 'Família')}${th('vsku', 'real', 'Real/dia', 'num')}${th('vsku', 'prev', 'Previsto/dia', 'num')}${th('vsku', 'desv', 'Desvio', 'num')}${th('vsku', 'tend', 'Tendência 4 sem.', 'num')}<th class="px-2 num">Vendido na janela</th>${th('vsku', 'b2b', 'Proposta comercial', 'num')}<th class="px-2">Estrutura</th><th></th></tr></thead><tbody>
+  ${rows.map(s => `<tr class="border-t hover:bg-sky-50"><td class="text-center"><input type="checkbox" class="vsk" value="${esc(s.sku)}"></td>
+    <td class="px-2 py-1.5 font-semibold text-sky-800 cursor-pointer hover:underline" onclick="openVenda('${esc(s.sku)}','sku')">${esc(s.sku)}</td><td class="px-2">${esc(s.fam)}</td>
+    <td class="px-2 num font-semibold">${f1(s.realDia)}</td><td class="px-2 num">${s.prevDia === null ? '<span class="text-violet-600">sem previsão</span>' : f1(s.prevDia)}</td><td class="px-2 num ${pctCls(s.desvio, tol)}">${pct(s.desvio)}</td>
+    <td class="px-2 num">${pct(s.tendencia)}</td><td class="px-2 num">${f0(s.total)}</td><td class="px-2 num">${s.b2b ? f0(s.b2b) : ''}</td>
+    <td class="px-2">${s.mapeado ? `<span class="text-slate-500" title="${esc(s.comps.map(c => c.mp + ' ×' + c.qtd).join(', '))}">${s.comps.length} comp.</span>` : '<span class="text-amber-600 font-semibold">sem estrutura</span>'}</td>
+    <td class="px-2 text-right">${s.realDia > 0 ? `<button class="text-sky-700 underline" onclick="usarReal(['${esc(s.sku)}'])" title="Grava o ritmo real como previsão padrão deste produto">usar real como previsão</button>` : ''}</td></tr>`).join('') || '<tr><td colspan=11 class="p-4 text-slate-400">Nenhum SKU neste filtro</td></tr>'}
+  </tbody></table></div>`;
+  document.getElementById('vcount').textContent = rows.length + ' SKUs';
+  document.getElementById('vacts').innerHTML = `<button class="border rounded-lg px-3 py-1.5 bg-white hover:bg-slate-50" onclick="usarReal([...document.querySelectorAll('.vsk:checked')].map(c=>c.value))">Usar ritmo real como previsão (selecionados)</button>${V.semEstrutura.length ? `<button class="border rounded-lg px-3 py-1.5 bg-white hover:bg-slate-50" onclick="go('importar')">Vincular SKUs sem estrutura</button>` : ''}`;
+  bindVq();
+}
+function usarReal(skus) {
+  const V = R?.vendas; if (!V || !skus.length) { toast('Selecione produtos'); return; }
+  const rows = skus.map(s => V.skus.find(z => z.sku === s)).filter(s => s && s.realDia > 0);
+  if (!rows.length) { toast('Nenhum produto selecionado tem venda na janela'); return; }
+  const ym = hoje().slice(0, 7);
+  if (!confirm(`Gravar o ritmo real (média de ${V.nd} dias até ${fd(V.fim)}${ui.vendOpts.excluirB2B ? ', sem propostas comerciais' : ''}) como previsão padrão de ${rows.length} produto(s)?\n\nOs ajustes mensais a partir de ${ymLbl(ym)} desses produtos serão apagados. O MRP e as sugestões serão recalculados.`)) return;
+  // códigos com previsão para os mesmos componentes que não vendem (ex.: _MKT) — evitar contar em dobro
+  const alvo = new Set(rows.map(s => s.sku));
+  const comps = new Set(rows.flatMap(s => s.comps.map(c => c.mp)));
+  const duplos = DB.previsao.filter(f => !alvo.has(f.pa) && C.num(f.padrao) > 0 && !(DB.vendas.skus[f.pa]) && DB.estrutura.some(e => e.pa === f.pa && comps.has(e.mp)));
+  let zerar = false;
+  if (duplos.length) zerar = confirm(`Atenção: ${duplos.map(f => f.pa).join(', ')} também têm previsão para os mesmos componentes, mas não aparecem nas vendas (provavelmente código antigo).
+
+Zerar a previsão deles para não contar a demanda em dobro? (OK = zerar, Cancelar = manter)`);
+  if (zerar) duplos.forEach(f => { f.padrao = 0; Object.keys(f.meses || {}).forEach(k => { if (k >= ym) delete f.meses[k]; }); });
+  rows.forEach(s => {
+    let f = DB.previsao.find(z => z.pa === s.sku);
+    if (!f) { f = { pa: s.sku, grupo: s.fam, padrao: 0, meses: {} }; DB.previsao.push(f); }
+    f.padrao = Math.round(s.realDia * 100) / 100;
+    Object.keys(f.meses || {}).forEach(k => { if (k >= ym) delete f.meses[k]; });
+  });
+  closeModal(); changed('previsao'); toast(`Previsão atualizada para ${rows.length} produto(s)${zerar ? ` · ${duplos.length} código(s) antigo(s) zerado(s)` : ''}`);
+}
+function openVenda(cod, nivel) {
+  const V = R?.vendas; if (!V) return;
+  const s = C.serieSemanal(DB, cod, nivel, ui.vendOpts.excluirB2B); if (!s) return;
+  let head = '', extra = '';
+  if (nivel === 'mp') {
+    const a = V.itens.find(z => z.cod === cod); const x = a?.x;
+    const cons = (V.consumers.get(cod) || []).map(c => { const k = V.skus.find(z => z.sku === c.sku); return { sku: c.sku, qtd: c.qtd, real: k?.realDia || 0, prev: k?.prevDia }; }).sort((p, q) => q.real * q.qtd - p.real * p.qtd);
+    const viaPrev = DB.estrutura.filter(e => e.mp === cod && !cons.some(c => c.sku === e.pa)).map(e => e.pa);
+    head = a ? `<div class="grid grid-cols-2 md:grid-cols-6 gap-2 mb-3 text-xs">${[['Real/dia', f1(a.realDia)], ['Previsto/dia', f1(a.prevDia)], ['Desvio', a.status === 'sem_venda' ? '−100%' : pct(a.desvio)], ['Tendência 4 sem.', pct(a.tendencia)], ['Ruptura prev. → real', `${x.ruptura ? fd(x.ruptura) : 'sem'} → ${a.alt ? (a.alt.ruptura ? fd(a.alt.ruptura) : 'sem') : (x.ruptura ? fd(x.ruptura) : 'sem')}`], ['Situação', vBadge(a.status)]].map(([l, v]) => `<div class="bg-slate-50 rounded-lg p-2"><div class="text-slate-500">${l}</div><div class="font-bold text-sm">${v}</div></div>`).join('')}</div>` : '';
+    extra = `<div class="grid md:grid-cols-2 gap-4 mt-4"><div><div class="font-semibold mb-1">Produtos vendidos que consomem ${esc(cod)}</div><table class="w-full text-xs"><thead><tr class="text-left text-slate-500"><th>SKU</th><th class="num">Qtd/un.</th><th class="num">Real/dia</th><th class="num">Previsto/dia</th><th class="num">Consumo real/dia</th></tr></thead><tbody>
+      ${cons.map(c => `<tr class="border-t"><td class="py-1 text-sky-800 cursor-pointer hover:underline" onclick="openVenda('${esc(c.sku)}','sku')">${esc(c.sku)}</td><td class="num">${f1(c.qtd)}</td><td class="num">${f1(c.real)}</td><td class="num">${c.prev === null || c.prev === undefined ? '<span class="text-violet-600">–</span>' : f1(c.prev)}</td><td class="num font-semibold">${f1(c.real * c.qtd)}</td></tr>`).join('') || '<tr><td class="text-slate-400 py-1" colspan=5>Nenhuma venda ligada a este componente</td></tr>'}</tbody></table>
+      ${viaPrev.length ? `<div class="text-[11px] text-slate-500 mt-2">Também na estrutura, mas sem vendas no arquivo: ${viaPrev.map(esc).join(', ')}</div>` : ''}</div>
+      <div class="text-xs text-slate-600"><div class="font-semibold text-sm text-slate-800 mb-1">Como ler</div>Barras = consumo real por semana (vendas × estrutura). Linha = consumo previsto pela previsão de demanda para as mesmas semanas. Barras consistentemente acima da linha indicam previsão baixa (risco de ruptura); abaixo, previsão alta (risco de comprar demais).
+      ${x ? `<div class="mt-3"><button class="border rounded-lg px-3 py-1.5" onclick="closeModal();openItem('${esc(cod)}')">Abrir no MRP</button></div>` : ''}</div></div>`;
+  } else {
+    const k = V.skus.find(z => z.sku === cod);
+    head = k ? `<div class="grid grid-cols-2 md:grid-cols-5 gap-2 mb-3 text-xs">${[['Real/dia', f1(k.realDia)], ['Previsto/dia', k.prevDia === null ? 'sem previsão' : f1(k.prevDia)], ['Desvio', pct(k.desvio)], ['Tendência 4 sem.', pct(k.tendencia)], ['Estrutura', k.mapeado ? k.comps.map(c => esc(c.mp) + ' ×' + f1(c.qtd)).join(', ') : '<span class="text-amber-600">sem estrutura</span>']].map(([l, v]) => `<div class="bg-slate-50 rounded-lg p-2"><div class="text-slate-500">${l}</div><div class="font-bold text-sm">${v}</div></div>`).join('')}</div>` : '';
+    extra = k && k.realDia > 0 ? `<div class="mt-3 flex gap-2"><button class="border rounded-lg px-3 py-1.5" onclick="usarReal(['${esc(cod)}'])">Usar ritmo real (${f1(k.realDia)}/dia) como previsão</button></div>` : '';
+  }
+  openModal(`${esc(cod)} <span class="font-normal text-slate-500 text-sm">· real × previsto por semana</span>`, head + `<div class="h-72"><canvas id="chVend"></canvas></div>` + extra, 'max-w-5xl');
+  const ds = [{ type: 'bar', label: 'Real' + (ui.vendOpts.excluirB2B ? ' (sem B2B)' : ''), data: s.real.map(v => Math.round(v)), backgroundColor: '#0ea5e9', stack: 'r' }];
+  if (ui.vendOpts.excluirB2B && s.b2b.some(v => v > 0)) ds.push({ type: 'bar', label: 'Proposta comercial', data: s.b2b.map(v => Math.round(v) || null), backgroundColor: '#cbd5e1', stack: 'r' });
+  ds.push({ type: 'line', label: 'Previsto', data: s.prev.map(v => Math.round(v)), borderColor: '#f97316', backgroundColor: '#f97316', pointRadius: 2, borderWidth: 2 });
+  charts.m_vend = new Chart(document.getElementById('chVend'), { data: { labels: s.weeks.map(fd), datasets: ds }, options: { maintainAspectRatio: false, interaction: { mode: 'index', intersect: false }, scales: { x: { stacked: true }, y: { stacked: false, beginAtZero: true, title: { display: true, text: 'unidades por semana' } } }, plugins: { legend: { labels: { boxWidth: 12, font: { size: 11 } } } } } });
+}
+function renderVinculos() {
+  const box = document.getElementById('vincBox'); if (!box) return;
+  const sug = C.sugerirVinculos(DB);
+  const sem = (R?.vendas?.semEstrutura || []).filter(s => !sug.some(v => v.pa === s.sku));
+  if (!sug.length && !sem.length) { box.innerHTML = ''; return; }
+  box.innerHTML = `<div class="mt-3 border-t pt-3">
+  ${sug.length ? `<div class="font-semibold text-xs">Vínculos sugeridos (${sug.length})</div><div class="text-[11px] text-slate-500 mb-1">SKUs vendidos em pacote que parecem consumir um componente do cadastro. Confira o fator antes de criar — ele usa a mesma conversão do código _MKT da estrutura atual.</div>
+  <div class="max-h-48 overflow-y-auto border rounded"><table class="w-full text-[11px]"><tbody>${sug.map((v, i) => `<tr class="border-t"><td class="px-1"><input type="checkbox" class="vinc" value="${i}" checked></td><td class="px-1 font-semibold">${esc(v.pa)}</td><td>→ ${esc(v.mp)}</td><td class="px-1"><input type="number" step="any" class="cell-input" id="vq_${i}" value="${v.qtd}"></td><td class="text-slate-500">${esc(v.regra)}</td></tr>`).join('')}</tbody></table></div>
+  <button class="mt-2 bg-sky-600 text-white rounded-lg px-3 py-1 text-xs" onclick="criarVinculos()">Criar vínculos selecionados na estrutura</button>` : ''}
+  ${sem.length ? `<div class="text-[11px] text-amber-700 mt-2">Sem sugestão automática (cadastre a estrutura em Cadastros → Estrutura): ${sem.slice(0, 15).map(s => esc(s.sku) + ' (' + f0(s.total) + ')').join(', ')}${sem.length > 15 ? '…' : ''}</div>` : ''}</div>`;
+  window._vincSug = sug;
+}
+function criarVinculos() {
+  const sel = [...document.querySelectorAll('.vinc:checked')].map(c => Number(c.value)); if (!sel.length) { toast('Nada selecionado'); return; }
+  sel.forEach(i => { const v = window._vincSug[i]; DB.estrutura.push({ pa: v.pa, mp: v.mp, qtd: Number(document.getElementById('vq_' + i).value) || v.qtd }); });
+  changed('estrutura'); toast(`${sel.length} vínculo(s) criados na estrutura`);
 }
 
 /* ================= CONFIGURAÇÕES ================= */
