@@ -119,7 +119,7 @@ const MRPCore = (function () {
     return {
       settings: {
         horizonte: 240, segurancaDias: 30, coberturaDias: 60, leadTimePadrao: 45, transitPadrao: 35,
-        desembaracoDias: 0, cbmContainer: 68, containers: { "20'": 28, "40'": 58 }, pesoMaxContainer: { "20'": 25000, "40'": 26500, '40HC': 26500 }, containerPadrao: '40HC', medidasUrl: '', estoqueSomarAcabados: true, coberturaMaxDias: 180, janelaCaronaDias: 60, incluirSimulacoes: true, dataBase: '',
+        desembaracoDias: 0, cbmContainer: 68, containers: { "20'": 28, "40'": 58 }, pesoMaxContainer: { "20'": 25000, "40'": 26500, '40HC': 26500 }, containerPadrao: '40HC', medidasUrl: '', estoqueSomarAcabados: true, fatoresPacote: { PBG: { '1': 8, '3': 22, '5': 36 } }, coberturaMaxDias: 180, janelaCaronaDias: 60, incluirSimulacoes: true, dataBase: '',
         cambio: { USD: 5.40, CNY: 0.76, BRL: 1 }, cambioFonte: 'comercial', cambioMargem: 0, cambioInfo: null, workerUrl: ''
       },
       produtos: [],     // itens comprados (MP)
@@ -430,8 +430,11 @@ const MRPCore = (function () {
       if (temEstr.has(sku) || prods.has(sku)) return;
       const m = sku.match(/^([A-Z]+\d+)-(\d+)$/); if (!m) return;
       const mp = 'P' + m[1]; if (!prods.has(mp)) return;
-      // 1º: aprende com pacotes do mesmo tipo já cadastrados (ex.: PBG000X-5 → PPBG000X × 36)
       const pref = m[1].replace(/\d+$/, ''), suf = m[2];
+      // 1º: lâminas por pacote configuradas
+      const fc = num((db.settings.fatoresPacote || {})[pref]?.[suf]);
+      if (fc) { out.push({ pa: sku, mp, qtd: fc, regra: `${fc} por pacote (Configurações → lâminas por pacote)` }); return; }
+      // 2º: aprende com pacotes do mesmo tipo já cadastrados (ex.: PBG000X-5 → PPBG000X × 36)
       const conh = db.estrutura.filter(e => { const k = e.pa.match(/^([A-Z]+)\d+-(\d+)$/); return k && k[1] === pref && k[2] === suf && e.mp === 'P' + e.pa.replace(/-\d+$/, ''); });
       if (conh.length) {
         const cnt = {}; conh.forEach(e => { cnt[num(e.qtd)] = (cnt[num(e.qtd)] || 0) + 1; });
@@ -443,6 +446,16 @@ const MRPCore = (function () {
       out.push({ pa: sku, mp, qtd: num(m[2]) * fator, regra: mkt ? `${m[2]} × ${fator} (mesmo fator do ${m[1]}_MKT) — confira` : `${m[2]} un. — confira` });
     });
     return out;
+  }
+  // aplica as lâminas por pacote configuradas nos vínculos existentes (ex.: PBG0007-5 → PPBG0007 × 36)
+  function aplicarFatoresPacote(db) {
+    const F = db.settings.fatoresPacote || {}; let n = 0;
+    db.estrutura.forEach(e => {
+      const k = e.pa.match(/^([A-Z]+)(\d+)-(\d+)$/); if (!k) return;
+      const f = num(F[k[1]]?.[k[3]]); if (!f || e.mp !== 'P' + k[1] + k[2]) return;
+      if (num(e.qtd) !== f) { e.qtd = f; n++; }
+    });
+    return n;
   }
   // consumo real por componente e comparação com a previsão
   function analisarVendas(db, R, o = {}) {
@@ -883,7 +896,7 @@ const MRPCore = (function () {
     const res = db.produtos.filter(p => p.ativo !== false).map(p => computeItem(db, idx, p, opts));
     return { opts, itens: res, byCod: new Map(res.map(r => [r.cod, r])) };
   }
-  return { parseEstoqueCorrente, aplicarEstoque, parseMedidasCSV, parseMedidasSheet, aplicarMedidas, pesoMaxContainer, fecharPedidos, capacidadeContainer, parseVendasCSV, parseVendasSheet, mergeVendas, sugerirVinculos, analisarVendas, serieSemanal, taxaPrevisao, valorOrdem, emptyDB, importWorkbook, importStock, computeAll, computeItem, buildDemandIndex, itemParams, addDays, diffDays, todayISO, serialToISO, num, str };
+  return { aplicarFatoresPacote, parseEstoqueCorrente, aplicarEstoque, parseMedidasCSV, parseMedidasSheet, aplicarMedidas, pesoMaxContainer, fecharPedidos, capacidadeContainer, parseVendasCSV, parseVendasSheet, mergeVendas, sugerirVinculos, analisarVendas, serieSemanal, taxaPrevisao, valorOrdem, emptyDB, importWorkbook, importStock, computeAll, computeItem, buildDemandIndex, itemParams, addDays, diffDays, todayISO, serialToISO, num, str };
 })();
 
 
@@ -998,7 +1011,7 @@ function setSort(key, col) { const s = ui.sort[key]; ui.sort[key] = s && s.col =
 function download(name, content, type = 'application/json') { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([content], { type })); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); }
 
 /* ================= CÁLCULO ================= */
-function recalc() { if (DB.medidasTab) { try { C.aplicarMedidas(DB, DB.medidasTab); } catch (e) { console.error(e); } } if (DB.estoqueSnap) { try { C.aplicarEstoque(DB); } catch (e) { console.error(e); } } R = C.computeAll(DB); try { R.vendas = DB.vendas ? C.analisarVendas(DB, R, ui.vendOpts) : null; } catch (e) { console.error(e); R.vendas = null; } }
+function recalc() { try { if (C.aplicarFatoresPacote(DB)) Store.save('estrutura'); } catch (e) { console.error(e); } if (DB.medidasTab) { try { C.aplicarMedidas(DB, DB.medidasTab); } catch (e) { console.error(e); } } if (DB.estoqueSnap) { try { C.aplicarEstoque(DB); } catch (e) { console.error(e); } } R = C.computeAll(DB); try { R.vendas = DB.vendas ? C.analisarVendas(DB, R, ui.vendOpts) : null; } catch (e) { console.error(e); R.vendas = null; } }
 function prodByCod(cod) { return DB.produtos.find(p => p.cod === cod); }
 
 /* ================= NAVEGAÇÃO ================= */
@@ -1847,6 +1860,11 @@ function pgConfig(el) {
     ${f('dataBase', 'Data-base simulada', 'date', 'Deixe em branco para usar a data de hoje')}
     <label class="flex items-center gap-2 mt-5 text-xs"><input id="cf_incluirSimulacoes" type="checkbox" ${s.incluirSimulacoes ? 'checked' : ''}> Considerar ordens em "Simulação" no cálculo</label>
   </div>
+  <div class="font-bold mt-6 mb-1">Lâminas por pacote (pisos)</div>
+  <div class="text-[11px] text-slate-500 mb-2">Quantas lâminas do componente (PPBG…, PPAG…) vão em cada pacote vendido (PBG…-1, -3, -5). Aplicado automaticamente na estrutura, no estoque de produtos acabados, nas vendas e no peso/m³ por lâmina. Deixe em branco para não alterar.</div>
+  ${(() => { const F = s.fatoresPacote || {}; const pres = {}; DB.estrutura.forEach(e => { const k = e.pa.match(/^([A-Z]+)(\d+)-(\d+)$/); if (k && e.mp === 'P' + k[1] + k[2]) (pres[k[1]] = pres[k[1]] || new Set()).add(k[3]); }); Object.entries(F).forEach(([p, o]) => Object.keys(o).forEach(x => (pres[p] = pres[p] || new Set()).add(x)));
+    const prefs = Object.keys(pres).sort(); if (!prefs.length) return '<div class="text-xs text-slate-400">Nenhum produto em pacote na estrutura.</div>';
+    return `<table class="text-xs"><tbody>${prefs.map(p => `<tr><td class="pr-3 py-1 font-semibold">${esc(p)}…</td>${[...pres[p]].sort((a, b) => a - b).map(x => `<td class="pr-3"><label>-${esc(x)} <input type="number" class="border rounded px-1 py-0.5 w-16 cf-fp" data-p="${esc(p)}" data-x="${esc(x)}" value="${F[p]?.[x] ?? ''}" placeholder="—"></label></td>`).join('')}</tr>`).join('')}</tbody></table>`; })()}
   <div class="font-bold mt-6 mb-2">Câmbio para previsões</div>
   <div class="grid md:grid-cols-3 gap-4">
     <label class="block"><span class="text-xs text-slate-600 font-semibold">Fonte</span><select id="cf_cambioFonte" class="w-full border rounded px-2 py-1.5" onchange="document.querySelectorAll('.cf-manual').forEach(i=>i.disabled=this.value!=='manual')">
@@ -1874,10 +1892,11 @@ function saveConfig() {
   s.pesoMaxContainer = { "20'": Number(g('kg0').value) || 25000, "40'": Number(g('kg1').value) || 26500, '40HC': Number(g('kg2').value) || 26500 };
   if (!s.coberturaMaxDias) s.coberturaMaxDias = 180;
   s.horizonte = Math.min(Math.max(s.horizonte, 30), 730);
+  const fp = {}; document.querySelectorAll('.cf-fp').forEach(i => { const v = Number(i.value); if (v > 0) (fp[i.dataset.p] = fp[i.dataset.p] || {})[i.dataset.x] = v; }); s.fatoresPacote = fp;
   const fonteAntes = s.cambioFonte; s.cambioFonte = g('cambioFonte').value; s.cambioMargem = Number(g('cambioMargem').value) || 0;
   if (s.cambioFonte === 'manual') { s.cambio = { ...s.cambio, USD: Number(g('USD').value) || 0, CNY: Number(g('CNY').value) || 0 }; s.cambioInfo = { fonte: 'manual', em: new Date().toISOString(), ref: 'informado manualmente' }; }
   s.dataBase = g('dataBase').value; s.incluirSimulacoes = g('incluirSimulacoes').checked; s.workerUrl = g('workerUrl').value.trim();
-  changed('settings'); toast('Configurações salvas');
+  changed('settings', 'estrutura', 'produtos'); toast('Configurações salvas');
   if (s.cambioFonte !== 'manual' && s.cambioFonte !== fonteAntes) atualizarCambio(true);
 }
 
