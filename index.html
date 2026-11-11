@@ -607,7 +607,7 @@ const MRPCore = (function () {
       if (sk >= 0 && dp >= 0) { hdr = i; cSku = sk; cDisp = dp; cLoc = hs.findIndex(h => h.startsWith('fisicolocal')); cExt = hs.findIndex(h => h.startsWith('fisicoexterno')); cFull = hs.findIndex(h => h.startsWith('fisicofull')); cTipo = hs.findIndex(h => h === 'tipo'); break; }
     }
     if (hdr < 0) throw new Error('Não encontrei as colunas "SKU" e "Total disponível para venda".');
-    const rel = new Set([...db.produtos.map(p => p.cod), ...db.estrutura.map(e => e.pa)]);
+    const rel = new Set([...db.produtos.map(p => p.cod), ...db.produtos.map(p => gemeoMP(p.cod)), ...db.estrutura.map(e => e.pa)]);
     const skus = {}; let lidos = 0;
     for (let i = hdr + 1; i < rows.length; i++) {
       const r = rows[i]; const sku = str(r[cSku]); if (!sku) continue; lidos++;
@@ -618,22 +618,29 @@ const MRPCore = (function () {
     const data = m ? `${m[1]}-${m[2]}-${m[3]}` : todayISO();
     return { data, arquivo: arquivo || '', importadoEm: new Date().toISOString(), lidos, skus };
   }
-  // estoque do componente = saldo próprio + (produtos acabados × quantidade na estrutura)
+  // código de matéria-prima "gêmeo" de um item acabado: NAB0002-C → PNAB0002, VAB0003-C → PVAB0003
+  function gemeoMP(cod) { return /^P/.test(cod) && !/-[A-Z]+$/.test(cod) ? null : 'P' + cod.replace(/-[A-Z]+$/, ''); }
+  // estoque do item = saldo próprio + matéria-prima gêmea (PNAB…, PVAB…) + (produtos acabados × quantidade na estrutura)
   function aplicarEstoque(db) {
     const S = db.estoqueSnap; if (!S) return null;
     const somar = db.settings.estoqueSomarAcabados !== false;
-    const res = { semSaldo: [], comAcabados: 0 };
+    const prods = new Set(db.produtos.map(p => p.cod));
+    const res = { semSaldo: [], comAcabados: 0, comGemeo: 0 };
     db.produtos.forEach(p => {
       const own = S.skus[p.cod] ? num(S.skus[p.cod].disp) : 0;
       if (!S.skus[p.cod]) res.semSaldo.push(p.cod);
       let acab = 0; const det = [];
+      const g = gemeoMP(p.cod);
+      if (g && g !== p.cod && S.skus[g] && !prods.has(g) && !db.estrutura.some(e => e.pa === g && e.mp === p.cod)) {
+        const v = num(S.skus[g].disp); if (v) { acab += v; det.push(`${g} (matéria-prima): ${v}`); res.comGemeo++; }
+      }
       if (somar) db.estrutura.forEach(e => {
         if (e.mp !== p.cod || e.pa === p.cod || !S.skus[e.pa]) return;
         const v = num(S.skus[e.pa].disp) * num(e.qtd); if (!v) return;
         acab += v; det.push(`${e.pa}: ${num(S.skus[e.pa].disp)} × ${num(e.qtd)}`);
       });
       p.estoqueProprio = own; p.estoqueAcabados = acab; p.estoqueDet = det; p.estoque = own + acab;
-      if (acab) res.comAcabados++;
+      if (det.some(d => !d.includes('(matéria-prima)'))) res.comAcabados++;
     });
     db.estoqueAtualizadoEm = S.data;
     return res;
@@ -1147,7 +1154,7 @@ function pgMRP(el) {
   <tbody>${rows.map(x => `<tr class="border-t hover:bg-sky-50 cursor-pointer" onclick="openItem('${esc(x.cod)}')">
     <td class="px-2 py-1.5"><div class="font-semibold">${esc(x.cod)}</div><div class="text-slate-400 truncate max-w-[260px]" title="${esc(x.produto.desc)}">${esc(x.produto.desc)}</div></td>
     <td class="px-2">${esc(x.produto.familia)}</td><td class="px-2">${esc(x.produto.fornecedor)}</td>
-    <td class="px-2 num ${C.num(x.produto.estoque) <= 0 ? 'text-red-600 font-semibold' : ''}" title="${x.produto.estoqueAcabados ? 'Próprio ' + f0(x.produto.estoqueProprio) + ' + produtos acabados ' + f0(x.produto.estoqueAcabados) : ''}">${f0(x.produto.estoque)}${x.produto.estoqueAcabados ? '<span class="text-slate-400">*</span>' : ''}</td>
+    <td class="px-2 num ${C.num(x.produto.estoque) <= 0 ? 'text-red-600 font-semibold' : ''}" title="${x.produto.estoqueAcabados ? 'Próprio ' + f0(x.produto.estoqueProprio) + ' + ' + (x.produto.estoqueDet || []).join(' + ') : ''}">${f0(x.produto.estoque)}${x.produto.estoqueAcabados ? '<span class="text-slate-400">*</span>' : ''}</td>
     <td class="px-2 num">${f1(x.avg30)}</td><td class="px-2 num">${x.diasEstoque === null ? '–' : (x.diasEstoque >= R.opts.horizonte ? '>' + R.opts.horizonte : f0(x.diasEstoque))}</td>
     <td class="px-2 num">${x.totalAberto ? f0(x.totalAberto) : '–'}${x.atrasadas ? ' <span class="text-red-500" title="chegada vencida">⚠</span>' : ''}</td>
     <td class="px-2 ${x.rupturaDia >= 0 && x.rupturaDia <= 30 ? 'text-red-600 font-semibold' : ''}">${x.ruptura ? fd(x.ruptura) + ` <span class="text-slate-400">(${x.rupturaDia}d)</span>` : '<span class="text-slate-400">sem ruptura</span>'}</td>
@@ -1187,7 +1194,7 @@ function openItem(cod) {
         ${[['leadTime', 'Lead time produção (d)', x.prm.leadTime], ['transitTime', 'Trânsito (d)', x.prm.transitTime], ['multiplo', 'Múltiplo de compra', x.prm.mult], ['segurancaDias', 'Estoque segurança (dias)', x.prm.seg], ['coberturaDias', 'Cobertura por pedido (dias)', x.prm.cob], ['estoque', 'Estoque atual', p.estoque]].map(([k, l, v]) => { const ro = k === 'estoque' && DB.estoqueSnap; return `<label class="block"><span class="text-slate-500">${l}</span><input type="number" step="any" class="w-full border rounded px-2 py-1 ${ro ? 'bg-slate-100' : ''}" value="${v ?? ''}" ${ro ? 'disabled title="Vem do relatório de estoque corrente"' : ''} onchange="setItemParam('${esc(cod)}','${k}',this.value)"></label>`; }).join('')}
       </div>
       ${(p.cotacoes || []).length > 1 ? `<div class="text-[11px] text-slate-600 mt-2">Cotações: ${p.cotacoes.map(c => `<span class="${c.fornecedor === p.fornecedor ? 'font-semibold' : ''}">${esc(c.fornecedor)} ${c.moeda} ${nf2.format(c.custo)}</span>`).join(' · ')}</div>` : ''}
-      ${DB.estoqueSnap ? `<div class="text-[11px] text-slate-600 mt-2">Estoque de ${fd(DB.estoqueSnap.data)}: próprio <b>${f0(p.estoqueProprio)}</b>${p.estoqueAcabados ? ` + em produtos acabados <b>${f0(p.estoqueAcabados)}</b> <span class="text-slate-400">(${esc((p.estoqueDet || []).join(' · '))})</span>` : ''}</div>` : ''}
+      ${DB.estoqueSnap ? `<div class="text-[11px] text-slate-600 mt-2">Estoque de ${fd(DB.estoqueSnap.data)}: próprio <b>${f0(p.estoqueProprio)}</b>${p.estoqueAcabados ? ` + matéria-prima/produtos acabados <b>${f0(p.estoqueAcabados)}</b> <span class="text-slate-400">(${esc((p.estoqueDet || []).join(' · '))})</span>` : ''}</div>` : ''}
       <div class="text-[11px] text-slate-400 mt-1">Lead time total considerado: ${x.prm.LT} dias (produção + trânsito${x.prm.desembaraco ? ' + desembaraço' : ''}). Estoque de segurança ≈ ${f0(ssQ)} pç.</div>
       <div class="font-semibold mt-4 mb-1">Plano de compras sugerido</div>
       <table class="w-full text-xs"><thead><tr class="text-left text-slate-500"><th>Pedir até</th><th>Chegada</th><th class="num">Qtd</th><th></th></tr></thead><tbody>
@@ -1541,7 +1548,7 @@ function pgImportar(el) {
   el.innerHTML = `<div class="grid md:grid-cols-2 gap-4 max-w-5xl">
   ${card('1. Planilha MRP atual (.xlsb / .xlsx)', 'Migração completa: lê as abas MRP, Structure, Forecast, Stock_Structure, Stock_System, COSTS, Tab_CBM, Purchase_Order, Suppliers e Follow-up. <b>Substitui todos os dados do site</b> (as configurações são mantidas).', `<input type="file" id="fMRP" accept=".xlsb,.xlsx,.xlsm" class="text-xs"><div id="logMRP" class="text-xs mt-3 text-slate-600 whitespace-pre-line"></div>`)}
   ${card('2. Estoque atual (relatório Estoque Corrente)', 'Relatório de estoque corrente do ERP (.xlsx). Usa a coluna <b>Total disponível para venda</b> (Local + Full − DVG − bloqueados − reserva) de cada SKU. A data do estoque é lida do nome do arquivo.', `<input type="file" id="fEst" accept=".xlsx,.xls,.xlsb,.csv" class="text-xs">
-    <label class="flex items-start gap-2 text-xs mt-2"><input type="checkbox" class="mt-0.5" ${DB.settings.estoqueSomarAcabados !== false ? 'checked' : ''} onchange="DB.settings.estoqueSomarAcabados=this.checked;changed('settings','produtos')"> <span>Somar o estoque de <b>produtos acabados</b> aos componentes pela estrutura (ex.: 1.055 pacotes PBG0007-5 × 40 = 42.200 PPBG0007), como fazia a planilha. Assim o MRP não compra componente que já está pronto em produto acabado.</span></label>
+    <label class="flex items-start gap-2 text-xs mt-2"><input type="checkbox" class="mt-0.5" ${DB.settings.estoqueSomarAcabados !== false ? 'checked' : ''} onchange="DB.settings.estoqueSomarAcabados=this.checked;changed('settings','produtos')"> <span>Somar o estoque de <b>produtos acabados</b> aos componentes pela estrutura (ex.: pacotes PBG0007-5 × 36 lâminas → PPBG0007), como fazia a planilha. Assim o MRP não compra componente que já está pronto em produto acabado. A matéria-prima dos itens acabados (ex.: PNAB0002 para NAB0002-C) é sempre somada.</span></label>
     <div id="logEst" class="text-xs mt-3 text-slate-600 whitespace-pre-line">${DB.estoqueSnap ? `Estoque no site: <b>${fd(DB.estoqueSnap.data)}</b> (${esc(DB.estoqueSnap.arquivo)}) · ${Object.keys(DB.estoqueSnap.skus).length} SKUs usados` : ''}</div>`)}
   ${card('3. Relatório de vendas (efetivo)', 'Export de vendas do e-commerce (CSV ou Excel) com as colunas <b>Data do pedido</b>, <b>SKU</b>, <b>Qtd</b>, <b>Status expedição</b> e <b>Canal</b>. Pedidos cancelados são ignorados; vendas de "Proposta comercial" ficam separadas. Só os totais por SKU e dia são guardados (nenhum dado de cliente). Importar um novo período substitui apenas os dias daquele período.', `<input type="file" id="fVend" accept=".csv,.txt,.xlsx,.xls" class="text-xs"><div id="logVend" class="text-xs mt-3 text-slate-600 whitespace-pre-line">${DB.vendas ? `Histórico no site: ${fd(DB.vendas.base)} a ${fd(C.addDays(DB.vendas.base, DB.vendas.dias - 1))} · ${Object.keys(DB.vendas.skus).length} SKUs` : ''}</div><div id="vincBox"></div>`)}
   ${card('6. Medidas e pesos dos produtos', 'Tabela de dimensões (Peso, Largura, Altura, Comprimento, Cubagem) por código. Usada para calcular m³ e peso dos containers. Códigos de produto vendido são levados ao componente pela estrutura (ex.: PBG0007-5 ÷ 40 → PPBG0007).', `<div class="flex gap-2"><input id="medUrl" placeholder="Link da planilha Google" value="${esc(DB.settings.medidasUrl || '')}" class="border rounded px-2 py-1 text-xs flex-1"><button class="bg-sky-600 text-white rounded px-3 py-1 text-xs" onclick="buscarMedidasUrl()">Buscar</button></div>
@@ -1571,7 +1578,7 @@ function pgImportar(el) {
       const snap = C.parseEstoqueCorrente(XLSX, XLSX.read(await f.arrayBuffer(), { type: 'array' }), DB, f.name);
       DB.estoqueSnap = snap; const r = C.aplicarEstoque(DB); recalc(); Store.save('estoque', 'produtos', 'meta'); renderNav();
       const dias = C.diffDays(snap.data, C.todayISO());
-      log.innerHTML = `<b class="text-emerald-700">Estoque atualizado — posição de ${fd(snap.data)}</b>${dias > 3 ? ` <span class="text-amber-700">(${dias} dias atrás)</span>` : ''}\n${f0(snap.lidos)} SKUs no relatório · ${Object.keys(snap.skus).length} usados pelo MRP · ${r.comAcabados} componentes somando produtos acabados${r.semSaldo.length ? `\n<span class="text-amber-700">${r.semSaldo.length} itens do MRP não estão no relatório (estoque considerado 0): ${r.semSaldo.slice(0, 30).map(esc).join(', ')}</span>` : ''}`;
+      log.innerHTML = `<b class="text-emerald-700">Estoque atualizado — posição de ${fd(snap.data)}</b>${dias > 3 ? ` <span class="text-amber-700">(${dias} dias atrás)</span>` : ''}\n${f0(snap.lidos)} SKUs no relatório · ${Object.keys(snap.skus).length} usados pelo MRP · ${r.comAcabados} itens somando produtos acabados · ${r.comGemeo} itens somando a matéria-prima (P…)${r.semSaldo.length ? `\n<span class="text-amber-700">${r.semSaldo.length} itens do MRP não estão no relatório (estoque considerado 0): ${r.semSaldo.slice(0, 30).map(esc).join(', ')}</span>` : ''}`;
       toast('Estoque atualizado');
     } catch (err) { console.error(err); log.innerHTML = '<span class="text-red-600">Erro: ' + esc(err.message) + '</span>'; }
   };
