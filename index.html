@@ -813,8 +813,8 @@ const MRPCore = (function () {
     return s;
   }
   // prioridade: item > família > fornecedor (só lead time/trânsito) > padrão das Configurações
-  function itemParams(db, p) {
-    const s = db.settings; const f = db.fornecedores.find(x => x.nome === p.fornecedor) || {};
+  function itemParams(db, p, fornAlt) {
+    const s = db.settings; const f = db.fornecedores.find(x => x.nome === (fornAlt || p.fornecedor)) || {};
     const fam = (s.familias || {})[p.familia] || {};
     const tem = v => v !== null && v !== undefined && v !== '' && !(typeof v === 'number' && isNaN(v));
     const pick = (...c) => { for (const [v, o] of c) if (tem(v)) return [num(v), o]; return [0, 'padrão']; };
@@ -1263,11 +1263,13 @@ function setItemParam(cod, k, v) {
 /* ================= SUGESTÕES ================= */
 function sugRows() {
   const F = ui.sugFiltro, t = R.opts.today;
-  return R.itens.filter(x => x.prox && (F.status === 'todos' ? true : F.status === 'acao' ? ['atrasado', 'comprar'].includes(x.status) : F.status === 'janela' ? C.diffDays(t, x.prox.dataPedidoIdeal) <= F.janela : x.status === F.status) && (!F.fornecedor || x.produto.fornecedor === F.fornecedor));
+  return R.itens.filter(x => x.prox && (F.status === 'todos' ? true : F.status === 'acao' ? ['atrasado', 'comprar'].includes(x.status) : F.status === 'janela' ? C.diffDays(t, x.prox.dataPedidoIdeal) <= F.janela : x.status === F.status) && (!F.fornecedor || F.modo === 'geral' || x.produto.fornecedor === F.fornecedor) && (!F.familia || F.modo !== 'geral' || x.produto.familia === F.familia));
 }
 function pgSugestoes(el) {
   const F = ui.sugFiltro;
   if (!R || !R.itens.length) { el.innerHTML = ''; return; }
+  if (!F.modo) F.modo = 'geral';
+  if (F.modo === 'geral') return pgSugGeral(el);
   if (F.fechar === undefined) F.fechar = true;
   ui.sugQtd = ui.sugQtd || {};
   const rows = sugRows();
@@ -1277,6 +1279,7 @@ function pgSugestoes(el) {
   const totVal = G.reduce((a, g) => a + g.valor, 0), totCont = G.reduce((a, g) => a + (g.containers || 0), 0);
   el.innerHTML = `
   <div class="flex flex-wrap gap-2 mb-3 items-center">
+    ${sugModoSwitch()}
     <select id="sst" class="border rounded-lg px-2 py-1.5">${[['acao', 'Ação imediata (atrasado + 7 dias)'], ['atrasado', 'Somente atrasados'], ['janela', 'Pedir nos próximos N dias'], ['todos', 'Todas as sugestões do horizonte']].map(([v, l]) => opt(v, F.status, l)).join('')}</select>
     ${F.status === 'janela' ? `<input id="sjan" type="number" value="${F.janela}" class="border rounded-lg px-2 py-1.5 w-20"> dias` : ''}
     <select id="sforn" class="border rounded-lg px-2 py-1.5"><option value="">Todos os fornecedores</option>${uniq(DB.produtos.map(p => p.fornecedor)).map(f => opt(f, F.fornecedor)).join('')}</select>
@@ -1319,6 +1322,108 @@ function pgSugestoes(el) {
   document.getElementById('sforn').onchange = e => { F.fornecedor = e.target.value; render(); };
   const j = document.getElementById('sjan'); if (j) j.onchange = e => { F.janela = Number(e.target.value) || 30; render(); };
 }
+
+/* ===== Sugestões: lista geral + montar pedido ===== */
+function sugModoSwitch() {
+  const m = ui.sugFiltro.modo || 'geral';
+  return `<div class="flex rounded-lg border bg-white overflow-hidden text-xs">${[['geral', 'Lista geral'], ['fornecedor', 'Por fornecedor (fechar container)']].map(([k, l]) => `<button class="px-3 py-1.5 ${m === k ? 'bg-slate-800 text-white' : 'hover:bg-slate-50'}" onclick="ui.sugFiltro.modo='${k}';render()">${l}</button>`).join('')}</div>`;
+}
+function qtdSug(x) { const o = (ui.sugQtd || {})[x.cod]; return o !== undefined && o !== null && o !== '' ? Number(o) : x.prox.qtd; }
+function pgSugGeral(el) {
+  const F = ui.sugFiltro; ui.sugQtd = ui.sugQtd || {};
+  let rows = sugRows();
+  rows = sortRows('sugg', rows, { cod: x => x.cod, fam: x => x.produto.familia, forn: x => x.produto.fornecedor, est: x => C.num(x.produto.estoque), dem: x => x.avg30, rupt: x => x.rupturaDia >= 0 ? x.rupturaDia : 99999, ped: x => x.prox.dataPedidoIdeal, qtd: x => qtdSug(x), val: x => qtdSug(x) * x.custoBRL, st: x => ['atrasado', 'comprar', 'planejar', 'ok'].indexOf(x.status) });
+  if (!ui.sort.sugg) rows = [...rows].sort((a, b) => a.prox.dataPedidoIdeal.localeCompare(b.prox.dataPedidoIdeal) || (a.rupturaDia >= 0 ? a.rupturaDia : 99999) - (b.rupturaDia >= 0 ? b.rupturaDia : 99999));
+  const tot = rows.reduce((a, x) => { const q = qtdSug(x); a.v += q * x.custoBRL; a.m += q * x.cbmUn; a.k += q * (x.pesoUn || 0); return a; }, { v: 0, m: 0, k: 0 });
+  el.innerHTML = `
+  <div class="flex flex-wrap gap-2 mb-3 items-center">
+    ${sugModoSwitch()}
+    <select id="sst" class="border rounded-lg px-2 py-1.5">${[['acao', 'Ação imediata (atrasado + 7 dias)'], ['atrasado', 'Somente atrasados'], ['janela', 'Pedir nos próximos N dias'], ['todos', 'Todas as sugestões do horizonte']].map(([v, l]) => opt(v, F.status, l)).join('')}</select>
+    ${F.status === 'janela' ? `<input id="sjan" type="number" value="${F.janela}" class="border rounded-lg px-2 py-1.5 w-20"> dias` : ''}
+    <select id="sfam" class="border rounded-lg px-2 py-1.5"><option value="">Todas as famílias</option>${uniq(DB.produtos.map(p => p.familia)).map(f => opt(f, F.familia)).join('')}</select>
+    <div class="ml-auto flex gap-2">
+      ${Object.keys(ui.sugQtd).length ? `<button onclick="ui.sugQtd={};render()" class="border rounded-lg px-3 py-1.5 bg-white hover:bg-slate-50">Limpar ajustes manuais</button>` : ''}
+      <button onclick="exportSugGeral()" class="border rounded-lg px-3 py-1.5 bg-white hover:bg-slate-50">Exportar Excel</button>
+      <button onclick="montarPedido([...document.querySelectorAll('.sugck:checked')].map(c=>c.value))" class="rounded-lg px-3 py-1.5 bg-violet-600 text-white hover:bg-violet-700">Montar pedido com os selecionados</button>
+    </div>
+  </div>
+  <div class="text-[11px] text-slate-500 mb-3">${rows.length} itens · ${brl.format(tot.v)}${tot.m ? ` · ${f1(tot.m)} m³` : ''}${tot.k ? ` · ${nf1.format(tot.k / 1000)} t` : ''}. Quantidade = necessidade calculada pelo MRP (cobertura + segurança − estoque projetado, no múltiplo). Selecione os itens e clique em <b>Montar pedido</b> para decidir quanto vai para cada fornecedor.</div>
+  <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 220px)"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="w-8 text-center"><input type="checkbox" onchange="document.querySelectorAll('.sugck').forEach(c=>c.checked=this.checked)"></th>
+  ${th('sugg', 'cod', 'Item')}${th('sugg', 'fam', 'Família')}${th('sugg', 'forn', 'Fornecedor principal')}${th('sugg', 'est', 'Estoque', 'num')}${th('sugg', 'dem', 'Dem./dia', 'num')}${th('sugg', 'rupt', 'Ruptura')}${th('sugg', 'ped', 'Pedir até')}<th class="px-2">Chegada</th>${th('sugg', 'qtd', 'Qtd sugerida', 'num')}<th class="px-2 num">m³</th><th class="px-2 num">kg</th>${th('sugg', 'val', 'Valor', 'num')}${th('sugg', 'st', 'Situação')}</tr></thead><tbody>
+  ${rows.map(x => { const q = qtdSug(x), fixo = ui.sugQtd[x.cod] !== undefined; const pc = x.prox.parcelas && x.prox.parcelas.length > 1 ? dividirParcelas({ parcelas: x.prox.parcelas, qFinal: q, mult: x.prm.mult, dataChegada: x.prox.dataChegada }) : null;
+    return `<tr class="border-t hover:bg-sky-50"><td class="text-center"><input type="checkbox" class="sugck" value="${esc(x.cod)}"></td>
+    <td class="px-2 py-1.5 cursor-pointer" onclick="openItem('${esc(x.cod)}')"><div class="font-semibold text-sky-800">${esc(x.cod)}</div><div class="text-slate-400 truncate max-w-[220px]">${esc(x.produto.desc)}</div></td>
+    <td class="px-2">${esc(x.produto.familia)}</td><td class="px-2">${esc(x.produto.fornecedor)}${(x.produto.cotacoes || []).length > 1 ? ` <span class="text-slate-400" title="${esc(x.produto.cotacoes.map(c => c.fornecedor).join(', '))}">+${x.produto.cotacoes.length - 1}</span>` : ''}</td>
+    <td class="px-2 num">${f0(x.produto.estoque)}</td><td class="px-2 num">${f1(x.avg30)}</td><td class="px-2">${x.ruptura ? fd(x.ruptura) : '–'}</td>
+    <td class="px-2 ${x.prox.atrasado ? 'text-red-600 font-semibold' : ''}">${fd(x.prox.dataPedidoIdeal)}</td><td class="px-2">${fd(x.prox.dataChegada)}</td>
+    <td class="px-2 num"><input type="number" class="cell-input font-semibold ${fixo ? 'bg-amber-50' : ''}" value="${q}" onchange="ui.sugQtd['${esc(x.cod)}']=this.value===''?undefined:Number(this.value);render()">${pc ? `<div class="text-[10px] text-slate-500 whitespace-nowrap">${pc.map(p => f0(p.qtd) + ' em ' + fd(p.dataChegada)).join(' · ')}</div>` : ''}</td>
+    <td class="px-2 num">${x.cbmUn ? f1(q * x.cbmUn) : '<span class="text-amber-500">?</span>'}</td><td class="px-2 num">${x.pesoUn ? f0(q * x.pesoUn) : '<span class="text-amber-500">?</span>'}</td><td class="px-2 num">${x.custoBRL ? brl.format(q * x.custoBRL) : '–'}</td><td class="px-2">${badge(x.status)}</td></tr>`; }).join('') || '<tr><td colspan=13 class="p-4 text-slate-400">Nenhuma sugestão para este filtro.</td></tr>'}
+  </tbody></table></div>`;
+  document.getElementById('sst').onchange = e => { F.status = e.target.value; render(); };
+  document.getElementById('sfam').onchange = e => { F.familia = e.target.value; render(); };
+  const j = document.getElementById('sjan'); if (j) j.onchange = e => { F.janela = Number(e.target.value) || 30; render(); };
+}
+function exportSugGeral() {
+  xlsxDownload(`Sugestoes_compra_${R.opts.today}.xlsx`, [['Sugestões', sugRows().map(x => { const q = qtdSug(x); return { Item: x.cod, Descrição: x.produto.desc, Família: x.produto.familia, 'Fornecedor principal': x.produto.fornecedor, Estoque: C.num(x.produto.estoque), 'Demanda/dia': Math.round(x.avg30 * 100) / 100, Ruptura: x.ruptura || '', 'Pedir até': x.prox.dataPedidoIdeal, Chegada: x.prox.dataChegada, 'Qtd sugerida': q, Entregas: x.prox.parcelas?.length > 1 ? dividirParcelas({ parcelas: x.prox.parcelas, qFinal: q, mult: x.prm.mult }).map(p => p.qtd + ' em ' + fd(p.dataChegada)).join(' | ') : '', 'm³': Math.round(q * x.cbmUn * 100) / 100, kg: Math.round(q * (x.pesoUn || 0)), 'Valor R$': Math.round(q * x.custoBRL), Situação: STATUS_LBL[x.status] }; })]]);
+}
+// custo do item num fornecedor: cotação daquele fornecedor, senão o custo do cadastro
+function custoForn(p, forn) {
+  const c = (p.cotacoes || []).find(z => z.fornecedor === forn && z.custo > 0);
+  if (c) return { custo: c.custo, moeda: c.moeda, cotado: true };
+  return { custo: C.num(p.custo), moeda: p.moeda || 'USD', cotado: forn === p.fornecedor };
+}
+function montarPedido(cods) {
+  if (!cods.length) { toast('Selecione os itens que vão entrar no pedido'); return; }
+  const aloc = {}, cols = [];
+  cods.forEach(cod => { const x = R.byCod.get(cod); if (!x || !x.prox) return; const f = x.produto.fornecedor || '(sem fornecedor)'; if (!cols.includes(f)) cols.push(f); aloc[cod] = { [f]: qtdSug(x) }; });
+  window._mp = { cods: Object.keys(aloc), cols, aloc };
+  renderMontarPedido();
+}
+function renderMontarPedido() {
+  const M = window._mp, s = DB.settings;
+  const totForn = f => M.cods.reduce((a, cod) => { const x = R.byCod.get(cod), q = C.num(M.aloc[cod][f]); if (!q) return a; const cf = custoForn(x.produto, f); a.q += q; a.n += 1; a.m += q * x.cbmUn; a.k += q * (x.pesoUn || 0); a.v += q * cf.custo * C.taxaPrevisao(DB, cf.moeda); if (!x.cbmUn) a.semM++; return a; }, { q: 0, n: 0, m: 0, k: 0, v: 0, semM: 0 });
+  const fornOpts = uniq([...DB.fornecedores.map(f => f.nome), ...DB.produtos.map(p => p.fornecedor)]).filter(f => !M.cols.includes(f));
+  openModal('Montar pedido — distribuir entre fornecedores', `
+  <div class="flex flex-wrap items-center gap-2 mb-3 text-xs">
+    <span>Mandar tudo para</span><select id="mpTudo" class="border rounded px-2 py-1">${uniq([...M.cols, ...fornOpts]).map(f => opt(f, M.cols[0])).join('')}</select><button class="border rounded px-2 py-1 bg-white hover:bg-slate-50" onclick="mpTudo()">aplicar</button>
+    <span class="ml-4">Adicionar fornecedor</span><select id="mpAdd" class="border rounded px-2 py-1"><option value="">—</option>${fornOpts.map(f => opt(f, '')).join('')}</select><button class="border rounded px-2 py-1 bg-white hover:bg-slate-50" onclick="mpAdd()">adicionar coluna</button>
+  </div>
+  <div class="scroll-x" style="max-height:55vh"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="px-2 py-1.5">Item</th><th class="px-2 num">Sugerido</th>${M.cols.map((f, i) => `<th class="px-2 num">${esc(f)} <button class="text-slate-400 hover:text-red-500" title="remover coluna" onclick="mpRem(${i})">×</button></th>`).join('')}<th class="px-2 num">Alocado</th></tr></thead><tbody>
+  ${M.cods.map(cod => { const x = R.byCod.get(cod), sug = qtdSug(x), al = M.cols.reduce((a, f) => a + C.num(M.aloc[cod][f]), 0);
+    return `<tr class="border-t"><td class="px-2 py-1"><div class="font-semibold">${esc(cod)}</div><div class="text-slate-400 truncate max-w-[200px]">${esc(x.produto.desc)}</div></td><td class="px-2 num">${f0(sug)}</td>
+    ${M.cols.map(f => { const cf = custoForn(x.produto, f); return `<td class="px-2 num"><input type="number" class="cell-input ${C.num(M.aloc[cod][f]) ? 'font-semibold bg-violet-50' : ''}" value="${M.aloc[cod][f] ?? ''}" placeholder="0" onchange="window._mp.aloc['${esc(cod)}']['${esc(f)}']=Number(this.value)||0;renderMontarPedido()">${!cf.cotado ? '<div class="text-[10px] text-amber-600" title="Sem cotação deste fornecedor — usa o custo do cadastro">sem cotação</div>' : ''}</td>`; }).join('')}
+    <td class="px-2 num font-semibold ${Math.abs(al - sug) > 0.5 ? 'text-amber-600' : 'text-emerald-700'}">${f0(al)}${Math.abs(al - sug) > 0.5 ? `<div class="text-[10px] font-normal">${al > sug ? '+' : ''}${f0(al - sug)} vs sugerido</div>` : ''}</td></tr>`; }).join('')}
+  </tbody><tfoot>
+    ${[['Itens', t => f0(t.n)], ['Peças', t => f0(t.q)], ['m³', t => t.m ? f1(t.m) + (t.semM ? ` <span class="text-amber-600" title="itens sem volume">(+${t.semM}?)</span>` : '') : '–'], ['Peso', t => t.k ? nf1.format(t.k / 1000) + ' t' : '–'], ['Containers', (t, f) => { const fo = DB.fornecedores.find(z => z.nome === f) || {}; const tipo = fo.container || s.containerPadrao || '40HC'; const cap = C.capacidadeContainer(DB, tipo), kg = C.pesoMaxContainer(DB, tipo); if (!cap || (!t.m && !t.k)) return tipo === 'LCL' ? 'LCL' : '–'; const n = Math.max(t.m / cap, kg ? t.k / kg : 0); return `${nf2.format(n)} × ${esc(tipo)}`; }], ['Valor', t => brl.format(t.v)]].map(([l, fn]) => `<tr class="border-t bg-slate-50"><td class="px-2 py-1 font-semibold" colspan="2">${l}</td>${M.cols.map(f => `<td class="px-2 num">${fn(totForn(f), f)}</td>`).join('')}<td></td></tr>`).join('')}
+  </tfoot></table></div>
+  <div class="text-[11px] text-slate-500 mt-2">As datas de chegada usam o lead time de cada fornecedor (respeitando item e família). Itens com entregas parceladas geram uma linha de ordem por parcela. Cada fornecedor recebe um número de PO planejada próprio.</div>
+  <div class="flex mt-4 gap-2"><button onclick="closeModal()" class="ml-auto border rounded-lg px-3 py-1.5">Cancelar</button><button onclick="criarOrdensMP()" class="bg-violet-600 text-white rounded-lg px-4 py-1.5">Criar ordens planejadas</button></div>`, 'max-w-6xl');
+}
+function mpTudo() { const M = window._mp, f = document.getElementById('mpTudo').value; if (!M.cols.includes(f)) M.cols.push(f); M.cods.forEach(cod => { const x = R.byCod.get(cod); const tot = M.cols.reduce((a, c) => a + C.num(M.aloc[cod][c]), 0) || qtdSug(x); M.aloc[cod] = { [f]: tot }; }); M.cols = [f]; renderMontarPedido(); }
+function mpAdd() { const M = window._mp, f = document.getElementById('mpAdd').value; if (!f) return; M.cols.push(f); renderMontarPedido(); }
+function mpRem(i) { const M = window._mp, f = M.cols[i]; if (M.cods.some(c => C.num(M.aloc[c][f])) && !confirm(`Remover ${f}? As quantidades desta coluna voltam para o primeiro fornecedor.`)) return; M.cols.splice(i, 1); if (!M.cols.length) return closeModal(); M.cods.forEach(c => { const q = C.num(M.aloc[c][f]); delete M.aloc[c][f]; if (q) M.aloc[c][M.cols[0]] = C.num(M.aloc[c][M.cols[0]]) + q; }); renderMontarPedido(); }
+function criarOrdensMP() {
+  const M = window._mp, t = R.opts.today, tag = t.replace(/-/g, '').slice(2); let n = 0, linhas = 0;
+  M.cols.forEach(f => {
+    const po = `PLAN-${tag}-${f.split(' ')[0].slice(0, 8)}`;
+    M.cods.forEach(cod => {
+      const q = C.num(M.aloc[cod][f]); if (q <= 0) return;
+      const x = R.byCod.get(cod), p = x.produto, prm = C.itemParams(DB, p, f), cf = custoForn(p, f);
+      const dp0 = x.prox?.dataPedido || t, dp = dp0 < t ? t : dp0;
+      const parts = x.prox?.parcelas?.length > 1 ? dividirParcelas({ parcelas: x.prox.parcelas, qFinal: q, mult: prm.mult, dataChegada: x.prox.dataChegada }) : [{ qtd: q, dia: null }];
+      const d0 = parts[0].dia;
+      parts.forEach((pc, j) => {
+        const desloc = pc.dia !== null && pc.dia !== undefined && d0 !== null && d0 !== undefined ? pc.dia - d0 : 0;
+        const cheg = C.addDays(dp, prm.LT + desloc);
+        DB.ordens.push({ id: uid('po'), po, fornecedor: f, item: cod, qtd: pc.qtd, dataPedido: dp, leadTime: prm.leadTime + desloc, dataEmbarque: C.addDays(cheg, -(prm.transitTime + prm.desembaraco)), transitTime: prm.transitTime, dataChegada: cheg, qtdRecebida: 0, status: 'Planejada', custoUnit: cf.custo, moeda: cf.moeda, cambioPago: null, responsavel: user?.email || '', obs: 'Montado em Sugestões' + (parts.length > 1 ? ` — entrega ${j + 1}/${parts.length}` : '') });
+        linhas++;
+      });
+      n++; delete (ui.sugQtd || {})[cod];
+    });
+  });
+  closeModal(); changed('ordens'); toast(`${linhas} linha(s) de ordem planejada criadas (${n} alocações, ${M.cols.length} fornecedor(es)). Veja em Ordens de compra.`, 4000);
+}
+
 function editForn(nome) {
   let f = DB.fornecedores.find(z => z.nome === nome);
   if (!f) { f = { nome, leadTime: null, transitTime: null, contato: '', linha: '' }; DB.fornecedores.push(f); }

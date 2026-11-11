@@ -11,6 +11,11 @@ Planejamento de importação: estoque projetado dia a dia, ruptura, ordens de co
 - Estoque de segurança, cobertura por pedido, lead time de produção, trânsito e intervalo de entregas podem ser definidos por família (Configurações → Parâmetros por família). Prioridade: item > família > fornecedor > padrão.
 - Entregas parceladas: com cobertura de 30 dias e entregas a cada 15, cada pedido vira 2 parcelas (a 1ª com o estoque de segurança e a reposição, a 2ª com a demanda do período seguinte). As ordens planejadas são criadas uma por parcela, com a mesma PO.
 
+## Sugestões: lista geral e montar pedido
+- Por padrão, as sugestões aparecem numa lista geral (sem agrupar por fornecedor). Selecione os itens e use **Montar pedido** para distribuir as quantidades entre fornecedores (colunas), mandar tudo para um só, e ver peças, m³, peso, containers e valor de cada um antes de criar as ordens.
+- Custo por fornecedor vem da cotação daquele fornecedor (aba COSTS); lead time respeita item > família > fornecedor > padrão. Cada fornecedor recebe uma PO planejada própria.
+- A visão "Por fornecedor (fechar container)" continua disponível no seletor do topo.
+
 ## Fechamento de pedido por fornecedor
 - Na tela de Sugestões, cada fornecedor vira um pedido: itens de **carona** (pedido ideal nos próximos N dias) entram no mesmo embarque, a quantidade sobe até o **pedido mínimo** e o último **container** é completado.
 - O complemento é distribuído para igualar a cobertura (dias) dos itens, respeitando o múltiplo de compra e a cobertura máxima (padrão 180 dias). Quantidades digitadas ficam fixas.
