@@ -130,6 +130,7 @@ const MRPCore = (function () {
       fornecedores: [], // {nome, leadTime, transitTime, moeda, contato, linha}
       vendas: null,     // vendas efetivas agregadas por SKU/dia
       estoqueSnap: null, // último relatório de estoque corrente (saldo por SKU)
+      medidasTab: null,  // tabela de medidas importada {codigo: {peso, m3}}
       estoqueAtualizadoEm: null
     };
   }
@@ -429,9 +430,17 @@ const MRPCore = (function () {
       if (temEstr.has(sku) || prods.has(sku)) return;
       const m = sku.match(/^([A-Z]+\d+)-(\d+)$/); if (!m) return;
       const mp = 'P' + m[1]; if (!prods.has(mp)) return;
+      // 1º: aprende com pacotes do mesmo tipo já cadastrados (ex.: PBG000X-5 → PPBG000X × 36)
+      const pref = m[1].replace(/\d+$/, ''), suf = m[2];
+      const conh = db.estrutura.filter(e => { const k = e.pa.match(/^([A-Z]+)\d+-(\d+)$/); return k && k[1] === pref && k[2] === suf && e.mp === 'P' + e.pa.replace(/-\d+$/, ''); });
+      if (conh.length) {
+        const cnt = {}; conh.forEach(e => { cnt[num(e.qtd)] = (cnt[num(e.qtd)] || 0) + 1; });
+        const q = Number(Object.entries(cnt).sort((a, b) => b[1] - a[1])[0][0]);
+        out.push({ pa: sku, mp, qtd: q, regra: `igual aos outros ${pref}…-${suf} já cadastrados (× ${q})` }); return;
+      }
       const mkt = db.estrutura.find(e => e.pa === m[1] + '_MKT' && e.mp === mp);
       const fator = mkt ? num(mkt.qtd) : 1;
-      out.push({ pa: sku, mp, qtd: num(m[2]) * fator, regra: mkt ? `${m[2]} × ${fator} (mesmo fator do ${m[1]}_MKT)` : `${m[2]} un.` });
+      out.push({ pa: sku, mp, qtd: num(m[2]) * fator, regra: mkt ? `${m[2]} × ${fator} (mesmo fator do ${m[1]}_MKT) — confira` : `${m[2]} un. — confira` });
     });
     return out;
   }
@@ -642,6 +651,7 @@ const MRPCore = (function () {
     const base = c => c.replace(/[-_].*$/, '');
     const res = { diretos: [], viaEstrutura: [], semMedida: [] };
     db.produtos.forEach(p => {
+      if (p.medidaManual) return;
       if (M[p.cod]) { p.m3Un = M[p.cod].m3; p.pesoUn = M[p.cod].peso; p.medidaFonte = p.cod; res.diretos.push(p.cod); return; }
       const cands = db.estrutura.filter(e => e.mp === p.cod && M[e.pa] && num(e.qtd) > 0 && p.cod.includes(base(e.pa)));
       if (cands.length) {
@@ -649,6 +659,7 @@ const MRPCore = (function () {
         p.m3Un = M[e.pa].m3 / num(e.qtd); p.pesoUn = M[e.pa].peso / num(e.qtd); p.medidaFonte = `${e.pa} ÷ ${num(e.qtd)}`;
         res.viaEstrutura.push(`${p.cod} ← ${e.pa}${num(e.qtd) !== 1 ? ' ÷ ' + num(e.qtd) : ''}`); return;
       }
+      if (p.medidaFonte && p.medidaFonte !== 'manual') { p.m3Un = null; p.pesoUn = null; p.medidaFonte = ''; }
       if (p.ativo !== false) res.semMedida.push(p.cod);
     });
     return res;
@@ -885,7 +896,7 @@ const FIREBASE_CONFIG = null;
 const DOMINIO_PERMITIDO = 'grupotbx.com.br';
 const COLECAO = 'mrp';                 // coleção do Firestore
 const LOCAL_KEY = 'mrp_tbx_v1';
-const DATASETS = ['settings', 'produtos', 'estrutura', 'previsao', 'ordens', 'embarques', 'fornecedores', 'vendas', 'estoque', 'meta'];
+const DATASETS = ['settings', 'produtos', 'estrutura', 'previsao', 'ordens', 'embarques', 'fornecedores', 'vendas', 'estoque', 'medidas', 'meta'];
 
 /* ================= ESTADO ================= */
 const C = MRPCore;
@@ -924,7 +935,7 @@ const Store = {
     const base = C.emptyDB();
     if (this.mode === 'firebase') {
       const snaps = await Promise.all(DATASETS.map(k => fsdb.collection(COLECAO).doc(k).get()));
-      snaps.forEach((s, i) => { const k = DATASETS[i]; if (s.exists) { const d = s.data(); if (k === 'settings') base.settings = { ...base.settings, ...d.v, cambio: { ...base.settings.cambio, ...(d.v?.cambio || {}) } }; else if (k === 'meta') base.estoqueAtualizadoEm = d.v?.estoqueAtualizadoEm || null; else if (k === 'vendas') base.vendas = d.v || null; else if (k === 'estoque') base.estoqueSnap = d.v || null; else base[k] = d.v || []; } });
+      snaps.forEach((s, i) => { const k = DATASETS[i]; if (s.exists) { const d = s.data(); if (k === 'settings') base.settings = { ...base.settings, ...d.v, cambio: { ...base.settings.cambio, ...(d.v?.cambio || {}) } }; else if (k === 'meta') base.estoqueAtualizadoEm = d.v?.estoqueAtualizadoEm || null; else if (k === 'vendas') base.vendas = d.v || null; else if (k === 'estoque') base.estoqueSnap = d.v || null; else if (k === 'medidas') base.medidasTab = d.v || null; else base[k] = d.v || []; } });
     } else {
       try { const raw = localStorage.getItem(LOCAL_KEY); if (raw) { const d = JSON.parse(raw); Object.assign(base, d); base.settings = { ...C.emptyDB().settings, ...d.settings, cambio: { ...C.emptyDB().settings.cambio, ...(d.settings?.cambio || {}) } }; } } catch (e) { console.warn(e); }
     }
@@ -943,7 +954,7 @@ const Store = {
       if (this.mode === 'firebase') {
         const batch = fsdb.batch();
         keys.forEach(k => {
-          const v = k === 'meta' ? { estoqueAtualizadoEm: DB.estoqueAtualizadoEm } : k === 'estoque' ? DB.estoqueSnap : DB[k];
+          const v = k === 'meta' ? { estoqueAtualizadoEm: DB.estoqueAtualizadoEm } : k === 'estoque' ? DB.estoqueSnap : k === 'medidas' ? DB.medidasTab : DB[k];
           batch.set(fsdb.collection(COLECAO).doc(k), { v: JSON.parse(JSON.stringify(v ?? null)), em: firebase.firestore.FieldValue.serverTimestamp(), por: user?.email || '' });
         });
         await batch.commit();
@@ -987,7 +998,7 @@ function setSort(key, col) { const s = ui.sort[key]; ui.sort[key] = s && s.col =
 function download(name, content, type = 'application/json') { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([content], { type })); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); }
 
 /* ================= CÁLCULO ================= */
-function recalc() { if (DB.estoqueSnap) { try { C.aplicarEstoque(DB); } catch (e) { console.error(e); } } R = C.computeAll(DB); try { R.vendas = DB.vendas ? C.analisarVendas(DB, R, ui.vendOpts) : null; } catch (e) { console.error(e); R.vendas = null; } }
+function recalc() { if (DB.medidasTab) { try { C.aplicarMedidas(DB, DB.medidasTab); } catch (e) { console.error(e); } } if (DB.estoqueSnap) { try { C.aplicarEstoque(DB); } catch (e) { console.error(e); } } R = C.computeAll(DB); try { R.vendas = DB.vendas ? C.analisarVendas(DB, R, ui.vendOpts) : null; } catch (e) { console.error(e); R.vendas = null; } }
 function prodByCod(cod) { return DB.produtos.find(p => p.cod === cod); }
 
 /* ================= NAVEGAÇÃO ================= */
@@ -1503,8 +1514,9 @@ function editProd(cod) {
   <div class="flex gap-2 mt-4">${cod ? `<button onclick="if(confirm('Excluir item?')){DB.produtos=DB.produtos.filter(x=>x.cod!=='${esc(cod)}');closeModal();changed('produtos')}" class="text-red-600 border border-red-200 rounded-lg px-3 py-1.5">Excluir</button>` : ''}<button onclick="closeModal()" class="ml-auto border rounded-lg px-3 py-1.5">Cancelar</button><button onclick="saveProd('${esc(cod || '')}')" class="bg-sky-600 text-white rounded-lg px-4 py-1.5">Salvar</button></div>`, 'max-w-3xl');
 }
 function saveProd(cod) {
-  const p = cod ? prodByCod(cod) : {};
+  const p = cod ? prodByCod(cod) : {}; const antesM3 = p.m3Un ?? null, antesKg = p.pesoUn ?? null;
   PROD_F.forEach(([k, , ty]) => { if (k === 'cod' && cod) return; const v = document.getElementById('pf_' + k).value.trim(); p[k] = ty === 'number' ? (v === '' ? (['custo', 'estoque'].includes(k) ? 0 : null) : Number(v)) : v; });
+  if (cod && (p.m3Un !== antesM3 || p.pesoUn !== antesKg)) { p.medidaManual = !!(p.m3Un || p.pesoUn); p.medidaFonte = p.medidaManual ? 'manual' : ''; }
   p.ativo = document.getElementById('pf_ativo').checked; p.fornecedor = (p.fornecedor || '').toUpperCase(); p.moeda = (p.moeda || 'USD').toUpperCase();
   if (!cod) { if (!p.cod) { toast('Informe o código'); return; } if (prodByCod(p.cod)) { toast('Código já existe'); return; } p.mrp = true; DB.produtos.push(p); }
   closeModal(); changed('produtos'); toast('Item salvo');
@@ -1589,7 +1601,7 @@ async function buscarMedidasUrl() {
   } catch (err) { log.innerHTML = `<span class="text-red-600">Não consegui ler a planilha (${esc(err.message)}). Verifique se ela está compartilhada como "Qualquer pessoa com o link pode ver" ou envie o arquivo baixado.</span>`; }
 }
 function aplicarMedidasUI(M, origem) {
-  const r = C.aplicarMedidas(DB, M); recalc(); Store.save('produtos', 'settings'); renderNav();
+  DB.medidasTab = M; const r = C.aplicarMedidas(DB, M); recalc(); Store.save('produtos', 'settings', 'medidas'); renderNav();
   const log = document.getElementById('logMed');
   if (log) log.innerHTML = `<b class="text-emerald-700">Medidas aplicadas (${esc(origem)})</b>\n${Object.keys(M).length} códigos na tabela · ${r.diretos.length} itens pelo mesmo código · ${r.viaEstrutura.length} pela estrutura\n${r.viaEstrutura.length ? '<span class="text-slate-500">' + r.viaEstrutura.map(esc).join(' · ') + '</span>\n' : ''}${r.semMedida.length ? `<span class="text-amber-700">${r.semMedida.length} itens sem medida (inclua na tabela ou cadastre em Cadastros → Itens): ${r.semMedida.slice(0, 40).map(esc).join(', ')}${r.semMedida.length > 40 ? '…' : ''}</span>` : ''}`;
   toast('Medidas e pesos atualizados');
