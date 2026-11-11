@@ -119,7 +119,7 @@ const MRPCore = (function () {
     return {
       settings: {
         horizonte: 240, segurancaDias: 30, coberturaDias: 60, leadTimePadrao: 45, transitPadrao: 35,
-        desembaracoDias: 0, cbmContainer: 68, containers: { "20'": 28, "40'": 58 }, pesoMaxContainer: { "20'": 25000, "40'": 26500, '40HC': 26500 }, containerPadrao: '40HC', medidasUrl: '', estoqueSomarAcabados: true, fatoresPacote: { PBG: { '1': 8, '3': 22, '5': 36 } }, coberturaMaxDias: 180, janelaCaronaDias: 60, incluirSimulacoes: true, dataBase: '',
+        desembaracoDias: 0, cbmContainer: 68, containers: { "20'": 28, "40'": 58 }, pesoMaxContainer: { "20'": 25000, "40'": 26500, '40HC': 26500 }, containerPadrao: '40HC', medidasUrl: '', estoqueSomarAcabados: true, fatoresPacote: { PBG: { '1': 8, '3': 22, '5': 36 }, PAG: { '1': 8, '3': 22, '5': 36 } }, coberturaMaxDias: 180, janelaCaronaDias: 60, incluirSimulacoes: true, dataBase: '',
         cambio: { USD: 5.40, CNY: 0.76, BRL: 1 }, cambioFonte: 'comercial', cambioMargem: 0, cambioInfo: null, workerUrl: ''
       },
       produtos: [],     // itens comprados (MP)
@@ -1936,6 +1936,8 @@ async function atualizarCambio(force) {
 (async function init() {
   if (FIREBASE_CONFIG) document.getElementById('loginScreen').classList.remove('hidden');
   await Store.init();
+  // garante os fatores de pacote padrão de cada tipo de piso (PBG e PAG) em configurações já salvas
+  { const F = DB.settings.fatoresPacote = DB.settings.fatoresPacote || {}; const def = C.emptyDB().settings.fatoresPacote; let mud = false; Object.keys(def).forEach(k => { if (!F[k]) { F[k] = { ...def[k] }; mud = true; } }); if (mud) Store.save('settings'); }
   const h = location.hash.slice(1); if (PAGES.some(p => p[0] === h)) page = h;
   recalc(); render();
   atualizarCambio(false);
