@@ -7,6 +7,10 @@ Planejamento de importação: estoque projetado dia a dia, ruptura, ordens de co
 2. Atualize o estoque com o relatório **Estoque Corrente** do ERP (colunas **SKU** e **Total disponível para venda**). A data do estoque é lida do nome do arquivo e, por padrão, o estoque de produtos acabados é somado aos componentes pela estrutura (ex.: PBG0007-5 × 40 → PPBG0007).
 3. Ajuste os parâmetros em **Configurações** (segurança, cobertura, lead times, câmbio).
 
+## Parâmetros por família e entregas parceladas
+- Estoque de segurança, cobertura por pedido, lead time de produção, trânsito e intervalo de entregas podem ser definidos por família (Configurações → Parâmetros por família). Prioridade: item > família > fornecedor > padrão.
+- Entregas parceladas: com cobertura de 30 dias e entregas a cada 15, cada pedido vira 2 parcelas (a 1ª com o estoque de segurança e a reposição, a 2ª com a demanda do período seguinte). As ordens planejadas são criadas uma por parcela, com a mesma PO.
+
 ## Fechamento de pedido por fornecedor
 - Na tela de Sugestões, cada fornecedor vira um pedido: itens de **carona** (pedido ideal nos próximos N dias) entram no mesmo embarque, a quantidade sobe até o **pedido mínimo** e o último **container** é completado.
 - O complemento é distribuído para igualar a cobertura (dias) dos itens, respeitando o múltiplo de compra e a cobertura máxima (padrão 180 dias). Quantidades digitadas ficam fixas.

@@ -119,7 +119,7 @@ const MRPCore = (function () {
     return {
       settings: {
         horizonte: 240, segurancaDias: 30, coberturaDias: 60, leadTimePadrao: 45, transitPadrao: 35,
-        desembaracoDias: 0, cbmContainer: 68, containers: { "20'": 28, "40'": 58 }, pesoMaxContainer: { "20'": 25000, "40'": 26500, '40HC': 26500 }, containerPadrao: '40HC', medidasUrl: '', estoqueSomarAcabados: true, fatoresPacote: { PBG: { '1': 8, '3': 22, '5': 36 }, PAG: { '1': 8, '3': 22, '5': 36 } }, coberturaMaxDias: 180, janelaCaronaDias: 60, incluirSimulacoes: true, dataBase: '',
+        desembaracoDias: 0, intervaloEntrega: 0, familias: {}, cbmContainer: 68, containers: { "20'": 28, "40'": 58 }, pesoMaxContainer: { "20'": 25000, "40'": 26500, '40HC': 26500 }, containerPadrao: '40HC', medidasUrl: '', estoqueSomarAcabados: true, fatoresPacote: { PBG: { '1': 8, '3': 22, '5': 36 }, PAG: { '1': 8, '3': 22, '5': 36 } }, coberturaMaxDias: 180, janelaCaronaDias: 60, incluirSimulacoes: true, dataBase: '',
         cambio: { USD: 5.40, CNY: 0.76, BRL: 1 }, cambioFonte: 'comercial', cambioMargem: 0, cambioInfo: null, workerUrl: ''
       },
       produtos: [],     // itens comprados (MP)
@@ -721,6 +721,7 @@ const MRPCore = (function () {
         const qMax = Math.max(q0, Math.floor(Math.max(0, covMax * dia - antes) / mult) * mult);
         lines.set(x.cod, { cod: x.cod, x, origem, fixo, qBase: q0, qExtra: 0, mult, dia, antes, qMax, dArr,
           cbmUn: x.cbmUn, kgUn: x.pesoUn || 0, valUn: x.custoBRL, dataChegada: addDays(today, dArr),
+          parcelas: (origem !== 'complemento' && x.prox && x.prox.parcelas && x.prox.parcelas.length > 1) ? x.prox.parcelas : null, qRef: x.prox ? x.prox.qtd : 0,
           dataPedido: usaProx ? x.prox.dataPedido : today });
       };
       xs.forEach(x => add(x, 'mrp', x.prox ? x.prox.qtd : 0));
@@ -811,15 +812,24 @@ const MRPCore = (function () {
     let s = 0; ps.forEach(({ pa, qtd }) => { s += paRate(idx.fcByPa.get(pa), ym) * qtd; });
     return s;
   }
+  // prioridade: item > família > fornecedor (só lead time/trânsito) > padrão das Configurações
   function itemParams(db, p) {
     const s = db.settings; const f = db.fornecedores.find(x => x.nome === p.fornecedor) || {};
-    const lt = num(p.leadTime ?? f.leadTime ?? s.leadTimePadrao) || num(s.leadTimePadrao);
-    const tt = num(p.transitTime ?? f.transitTime ?? s.transitPadrao) || num(s.transitPadrao);
+    const fam = (s.familias || {})[p.familia] || {};
+    const tem = v => v !== null && v !== undefined && v !== '' && !(typeof v === 'number' && isNaN(v));
+    const pick = (...c) => { for (const [v, o] of c) if (tem(v)) return [num(v), o]; return [0, 'padrão']; };
+    const [lt, oLt] = pick([p.leadTime, 'item'], [fam.leadTime, 'família'], [f.leadTime, 'fornecedor'], [s.leadTimePadrao, 'padrão']);
+    const [tt, oTt] = pick([p.transitTime, 'item'], [fam.transitTime, 'família'], [f.transitTime, 'fornecedor'], [s.transitPadrao, 'padrão']);
+    const [seg, oSeg] = pick([p.segurancaDias, 'item'], [fam.segurancaDias, 'família'], [s.segurancaDias, 'padrão']);
+    const [cob0, oCob] = pick([p.coberturaDias, 'item'], [fam.coberturaDias, 'família'], [s.coberturaDias, 'padrão']);
+    const [intv, oInt] = pick([p.intervaloEntrega, 'item'], [fam.intervaloEntrega, 'família'], [s.intervaloEntrega, 'padrão']);
+    const cob = cob0 || 30;
     return {
       leadTime: lt, transitTime: tt, desembaraco: num(s.desembaracoDias),
-      LT: lt + tt + num(s.desembaracoDias),
-      seg: num(p.segurancaDias ?? s.segurancaDias), cob: num(p.coberturaDias ?? s.coberturaDias) || 30,
-      mult: Math.max(1, num(p.multiplo) || 1)
+      LT: lt + tt + num(s.desembaracoDias), seg, cob,
+      intervalo: intv > 0 && intv < cob ? intv : 0,
+      mult: Math.max(1, num(p.multiplo) || 1),
+      origem: { leadTime: oLt, transitTime: oTt, segurancaDias: oSeg, coberturaDias: oCob, intervaloEntrega: oInt }
     };
   }
   function computeItem(db, idx, p, opts) {
@@ -877,8 +887,24 @@ const MRPCore = (function () {
       qtd = Math.max(qtd, prm.mult);
       qtd = Math.ceil(qtd / prm.mult) * prm.mult;
       let faltaAntes = 0; for (let d = 0; d < arrivalD; d++) faltaAntes += px.lost[d];
-      extra[arrivalD] += qtd;
-      plano.push({ dataPedido: addDays(today, Math.max(0, idealPedido)), dataPedidoIdeal: addDays(today, idealPedido), dataChegada: addDays(today, arrivalD), qtd, atrasado: idealPedido < 0, rupturaAntes: k === 0 && faltaAntes > 0, faltaAntes: k === 0 ? faltaAntes : 0 });
+      // entregas parceladas: o pedido cobre "cob" dias, mas chega em parcelas a cada "intervalo" dias
+      let parcelas = [{ dia: arrivalD, qtd }];
+      if (prm.intervalo) {
+        const resto = []; let soma = 0;
+        const nParc = Math.ceil(prm.cob / prm.intervalo);
+        for (let j = 1; j < nParc; j++) {
+          const d0 = arrivalD + j * prm.intervalo; if (d0 > H) break;
+          let dem = 0; for (let d = d0; d < Math.min(H + 1, d0 + prm.intervalo, arrivalD + prm.cob); d++) dem += rates[d];
+          const qj = Math.ceil(dem / prm.mult) * prm.mult; if (qj <= 0) continue;
+          resto.push({ dia: d0, qtd: qj }); soma += qj;
+        }
+        const q0 = Math.ceil(Math.max(prm.mult, qtd - soma) / prm.mult) * prm.mult;
+        parcelas = [{ dia: arrivalD, qtd: q0 }, ...resto];
+        qtd = parcelas.reduce((a, pc) => a + pc.qtd, 0);
+      }
+      parcelas.forEach(pc => { extra[pc.dia] += pc.qtd; });
+      plano.push({ dataPedido: addDays(today, Math.max(0, idealPedido)), dataPedidoIdeal: addDays(today, idealPedido), dataChegada: addDays(today, arrivalD), qtd, atrasado: idealPedido < 0, rupturaAntes: k === 0 && faltaAntes > 0, faltaAntes: k === 0 ? faltaAntes : 0,
+        parcelas: parcelas.map(pc => ({ dataChegada: addDays(today, pc.dia), qtd: pc.qtd, dia: pc.dia })) });
       from = arrivalD + 1;
     }
     const prox = plano[0] || null;
@@ -903,7 +929,7 @@ const MRPCore = (function () {
     const res = db.produtos.filter(p => p.ativo !== false).map(p => computeItem(db, idx, p, opts));
     return { opts, itens: res, byCod: new Map(res.map(r => [r.cod, r])) };
   }
-  return { aplicarFatoresPacote, parseEstoqueCorrente, aplicarEstoque, parseMedidasCSV, parseMedidasSheet, aplicarMedidas, pesoMaxContainer, fecharPedidos, capacidadeContainer, parseVendasCSV, parseVendasSheet, mergeVendas, sugerirVinculos, analisarVendas, serieSemanal, taxaPrevisao, valorOrdem, emptyDB, importWorkbook, importStock, computeAll, computeItem, buildDemandIndex, itemParams, addDays, diffDays, todayISO, serialToISO, num, str };
+  return { itemParams, aplicarFatoresPacote, parseEstoqueCorrente, aplicarEstoque, parseMedidasCSV, parseMedidasSheet, aplicarMedidas, pesoMaxContainer, fecharPedidos, capacidadeContainer, parseVendasCSV, parseVendasSheet, mergeVendas, sugerirVinculos, analisarVendas, serieSemanal, taxaPrevisao, valorOrdem, emptyDB, importWorkbook, importStock, computeAll, computeItem, buildDemandIndex, itemParams, addDays, diffDays, todayISO, serialToISO, num, str };
 })();
 
 
@@ -1171,7 +1197,7 @@ function openItem(cod) {
   const p = x.produto, t = R.opts.today, H = R.opts.horizonte;
   // semanas
   const weeks = [];
-  const planArr = new Array(H + 1).fill(0); x.plano.forEach(pl => { const d = C.diffDays(t, pl.dataChegada); if (d >= 0 && d <= H) planArr[d] += pl.qtd; });
+  const planArr = new Array(H + 1).fill(0); x.plano.forEach(pl => (pl.parcelas && pl.parcelas.length ? pl.parcelas : [{ dataChegada: pl.dataChegada, qtd: pl.qtd }]).forEach(pc => { const d = C.diffDays(t, pc.dataChegada); if (d >= 0 && d <= H) planArr[d] += pc.qtd; }));
   let sPlan = C.num(p.estoque);
   const SP = []; for (let d = 0; d <= H; d++) { sPlan = Math.max(0, sPlan + x.arr[d] + planArr[d] - x.rates[d]); SP.push(sPlan); }
   for (let w = 0; w * 7 <= H; w++) {
@@ -1191,14 +1217,16 @@ function openItem(cod) {
     <div>
       <div class="font-semibold mb-1">Parâmetros de compra</div>
       <div class="grid grid-cols-3 gap-2 text-xs">
-        ${[['leadTime', 'Lead time produção (d)', x.prm.leadTime], ['transitTime', 'Trânsito (d)', x.prm.transitTime], ['multiplo', 'Múltiplo de compra', x.prm.mult], ['segurancaDias', 'Estoque segurança (dias)', x.prm.seg], ['coberturaDias', 'Cobertura por pedido (dias)', x.prm.cob], ['estoque', 'Estoque atual', p.estoque]].map(([k, l, v]) => { const ro = k === 'estoque' && DB.estoqueSnap; return `<label class="block"><span class="text-slate-500">${l}</span><input type="number" step="any" class="w-full border rounded px-2 py-1 ${ro ? 'bg-slate-100' : ''}" value="${v ?? ''}" ${ro ? 'disabled title="Vem do relatório de estoque corrente"' : ''} onchange="setItemParam('${esc(cod)}','${k}',this.value)"></label>`; }).join('')}
+        ${[['leadTime', 'Lead time produção (d)', x.prm.leadTime], ['transitTime', 'Trânsito (d)', x.prm.transitTime], ['segurancaDias', 'Estoque segurança (dias)', x.prm.seg], ['coberturaDias', 'Cobertura por pedido (dias)', x.prm.cob], ['intervaloEntrega', 'Entregas a cada (dias)', x.prm.intervalo || '']].map(([k, l, v]) => { const o = x.prm.origem[k]; const proprio = p[k] !== null && p[k] !== undefined && p[k] !== ''; return `<label class="block"><span class="text-slate-500">${l}</span><input type="number" step="any" class="w-full border rounded px-2 py-1 ${proprio ? 'border-sky-400 font-semibold' : ''}" value="${proprio ? p[k] : ''}" placeholder="${v === '' ? 'única' : v} (${o})" onchange="setItemParam('${esc(cod)}','${k}',this.value)"><span class="text-[10px] ${proprio ? 'text-sky-700' : 'text-slate-400'}">${proprio ? 'definido no item' : 'vem de: ' + o}</span></label>`; }).join('')}
+        ${[['multiplo', 'Múltiplo de compra', x.prm.mult], ['estoque', 'Estoque atual', p.estoque]].map(([k, l, v]) => { const ro = k === 'estoque' && DB.estoqueSnap; return `<label class="block"><span class="text-slate-500">${l}</span><input type="number" step="any" class="w-full border rounded px-2 py-1 ${ro ? 'bg-slate-100' : ''}" value="${v ?? ''}" ${ro ? 'disabled title="Vem do relatório de estoque corrente"' : ''} onchange="setItemParam('${esc(cod)}','${k}',this.value)"></label>`; }).join('')}
       </div>
+      <div class="text-[11px] text-slate-400 mt-1">Campos em branco herdam da família (${esc(p.familia || '—')}), do fornecedor ou do padrão — ajuste em Configurações → Parâmetros por família. Digite um valor para fixar só neste item.</div>
       ${(p.cotacoes || []).length > 1 ? `<div class="text-[11px] text-slate-600 mt-2">Cotações: ${p.cotacoes.map(c => `<span class="${c.fornecedor === p.fornecedor ? 'font-semibold' : ''}">${esc(c.fornecedor)} ${c.moeda} ${nf2.format(c.custo)}</span>`).join(' · ')}</div>` : ''}
       ${DB.estoqueSnap ? `<div class="text-[11px] text-slate-600 mt-2">Estoque de ${fd(DB.estoqueSnap.data)}: próprio <b>${f0(p.estoqueProprio)}</b>${p.estoqueAcabados ? ` + matéria-prima/produtos acabados <b>${f0(p.estoqueAcabados)}</b> <span class="text-slate-400">(${esc((p.estoqueDet || []).join(' · '))})</span>` : ''}</div>` : ''}
-      <div class="text-[11px] text-slate-400 mt-1">Lead time total considerado: ${x.prm.LT} dias (produção + trânsito${x.prm.desembaraco ? ' + desembaraço' : ''}). Estoque de segurança ≈ ${f0(ssQ)} pç.</div>
+      <div class="text-[11px] text-slate-400 mt-1">Lead time total considerado: ${x.prm.LT} dias (produção + trânsito${x.prm.desembaraco ? ' + desembaraço' : ''}). Estoque de segurança ≈ ${f0(ssQ)} pç.${x.prm.intervalo ? ` Cada pedido cobre ${x.prm.cob} dias, entregue em parcelas a cada ${x.prm.intervalo} dias.` : ''}</div>
       <div class="font-semibold mt-4 mb-1">Plano de compras sugerido</div>
       <table class="w-full text-xs"><thead><tr class="text-left text-slate-500"><th>Pedir até</th><th>Chegada</th><th class="num">Qtd</th><th></th></tr></thead><tbody>
-      ${x.plano.map((pl, i) => `<tr class="border-t"><td class="py-1 ${pl.atrasado ? 'text-red-600 font-semibold' : ''}">${fd(pl.dataPedidoIdeal)}${pl.atrasado ? ' (atrasado)' : ''}</td><td>${fd(pl.dataChegada)}${pl.rupturaAntes ? ' <span class="text-red-500" title="há falta antes desta chegada">⚠</span>' : ''}</td><td class="num font-semibold">${f0(pl.qtd)}</td><td class="text-right">${i === 0 ? `<button class="text-sky-700 underline" onclick="criarPlanejada(['${esc(cod)}'])">criar ordem</button>` : ''}</td></tr>`).join('') || '<tr><td class="text-slate-400 py-1" colspan=4>Nenhuma compra necessária no horizonte</td></tr>'}
+      ${x.plano.map((pl, i) => `<tr class="border-t"><td class="py-1 ${pl.atrasado ? 'text-red-600 font-semibold' : ''}">${fd(pl.dataPedidoIdeal)}${pl.atrasado ? ' (atrasado)' : ''}</td><td>${fd(pl.dataChegada)}${pl.rupturaAntes ? ' <span class="text-red-500" title="há falta antes desta chegada">⚠</span>' : ''}</td><td class="num font-semibold">${f0(pl.qtd)}${pl.parcelas && pl.parcelas.length > 1 ? `<div class="font-normal text-[10px] text-slate-500">${pl.parcelas.map(pc => f0(pc.qtd) + ' em ' + fd(pc.dataChegada)).join(' · ')}</div>` : ''}</td><td class="text-right">${i === 0 ? `<button class="text-sky-700 underline" onclick="criarPlanejada(['${esc(cod)}'])">criar ordem</button>` : ''}</td></tr>`).join('') || '<tr><td class="text-slate-400 py-1" colspan=4>Nenhuma compra necessária no horizonte</td></tr>'}
       </tbody></table>
       ${x.prox?.faltaAntes >= 1 ? `<div class="mt-2 text-[11px] text-red-600">Mesmo comprando hoje, faltam ≈ ${f0(x.prox.faltaAntes)} pç até a chegada (venda perdida). Avalie embarque aéreo, antecipar uma PO em aberto ou substituto.</div>` : ''}
       <div class="font-semibold mt-4 mb-1">Ordens em aberto</div>
@@ -1282,7 +1310,7 @@ function pgSugestoes(el) {
       <td class="px-2 ${x.prox?.atrasado ? 'text-red-600 font-semibold' : ''}">${l.origem === 'mrp' && x.prox ? fd(x.prox.dataPedidoIdeal) : (x.prox ? `<span class="text-slate-400" title="pedido ideal">${fd(x.prox.dataPedidoIdeal)}</span>` : '–')}</td><td class="px-2">${fd(l.dataChegada)}</td>
       <td class="px-2 num">${l.origem === 'complemento' ? '–' : f0(l.fixo ? (x.prox?.qtd || 0) : l.qBase)}</td>
       <td class="px-2 num ${l.qExtra ? 'text-teal-700 font-semibold' : 'text-slate-300'}">${l.fixo ? '<span class="text-slate-500" title="quantidade digitada">manual</span>' : l.qExtra ? '+' + f0(l.qExtra) : '–'}</td>
-      <td class="px-2 num"><input type="number" class="cell-input font-semibold ${l.fixo ? 'bg-amber-50' : ''}" value="${l.qFinal}" onchange="ui.sugQtd['${esc(l.cod)}']=this.value===''?undefined:Number(this.value);render()"></td>
+      <td class="px-2 num"><input type="number" class="cell-input font-semibold ${l.fixo ? 'bg-amber-50' : ''}" value="${l.qFinal}" onchange="ui.sugQtd['${esc(l.cod)}']=this.value===''?undefined:Number(this.value);render()">${l.parcelas ? `<div class="text-[10px] text-slate-500 whitespace-nowrap" title="Entregas parceladas">${dividirParcelas(l).map(pc => f0(pc.qtd) + ' em ' + fd(pc.dataChegada)).join(' · ')}</div>` : ''}</td>
       <td class="px-2 num">${l.cobertura === null ? '–' : f0(l.cobertura) + 'd'}</td>
       <td class="px-2 num">${l.cbmUn ? f1(l.qFinal * l.cbmUn) : '<span class="text-amber-500" title="sem volume cadastrado">?</span>'}</td><td class="px-2 num">${l.kgUn ? f0(l.qFinal * l.kgUn) : '<span class="text-amber-500" title="sem peso cadastrado">?</span>'}</td><td class="px-2 num">${l.valUn ? brl.format(l.qFinal * l.valUn) : '–'}</td><td class="px-2">${badge(x.status)}</td></tr>`; }).join('')}
     </tbody></table></div></div>`;
@@ -1314,6 +1342,14 @@ function saveForn(nome) {
   f.pedidoMinimo = n('pedidoMinimo') || 0; f.moedaMinimo = g('moedaMinimo').value; f.janelaCarona = n('janelaCarona');
   closeModal(); changed('fornecedores'); toast('Fornecedor atualizado');
 }
+// distribui a quantidade final entre as parcelas, na proporção do plano do MRP
+function dividirParcelas(l) {
+  const P = l.parcelas; if (!P || P.length < 2) return [{ dataChegada: l.dataChegada, qtd: l.qFinal, dia: null }];
+  const ref = P.reduce((a, pc) => a + pc.qtd, 0) || 1, mult = l.mult || 1;
+  const out = P.map(pc => ({ ...pc, qtd: Math.floor((l.qFinal * pc.qtd / ref) / mult) * mult }));
+  out[0].qtd += l.qFinal - out.reduce((a, pc) => a + pc.qtd, 0);
+  return out.filter(pc => pc.qtd > 0);
+}
 function criarPlanejada(cods) {
   if (!cods.length) { toast('Selecione ao menos um item'); return; }
   const t = R.opts.today; let n = 0; const L = window._sugLines || new Map();
@@ -1324,7 +1360,13 @@ function criarPlanejada(cods) {
     if (!qtd) return;
     const dp0 = l ? l.dataPedido : (x.prox?.dataPedido || t); const dp = dp0 < t ? t : dp0;
     const orig = l?.origem === 'carona' ? ' (carona)' : l?.origem === 'complemento' ? ' (complemento de container/pedido mínimo)' : '';
-    DB.ordens.push({ id: uid('po'), po: 'PLAN-' + t.replace(/-/g, '').slice(2), fornecedor: x.produto.fornecedor, item: cod, qtd, dataPedido: dp, leadTime: x.prm.leadTime, dataEmbarque: C.addDays(dp, x.prm.leadTime), transitTime: x.prm.transitTime, dataChegada: C.addDays(dp, x.prm.LT), qtdRecebida: 0, status: 'Planejada', custoUnit: C.num(x.produto.custo), moeda: x.produto.moeda, cambioPago: null, responsavel: user?.email || '', obs: 'Gerada pela sugestão do MRP' + orig });
+    const parts = l ? dividirParcelas({ ...l, qFinal: qtd }) : (x.prox?.parcelas?.length > 1 ? dividirParcelas({ parcelas: x.prox.parcelas, qFinal: qtd, mult: x.prm.mult, dataChegada: x.prox.dataChegada }) : [{ qtd, dia: null }]);
+    const d0 = parts[0].dia;
+    parts.forEach((pc, j) => {
+      const desloc = pc.dia !== null && pc.dia !== undefined && d0 !== null && d0 !== undefined ? pc.dia - d0 : 0;
+      const cheg = C.addDays(dp, x.prm.LT + desloc);
+      DB.ordens.push({ id: uid('po'), po: 'PLAN-' + t.replace(/-/g, '').slice(2), fornecedor: x.produto.fornecedor, item: cod, qtd: pc.qtd, dataPedido: dp, leadTime: x.prm.leadTime + desloc, dataEmbarque: C.addDays(cheg, -(x.prm.transitTime + x.prm.desembaraco)), transitTime: x.prm.transitTime, dataChegada: cheg, qtdRecebida: 0, status: 'Planejada', custoUnit: C.num(x.produto.custo), moeda: x.produto.moeda, cambioPago: null, responsavel: user?.email || '', obs: 'Gerada pela sugestão do MRP' + orig + (parts.length > 1 ? ` — entrega ${j + 1}/${parts.length}` : '') });
+    });
     delete (ui.sugQtd || {})[cod]; n++;
   });
   closeModal(); changed('ordens'); toast(`${n} ordem(ns) planejada(s) criada(s). Veja em Ordens de compra.`);
@@ -1514,9 +1556,9 @@ function pgCadastros(el) {
   el.innerHTML = `<div class="flex gap-4 border-b mb-4">${[['itens', 'Itens comprados'], ['estrutura', 'Estrutura (produto → componentes)'], ['fornecedores', 'Fornecedores']].map(([k, l]) => `<button class="tab border-b-2 border-transparent px-1 pb-2 font-semibold ${tab === k ? 'active' : 'text-slate-500'}" onclick="ui.cadTab='${k}';render()">${l}</button>`).join('')}</div><div id="cadBody"></div>`;
   const b = document.getElementById('cadBody');
   if (tab === 'itens') {
-    b.innerHTML = `<div class="flex mb-2"><span class="text-xs text-slate-500">${DB.produtos.length} itens. Campos em branco usam o padrão do fornecedor ou das Configurações.</span><button onclick="editProd()" class="ml-auto rounded-lg px-3 py-1.5 bg-sky-600 text-white">+ Novo item</button></div>
-    <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 230px)"><table class="w-full tbl text-xs"><thead><tr class="text-left">${['Código', 'Descrição', 'Família', 'Fornecedor', 'Custo', 'Moeda', 'Múltiplo', 'm³/un', 'kg/un', 'Medida de', 'LT prod.', 'Trânsito', 'Seg. (d)', 'Cobert. (d)', 'Ativo', ''].map(h => `<th class="px-2 py-2">${h}</th>`).join('')}</tr></thead><tbody>
-    ${DB.produtos.map(p => `<tr class="border-t hover:bg-slate-50 ${p.ativo === false ? 'opacity-50' : ''}"><td class="px-2 py-1 font-medium">${esc(p.cod)}</td><td class="px-2 truncate max-w-[280px]" title="${esc(p.desc)}">${esc(p.desc)}</td><td class="px-2">${esc(p.familia)}</td><td class="px-2">${esc(p.fornecedor)}</td><td class="px-2 num">${p.custo ? nf2.format(p.custo) : '–'}</td><td class="px-2">${esc(p.moeda)}</td><td class="px-2 num">${f0(p.multiplo)}</td>${(() => { const m3 = C.num(p.m3Un) || ((C.num(p.cbmCx) && C.num(p.pcsCx)) ? C.num(p.cbmCx) / C.num(p.pcsCx) : C.num(p.pcsContainer) ? (C.num(DB.settings.cbmContainer) || 68) / C.num(p.pcsContainer) : 0); return `<td class="px-2 num">${m3 ? (m3 < 0.01 ? m3.toFixed(5) : m3.toFixed(4)).replace('.', ',') : '<span class="text-amber-500">–</span>'}</td><td class="px-2 num">${p.pesoUn ? nf2.format(p.pesoUn) : '<span class="text-amber-500">–</span>'}</td><td class="px-2 text-slate-400">${esc(p.medidaFonte || (p.cbmCx ? 'caixa' : p.pcsContainer ? 'pç/container' : ''))}</td>`; })()}<td class="px-2 num">${p.leadTime ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2 num">${p.transitTime ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2 num">${p.segurancaDias ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2 num">${p.coberturaDias ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2">${p.ativo === false ? 'não' : 'sim'}</td><td class="px-2"><button class="text-sky-700 hover:underline" onclick="editProd('${esc(p.cod)}')">editar</button></td></tr>`).join('')}
+    b.innerHTML = `<div class="flex mb-2"><span class="text-xs text-slate-500">${DB.produtos.length} itens. Campos em branco herdam da família, do fornecedor ou do padrão (Configurações). Valores em cinza mostram o que está valendo.</span><button onclick="editProd()" class="ml-auto rounded-lg px-3 py-1.5 bg-sky-600 text-white">+ Novo item</button></div>
+    <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 230px)"><table class="w-full tbl text-xs"><thead><tr class="text-left">${['Código', 'Descrição', 'Família', 'Fornecedor', 'Custo', 'Moeda', 'Múltiplo', 'm³/un', 'kg/un', 'Medida de', 'LT prod.', 'Trânsito', 'Seg. (d)', 'Cobert. (d)', 'Entregas a cada', 'Ativo', ''].map(h => `<th class="px-2 py-2">${h}</th>`).join('')}</tr></thead><tbody>
+    ${DB.produtos.map(p => `<tr class="border-t hover:bg-slate-50 ${p.ativo === false ? 'opacity-50' : ''}"><td class="px-2 py-1 font-medium">${esc(p.cod)}</td><td class="px-2 truncate max-w-[280px]" title="${esc(p.desc)}">${esc(p.desc)}</td><td class="px-2">${esc(p.familia)}</td><td class="px-2">${esc(p.fornecedor)}</td><td class="px-2 num">${p.custo ? nf2.format(p.custo) : '–'}</td><td class="px-2">${esc(p.moeda)}</td><td class="px-2 num">${f0(p.multiplo)}</td>${(() => { const m3 = C.num(p.m3Un) || ((C.num(p.cbmCx) && C.num(p.pcsCx)) ? C.num(p.cbmCx) / C.num(p.pcsCx) : C.num(p.pcsContainer) ? (C.num(DB.settings.cbmContainer) || 68) / C.num(p.pcsContainer) : 0); return `<td class="px-2 num">${m3 ? (m3 < 0.01 ? m3.toFixed(5) : m3.toFixed(4)).replace('.', ',') : '<span class="text-amber-500">–</span>'}</td><td class="px-2 num">${p.pesoUn ? nf2.format(p.pesoUn) : '<span class="text-amber-500">–</span>'}</td><td class="px-2 text-slate-400">${esc(p.medidaFonte || (p.cbmCx ? 'caixa' : p.pcsContainer ? 'pç/container' : ''))}</td>`; })()}${(() => { const pr = C.itemParams(DB, p); const c = (k, v) => p[k] !== null && p[k] !== undefined && p[k] !== '' ? `<td class="px-2 num font-semibold">${p[k]}</td>` : `<td class="px-2 num text-slate-400" title="vem de: ${pr.origem[k]}">${v || (k === 'intervaloEntrega' ? '–' : 0)}</td>`; return c('leadTime', pr.leadTime) + c('transitTime', pr.transitTime) + c('segurancaDias', pr.seg) + c('coberturaDias', pr.cob) + c('intervaloEntrega', pr.intervalo); })()}<td class="px-2">${p.ativo === false ? 'não' : 'sim'}</td><td class="px-2"><button class="text-sky-700 hover:underline" onclick="editProd('${esc(p.cod)}')">editar</button></td></tr>`).join('')}
     </tbody></table></div>`;
   } else if (tab === 'estrutura') {
     const q = (ui.estQ || '').toLowerCase();
@@ -1545,13 +1587,13 @@ function pgCadastros(el) {
 }
 function addEst() { const pa = document.getElementById('ne_pa').value.trim(), mp = document.getElementById('ne_mp').value.trim(), q = Number(document.getElementById('ne_q').value) || 1; if (!pa || !mp) { toast('Informe produto e componente'); return; } DB.estrutura.push({ pa, mp, qtd: q }); changed('estrutura'); }
 function addForn() { const n = prompt('Nome do fornecedor:'); if (!n) return; const nome = n.trim().toUpperCase(); if (DB.fornecedores.some(f => f.nome === nome)) { toast('Já existe'); return; } DB.fornecedores.push({ nome, leadTime: null, transitTime: null, contato: '', linha: '' }); DB.fornecedores.sort((a, b) => a.nome.localeCompare(b.nome)); changed('fornecedores'); }
-const PROD_F = [['cod', 'Código'], ['desc', 'Descrição'], ['familia', 'Família'], ['fornecedor', 'Fornecedor'], ['custo', 'Custo unitário', 'number'], ['moeda', 'Moeda'], ['multiplo', 'Múltiplo de compra', 'number'], ['pcsCx', 'Peças por caixa/pallet', 'number'], ['m3Un', 'm³ por unidade', 'number'], ['pesoUn', 'Peso por unidade (kg)', 'number'], ['cbmCx', 'm³ por caixa/pallet', 'number'], ['pcsContainer', 'Peças por container 40HC (se não tiver m³)', 'number'], ['leadTime', 'Lead time produção (d)', 'number'], ['transitTime', 'Trânsito (d)', 'number'], ['segurancaDias', 'Estoque segurança (dias)', 'number'], ['coberturaDias', 'Cobertura por pedido (dias)', 'number'], ['estoque', 'Estoque atual', 'number']];
+const PROD_F = [['cod', 'Código'], ['desc', 'Descrição'], ['familia', 'Família'], ['fornecedor', 'Fornecedor'], ['custo', 'Custo unitário', 'number'], ['moeda', 'Moeda'], ['multiplo', 'Múltiplo de compra', 'number'], ['pcsCx', 'Peças por caixa/pallet', 'number'], ['m3Un', 'm³ por unidade', 'number'], ['pesoUn', 'Peso por unidade (kg)', 'number'], ['cbmCx', 'm³ por caixa/pallet', 'number'], ['pcsContainer', 'Peças por container 40HC (se não tiver m³)', 'number'], ['leadTime', 'Lead time produção (d)', 'number'], ['transitTime', 'Trânsito (d)', 'number'], ['segurancaDias', 'Estoque segurança (dias)', 'number'], ['coberturaDias', 'Cobertura por pedido (dias)', 'number'], ['intervaloEntrega', 'Entregas a cada (dias)', 'number'], ['estoque', 'Estoque atual', 'number']];
 function editProd(cod) {
   const p = cod ? prodByCod(cod) : { moeda: 'USD', multiplo: 1, ativo: true };
   openModal(cod ? 'Editar item ' + esc(cod) : 'Novo item', `<datalist id="dlForn2">${DB.fornecedores.map(f => `<option value="${esc(f.nome)}">`).join('')}</datalist><div class="grid grid-cols-2 md:grid-cols-3 gap-3">
   ${PROD_F.map(([k, l, ty]) => `<label class="block ${k === 'desc' ? 'md:col-span-2' : ''}"><span class="text-xs text-slate-500">${l}</span><input id="pf_${k}" type="${ty || 'text'}" step="any" value="${esc(p[k] ?? '')}" ${k === 'cod' && cod ? 'disabled' : ''} ${k === 'fornecedor' ? 'list="dlForn2"' : ''} class="w-full border rounded px-2 py-1.5 disabled:bg-slate-100"></label>`).join('')}
   <label class="flex items-center gap-2 mt-5"><input id="pf_ativo" type="checkbox" ${p.ativo !== false ? 'checked' : ''}> Ativo (entra no MRP)</label></div>
-  <div class="text-[11px] text-slate-500 mt-2">Deixe lead time, trânsito, segurança e cobertura em branco para usar o padrão.</div>
+  <div class="text-[11px] text-slate-500 mt-2">Deixe lead time, trânsito, segurança, cobertura e entregas em branco para herdar da família / fornecedor / padrão.</div>
   <div class="flex gap-2 mt-4">${cod ? `<button onclick="if(confirm('Excluir item?')){DB.produtos=DB.produtos.filter(x=>x.cod!=='${esc(cod)}');closeModal();changed('produtos')}" class="text-red-600 border border-red-200 rounded-lg px-3 py-1.5">Excluir</button>` : ''}<button onclick="closeModal()" class="ml-auto border rounded-lg px-3 py-1.5">Cancelar</button><button onclick="saveProd('${esc(cod || '')}')" class="bg-sky-600 text-white rounded-lg px-4 py-1.5">Salvar</button></div>`, 'max-w-3xl');
 }
 function saveProd(cod) {
@@ -1654,7 +1696,7 @@ function exportMRP() {
 function exportSug() {
   const G = C.fecharPedidos(DB, R, sugRows(), { ativo: ui.sugFiltro.fechar !== false, overrides: ui.sugQtd || {} });
   const ORIG = { mrp: 'MRP', carona: 'Carona', complemento: 'Complemento' };
-  const rows = []; G.forEach(g => g.linhas.forEach(l => { const x = l.x; rows.push({ Fornecedor: g.fornecedor, Item: l.cod, Descrição: x.produto.desc, Origem: ORIG[l.origem], Estoque: C.num(x.produto.estoque), 'Demanda/dia': Math.round(x.avg30 * 100) / 100, Ruptura: x.ruptura || '', 'Pedir até': x.prox?.dataPedidoIdeal || '', 'Chegada prevista': l.dataChegada, 'Qtd MRP': l.origem === 'complemento' ? 0 : l.qBase, Ajuste: l.qExtra, 'Qtd final': l.qFinal, 'Cobertura (dias)': l.cobertura === null ? '' : Math.round(l.cobertura), 'm³': Math.round(l.qFinal * (l.cbmUn || 0) * 100) / 100, 'kg': Math.round(l.qFinal * (l.kgUn || 0)), 'Custo unit.': C.num(x.produto.custo), Moeda: x.produto.moeda, 'Valor R$': Math.round(l.qFinal * l.valUn), Situação: STATUS_LBL[x.status] }); }));
+  const rows = []; G.forEach(g => g.linhas.forEach(l => { const x = l.x; rows.push({ Fornecedor: g.fornecedor, Item: l.cod, Descrição: x.produto.desc, Origem: ORIG[l.origem], Estoque: C.num(x.produto.estoque), 'Demanda/dia': Math.round(x.avg30 * 100) / 100, Ruptura: x.ruptura || '', 'Pedir até': x.prox?.dataPedidoIdeal || '', 'Chegada prevista': l.dataChegada, 'Qtd MRP': l.origem === 'complemento' ? 0 : l.qBase, Ajuste: l.qExtra, 'Qtd final': l.qFinal, Entregas: l.parcelas ? dividirParcelas(l).map(pc => pc.qtd + ' em ' + fd(pc.dataChegada)).join(' | ') : '', 'Cobertura (dias)': l.cobertura === null ? '' : Math.round(l.cobertura), 'm³': Math.round(l.qFinal * (l.cbmUn || 0) * 100) / 100, 'kg': Math.round(l.qFinal * (l.kgUn || 0)), 'Custo unit.': C.num(x.produto.custo), Moeda: x.produto.moeda, 'Valor R$': Math.round(l.qFinal * l.valUn), Situação: STATUS_LBL[x.status] }); }));
   const res = G.map(g => ({ Fornecedor: g.fornecedor, Container: g.tipo, 'm³': Math.round(g.cbm * 100) / 100, kg: Math.round(g.kg || 0), Containers: g.containers || '', 'Ocupação %': g.ocupacao ? Math.round(g.ocupacao * 100) : '', 'Limitado por': g.limitadoPor || '', 'Pedido mínimo': g.moq ? g.moqMoeda + ' ' + g.moq : '', 'Mínimo atingido': g.moq ? (g.moqAtingido ? 'sim' : 'não') : '', 'Valor R$': Math.round(g.valor), 'Itens sem m³': g.semCbm.join(', ') }));
   xlsxDownload(`Sugestoes_compra_${R.opts.today}.xlsx`, [['Resumo por fornecedor', res], ['Itens', rows]]);
 }
@@ -1878,6 +1920,7 @@ function pgConfig(el) {
     ${f('leadTimePadrao', 'Lead time de produção padrão (dias)')}
     ${f('transitPadrao', 'Trânsito padrão (dias)')}
     ${f('desembaracoDias', 'Desembaraço + entrega (dias)', 'number', 'Somado ao lead time total')}
+    ${f('intervaloEntrega', 'Entregas a cada (dias)', 'number', '0 = pedido chega de uma vez. Ex.: cobertura 30 e entregas a cada 15 = 2 parcelas')}
     ${f('cbmContainer', "m³ úteis — 40HC", 'number', '40HC ≈ 68 m³ aproveitáveis')}
     <label class="block"><span class="text-xs text-slate-600 font-semibold">m³ úteis — 20'</span><input id="cf_c20" type="number" step="any" value="${s.containers?.["20'"] ?? 28}" class="w-full border rounded px-2 py-1.5"></label>
     <label class="block"><span class="text-xs text-slate-600 font-semibold">m³ úteis — 40'</span><input id="cf_c40" type="number" step="any" value="${s.containers?.["40'"] ?? 58}" class="w-full border rounded px-2 py-1.5"></label>
@@ -1888,6 +1931,12 @@ function pgConfig(el) {
     ${f('dataBase', 'Data-base simulada', 'date', 'Deixe em branco para usar a data de hoje')}
     <label class="flex items-center gap-2 mt-5 text-xs"><input id="cf_incluirSimulacoes" type="checkbox" ${s.incluirSimulacoes ? 'checked' : ''}> Considerar ordens em "Simulação" no cálculo</label>
   </div>
+  <div class="font-bold mt-6 mb-1">Parâmetros por família</div>
+  <div class="text-[11px] text-slate-500 mb-2">Em branco = usa o padrão acima (ou o do fornecedor, no caso de lead time e trânsito). Prioridade: item &gt; família &gt; fornecedor &gt; padrão.</div>
+  <div class="scroll-x"><table class="text-xs w-full"><thead><tr class="text-left text-slate-500"><th class="py-1 pr-2">Família</th><th class="px-1">Itens</th><th class="px-1">Estoque segurança (d)</th><th class="px-1">Cobertura por pedido (d)</th><th class="px-1">Entregas a cada (d)</th><th class="px-1">Lead time produção (d)</th><th class="px-1">Trânsito (d)</th></tr></thead><tbody>
+  ${uniq(DB.produtos.map(p => p.familia)).map(fam => { const v = (s.familias || {})[fam] || {}; const inp = (k, ph) => `<input type="number" step="any" class="border rounded px-1 py-0.5 w-20 cf-fam" data-f="${esc(fam)}" data-k="${k}" value="${v[k] ?? ''}" placeholder="${ph}">`;
+    return `<tr class="border-t"><td class="py-1 pr-2 font-semibold">${esc(fam)}</td><td class="px-1 text-slate-500">${DB.produtos.filter(p => p.familia === fam).length}</td><td class="px-1">${inp('segurancaDias', s.segurancaDias)}</td><td class="px-1">${inp('coberturaDias', s.coberturaDias)}</td><td class="px-1">${inp('intervaloEntrega', s.intervaloEntrega || 'única')}</td><td class="px-1">${inp('leadTime', 'forn./' + s.leadTimePadrao)}</td><td class="px-1">${inp('transitTime', 'forn./' + s.transitPadrao)}</td></tr>`; }).join('')}
+  </tbody></table></div>
   <div class="font-bold mt-6 mb-1">Lâminas por pacote (pisos)</div>
   <div class="text-[11px] text-slate-500 mb-2">Quantas lâminas do componente (PPBG…, PPAG…) vão em cada pacote vendido (PBG…-1, -3, -5). Aplicado automaticamente na estrutura, no estoque de produtos acabados, nas vendas e no peso/m³ por lâmina. Deixe em branco para não alterar.</div>
   ${(() => { const F = s.fatoresPacote || {}; const pres = {}; DB.estrutura.forEach(e => { const k = e.pa.match(/^([A-Z]+)(\d+)-(\d+)$/); if (k && e.mp === 'P' + k[1] + k[2]) (pres[k[1]] = pres[k[1]] || new Set()).add(k[3]); }); Object.entries(F).forEach(([p, o]) => Object.keys(o).forEach(x => (pres[p] = pres[p] || new Set()).add(x)));
@@ -1915,7 +1964,8 @@ function pgConfig(el) {
 }
 function saveConfig() {
   const s = DB.settings, g = k => document.getElementById('cf_' + k);
-  ['horizonte', 'segurancaDias', 'coberturaDias', 'leadTimePadrao', 'transitPadrao', 'desembaracoDias', 'cbmContainer', 'coberturaMaxDias', 'janelaCaronaDias'].forEach(k => s[k] = Number(g(k).value) || 0);
+  ['horizonte', 'segurancaDias', 'coberturaDias', 'leadTimePadrao', 'transitPadrao', 'desembaracoDias', 'intervaloEntrega', 'cbmContainer', 'coberturaMaxDias', 'janelaCaronaDias'].forEach(k => s[k] = Number(g(k).value) || 0);
+  const fams = {}; document.querySelectorAll('.cf-fam').forEach(i => { if (i.value !== '') (fams[i.dataset.f] = fams[i.dataset.f] || {})[i.dataset.k] = Number(i.value); }); s.familias = fams;
   s.containers = { "20'": Number(g('c20').value) || 28, "40'": Number(g('c40').value) || 58 }; s.containerPadrao = g('containerPadrao').value;
   s.pesoMaxContainer = { "20'": Number(g('kg0').value) || 25000, "40'": Number(g('kg1').value) || 26500, '40HC': Number(g('kg2').value) || 26500 };
   if (!s.coberturaMaxDias) s.coberturaMaxDias = 180;
