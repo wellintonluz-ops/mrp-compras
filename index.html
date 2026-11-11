@@ -119,7 +119,7 @@ const MRPCore = (function () {
     return {
       settings: {
         horizonte: 240, segurancaDias: 30, coberturaDias: 60, leadTimePadrao: 45, transitPadrao: 35,
-        desembaracoDias: 0, cbmContainer: 68, containers: { "20'": 28, "40'": 58 }, containerPadrao: '40HC', coberturaMaxDias: 180, janelaCaronaDias: 60, incluirSimulacoes: true, dataBase: '',
+        desembaracoDias: 0, cbmContainer: 68, containers: { "20'": 28, "40'": 58 }, pesoMaxContainer: { "20'": 25000, "40'": 26500, '40HC': 26500 }, containerPadrao: '40HC', medidasUrl: '', coberturaMaxDias: 180, janelaCaronaDias: 60, incluirSimulacoes: true, dataBase: '',
         cambio: { USD: 5.40, CNY: 0.76, BRL: 1 }, cambioFonte: 'comercial', cambioMargem: 0, cambioInfo: null, workerUrl: ''
       },
       produtos: [],     // itens comprados (MP)
@@ -568,6 +568,44 @@ const MRPCore = (function () {
   }
 
 
+
+  // ---------- medidas e pesos (tabela de dimensões dos produtos) ----------
+  const dec = v => { if (typeof v === 'number') return v; let t = str(v).replace(/\s/g, ''); if (!t) return 0; if (t.includes(',')) t = t.replace(/\./g, '').replace(',', '.'); const x = parseFloat(t); return isFinite(x) ? x : 0; };
+  function parseMedidas(rowsProvider) {
+    let H = null; const out = {};
+    rowsProvider(row => {
+      const hs = row.map(normH);
+      const iPeso = hs.findIndex(h => h.startsWith('peso')), iCub = hs.findIndex(h => h.startsWith('cubagem') || h === 'm3' || h === 'volume');
+      if (iPeso >= 0 || iCub >= 0) { H = { peso: iPeso, cub: iCub, l: hs.findIndex(h => h.startsWith('largura')), a: hs.findIndex(h => h.startsWith('altura')), c: hs.findIndex(h => h.startsWith('comprimento')) }; return; }
+      if (!H) return;
+      const cod = str(row[0]).toUpperCase(); if (!cod || !/\d/.test(cod)) return;
+      const peso = H.peso >= 0 ? dec(row[H.peso]) : 0;
+      let m3 = H.cub >= 0 ? dec(row[H.cub]) : 0;
+      if (!m3 && H.l >= 0 && H.a >= 0 && H.c >= 0) m3 = dec(row[H.l]) * dec(row[H.a]) * dec(row[H.c]);
+      if (peso || m3) out[cod] = { peso, m3 };
+    });
+    if (!Object.keys(out).length) throw new Error('Não encontrei medidas (colunas Peso e Cubagem/Largura/Altura/Comprimento).');
+    return out;
+  }
+  function parseMedidasCSV(text) { return parseMedidas(cb => eachCSVRow(text, cb)); }
+  function parseMedidasSheet(XLSX, wb) { const rows = []; wb.SheetNames.forEach(n => rows.push(...XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: true, defval: '' }))); return parseMedidas(cb => rows.forEach(cb)); }
+  // aplica no cadastro: código igual, ou via estrutura (produto vendido → componente principal, dividido pela qtd)
+  function aplicarMedidas(db, M) {
+    const base = c => c.replace(/[-_].*$/, '');
+    const res = { diretos: [], viaEstrutura: [], semMedida: [] };
+    db.produtos.forEach(p => {
+      if (M[p.cod]) { p.m3Un = M[p.cod].m3; p.pesoUn = M[p.cod].peso; p.medidaFonte = p.cod; res.diretos.push(p.cod); return; }
+      const cands = db.estrutura.filter(e => e.mp === p.cod && M[e.pa] && num(e.qtd) > 0 && p.cod.includes(base(e.pa)));
+      if (cands.length) {
+        const e = cands.sort((a, b) => num(b.qtd) - num(a.qtd))[0];
+        p.m3Un = M[e.pa].m3 / num(e.qtd); p.pesoUn = M[e.pa].peso / num(e.qtd); p.medidaFonte = `${e.pa} ÷ ${num(e.qtd)}`;
+        res.viaEstrutura.push(`${p.cod} ← ${e.pa}${num(e.qtd) !== 1 ? ' ÷ ' + num(e.qtd) : ''}`); return;
+      }
+      if (p.ativo !== false) res.semMedida.push(p.cod);
+    });
+    return res;
+  }
+
   // ---------- fechamento de pedido por fornecedor ----------
   // base: itens do MRP com sugestão (R.itens com prox). Retorna um bloco por fornecedor com
   // carona (itens do mesmo fornecedor a pedir em breve), pedido mínimo e complemento de container.
@@ -576,6 +614,7 @@ const MRPCore = (function () {
     if (tipo === '40HC') return num(s.cbmContainer) || 68;
     return num((s.containers || {})[tipo]) || (tipo === "20'" ? 28 : 58);
   }
+  function pesoMaxContainer(db, tipo) { if (tipo === 'LCL') return 0; const m = db.settings.pesoMaxContainer || {}; return num(m[tipo]) || (tipo === "20'" ? 25000 : 26500); }
   function fecharPedidos(db, R, base, o = {}) {
     const s = db.settings, today = R.opts.today, H = R.opts.horizonte;
     const covMax = num(s.coberturaMaxDias) || 180;
@@ -586,7 +625,7 @@ const MRPCore = (function () {
     grupos.forEach((xs, forn) => {
       const F = db.fornecedores.find(z => z.nome === forn) || {};
       const tipo = F.container || s.containerPadrao || '40HC';
-      const cap = capacidadeContainer(db, tipo);
+      const cap = capacidadeContainer(db, tipo), capKg = pesoMaxContainer(db, tipo);
       const completar = ativo && F.completarContainer !== false && cap > 0;
       const janela = num(F.janelaCarona ?? s.janelaCaronaDias ?? 60);
       const moq = num(F.pedidoMinimo), moqMoeda = F.moedaMinimo || 'USD';
@@ -602,7 +641,7 @@ const MRPCore = (function () {
         const q0 = fixo ? num(ov[x.cod]) : qBase;
         const qMax = Math.max(q0, Math.floor(Math.max(0, covMax * dia - antes) / mult) * mult);
         lines.set(x.cod, { cod: x.cod, x, origem, fixo, qBase: q0, qExtra: 0, mult, dia, antes, qMax, dArr,
-          cbmUn: x.cbmUn, valUn: x.custoBRL, dataChegada: addDays(today, dArr),
+          cbmUn: x.cbmUn, kgUn: x.pesoUn || 0, valUn: x.custoBRL, dataChegada: addDays(today, dArr),
           dataPedido: usaProx ? x.prox.dataPedido : today });
       };
       xs.forEach(x => add(x, 'mrp', x.prox ? x.prox.qtd : 0));
@@ -621,20 +660,23 @@ const MRPCore = (function () {
       const cob = l => l.dia > 0 ? (l.antes + q(l)) / l.dia : Infinity;
       const tot = f => L.reduce((a, l) => a + q(l) * f(l), 0);
       // adiciona quantidade igualando a cobertura (dias) entre os itens, respeitando múltiplo e cobertura máxima
-      const encher = (unit, gap, permiteUltrapassar) => {
+      // gap2/unit2: segundo limite que não pode ser ultrapassado (peso quando enche por m³)
+      const encher = (unit, gap, permiteUltrapassar, unit2, gap2) => {
         let guard = 0;
+        const cabe2 = (l, st) => !unit2 || st * unit2(l) <= gap2 + 1e-9;
         while (gap > 1e-9 && guard++ < 20000) {
           let best = null, bestStep = 0;
           for (const l of L) {
             if (l.fixo || l.dia <= 0 || !(unit(l) > 0)) continue;
             let step = l.mult * Math.max(1, Math.ceil(Math.max(1, l.dia) / l.mult));
-            if (q(l) + step > l.qMax) step = l.mult;
+            if (q(l) + step > l.qMax || (!permiteUltrapassar && step * unit(l) > gap + 1e-9) || !cabe2(l, step)) step = l.mult;
             if (q(l) + step > l.qMax) continue;
-            if (!permiteUltrapassar && step * unit(l) > gap + 1e-9) { step = l.mult; if (step * unit(l) > gap + 1e-9) continue; }
+            if (!permiteUltrapassar && step * unit(l) > gap + 1e-9) continue;
+            if (!cabe2(l, step)) continue;
             if (!best || cob(l) < cob(best)) { best = l; bestStep = step; }
           }
           if (!best) break;
-          best.qExtra += bestStep; gap -= bestStep * unit(best);
+          best.qExtra += bestStep; gap -= bestStep * unit(best); if (unit2) gap2 -= bestStep * unit2(best);
         }
         return gap;
       };
@@ -648,16 +690,24 @@ const MRPCore = (function () {
       }
       r.moqAtingido = !(moq > 0) || tot(l => l.valUn) >= moq * taxaMoq - 1;
       // 2) completar container (em m³)
-      r.cbmAntes = tot(l => l.cbmUn || 0);
-      if (cap > 0 && r.cbmAntes > 0) {
-        r.containers = Math.max(1, Math.ceil(r.cbmAntes / cap - 1e-6));
-        r.ocupacaoAntes = r.cbmAntes / (r.containers * cap);
-        if (completar) r.sobra = encher(l => l.cbmUn || 0, r.containers * cap - r.cbmAntes, false);
+      // 2) containers: o que limitar primeiro, volume (m³) ou peso (kg)
+      const nCont = (m3, kg) => Math.max(1, Math.ceil(m3 / cap - 1e-6), capKg > 0 ? Math.ceil(kg / capKg - 1e-6) : 0);
+      r.cbmAntes = tot(l => l.cbmUn || 0); r.kgAntes = tot(l => l.kgUn || 0);
+      if (cap > 0 && (r.cbmAntes > 0 || r.kgAntes > 0)) {
+        r.containers = nCont(r.cbmAntes, r.kgAntes);
+        r.ocupacaoAntes = Math.max(r.cbmAntes / (r.containers * cap), capKg ? r.kgAntes / (r.containers * capKg) : 0);
+        if (completar) encher(l => l.cbmUn || 0, r.containers * cap - r.cbmAntes, false, capKg ? (l => l.kgUn || 0) : null, r.containers * capKg - r.kgAntes);
       }
-      r.cbm = tot(l => l.cbmUn || 0);
-      if (cap > 0 && r.cbm > 0) { r.containers = Math.max(1, Math.ceil(r.cbm / cap - 1e-6)); r.ocupacao = r.cbm / (r.containers * cap); r.sobra = r.containers * cap - r.cbm; }
+      r.cbm = tot(l => l.cbmUn || 0); r.kg = tot(l => l.kgUn || 0); r.capKg = capKg;
+      if (cap > 0 && (r.cbm > 0 || r.kg > 0)) {
+        r.containers = nCont(r.cbm, r.kg);
+        r.ocupacaoM3 = r.cbm / (r.containers * cap); r.ocupacaoKg = capKg ? r.kg / (r.containers * capKg) : 0;
+        r.ocupacao = Math.max(r.ocupacaoM3, r.ocupacaoKg); r.limitadoPor = r.ocupacaoKg > r.ocupacaoM3 ? 'peso' : 'volume';
+        r.sobra = r.containers * cap - r.cbm; r.sobraKg = capKg ? r.containers * capKg - r.kg : 0;
+      }
       r.valor = tot(l => l.valUn);
       r.semCbm = L.filter(l => q(l) > 0 && !(l.cbmUn > 0)).map(l => l.cod);
+      r.semPeso = L.filter(l => q(l) > 0 && !(l.kgUn > 0)).map(l => l.cod);
       const ordem = { mrp: 0, carona: 1, complemento: 2 };
       r.linhas = L.filter(l => q(l) > 0).map(l => ({ ...l, qFinal: q(l), cobertura: l.dia > 0 ? (l.antes + q(l)) / l.dia : null, x: l.x }))
         .sort((a, b) => ordem[a.origem] - ordem[b.origem] || a.cod.localeCompare(b.cod));
@@ -760,11 +810,12 @@ const MRPCore = (function () {
     }
     if (avg30 <= 0 && !rates.some(x => x > 0)) status = 'sem_demanda';
     const custoBRL = num(p.custo) * taxaPrevisao(db, p.moeda);
-    const cbmUn = (num(p.cbmCx) && num(p.pcsCx)) ? num(p.cbmCx) / num(p.pcsCx) : num(p.pcsContainer) ? (num(db.settings.cbmContainer) || 68) / num(p.pcsContainer) : 0;
+    const cbmUn = num(p.m3Un) ? num(p.m3Un) : (num(p.cbmCx) && num(p.pcsCx)) ? num(p.cbmCx) / num(p.pcsCx) : num(p.pcsContainer) ? (num(db.settings.cbmContainer) || 68) / num(p.pcsContainer) : 0;
+    const pesoUn = num(p.pesoUn);
     return {
       cod: p.cod, produto: p, prm, rates, arr, S, lost, perdaTotal, avg30, rupturaDia: rupt, ruptura: rupt >= 0 ? addDays(today, rupt) : null,
       diasEstoque, coberturaComChegadas: rupt >= 0 ? rupt : null, abertas, totalAberto, atrasadas, plano, prox, status, diasParaPedido: dias,
-      custoBRL, cbmUn, estoqueValor: num(p.estoque) * custoBRL
+      custoBRL, cbmUn, pesoUn, estoqueValor: num(p.estoque) * custoBRL
     };
   }
   function computeAll(db, o = {}) {
@@ -773,7 +824,7 @@ const MRPCore = (function () {
     const res = db.produtos.filter(p => p.ativo !== false).map(p => computeItem(db, idx, p, opts));
     return { opts, itens: res, byCod: new Map(res.map(r => [r.cod, r])) };
   }
-  return { fecharPedidos, capacidadeContainer, parseVendasCSV, parseVendasSheet, mergeVendas, sugerirVinculos, analisarVendas, serieSemanal, taxaPrevisao, valorOrdem, emptyDB, importWorkbook, importStock, computeAll, computeItem, buildDemandIndex, itemParams, addDays, diffDays, todayISO, serialToISO, num, str };
+  return { parseMedidasCSV, parseMedidasSheet, aplicarMedidas, pesoMaxContainer, fecharPedidos, capacidadeContainer, parseVendasCSV, parseVendasSheet, mergeVendas, sugerirVinculos, analisarVendas, serieSemanal, taxaPrevisao, valorOrdem, emptyDB, importWorkbook, importStock, computeAll, computeItem, buildDemandIndex, itemParams, addDays, diffDays, todayISO, serialToISO, num, str };
 })();
 
 
@@ -1132,7 +1183,7 @@ function pgSugestoes(el) {
   ${G.map(g => {
     const f = DB.fornecedores.find(z => z.nome === g.fornecedor);
     const occ = v => v === undefined ? '' : `${Math.round(v * 100)}%`;
-    const contTxt = g.cap > 0 ? (g.cbm > 0 ? `<b>${f1(g.cbm)} m³</b> = ${g.containers} × ${esc(g.tipo)} · ocupação ${g.completar && g.ocupacaoAntes !== undefined && Math.abs(g.ocupacao - g.ocupacaoAntes) > 0.005 ? `${occ(g.ocupacaoAntes)} → <b class="text-emerald-700">${occ(g.ocupacao)}</b>` : `<b class="${g.ocupacao < 0.85 ? 'text-amber-600' : ''}">${occ(g.ocupacao)}</b>`}${g.sobra > 0.5 ? ` · sobram ${f1(g.sobra)} m³` : ''}` : `<span class="text-amber-600">m³ não informado</span>`) : 'LCL (carga fracionada)';
+    const contTxt = g.cap > 0 ? (g.containers ? `<b>${f1(g.cbm)} m³</b>${g.kg ? ` · <b>${nf1.format(g.kg / 1000)} t</b>` : ''} = ${g.containers} × ${esc(g.tipo)} · ocupação ${g.completar && g.ocupacaoAntes !== undefined && Math.abs(g.ocupacao - g.ocupacaoAntes) > 0.005 ? `${occ(g.ocupacaoAntes)} → <b class="text-emerald-700">${occ(g.ocupacao)}</b>` : `<b class="${g.ocupacao < 0.85 ? 'text-amber-600' : ''}">${occ(g.ocupacao)}</b>`} <span class="text-slate-500" title="Volume: ${occ(g.ocupacaoM3)} · Peso: ${g.kg ? occ(g.ocupacaoKg) : 'sem peso cadastrado'}">(limitado por <b>${g.limitadoPor}</b>: m³ ${occ(g.ocupacaoM3)} · peso ${g.kg ? occ(g.ocupacaoKg) : '?'})</span>` : `<span class="text-amber-600">m³ não informado</span>`) : 'LCL (carga fracionada)';
     const moqTxt = g.moq > 0 ? `Pedido mínimo ${esc(g.moqMoeda)} ${f0(g.moq)} ${g.moqAtingido ? '<span class="text-emerald-700">✓</span>' : '<span class="text-red-600">não atingido</span>'}` : '';
     return `<div class="bg-white rounded-xl shadow-sm border mb-4">
     <div class="flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-2.5 border-b bg-slate-50 rounded-t-xl">
@@ -1142,8 +1193,8 @@ function pgSugestoes(el) {
       <span class="text-xs"><b>${brl.format(g.valor)}</b>${g.valor - g.valorAntes > 1 ? ` <span class="text-slate-400">(+${brl.format(g.valor - g.valorAntes)} de carona/complemento)</span>` : ''}</span>
       <span class="ml-auto flex gap-2"><button class="text-xs text-sky-700 underline" onclick="editForn('${esc(g.fornecedor)}')">parâmetros do fornecedor</button><button class="text-xs rounded-lg px-2 py-1 bg-violet-600 text-white" onclick="criarPlanejada([...this.closest('.rounded-xl').querySelectorAll('.sugck')].map(c=>c.value))">Criar pedido deste fornecedor</button></span>
     </div>
-    ${g.semCbm.length && g.cap > 0 ? `<div class="px-4 py-1.5 text-[11px] bg-amber-50 text-amber-800 border-b">${g.semCbm.length} item(ns) sem volume cadastrado (${g.semCbm.slice(0, 8).map(esc).join(', ')}${g.semCbm.length > 8 ? '…' : ''}) — ficam fora do cálculo de container. Cadastre <b>m³ por caixa + peças por caixa</b> ou <b>peças por container</b> em Cadastros → Itens.</div>` : ''}
-    <div class="scroll-x"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="w-8"></th><th class="px-2 py-1.5">Item</th><th class="px-2">Origem</th><th class="px-2 num">Estoque</th><th class="px-2 num">Dem./dia</th><th class="px-2">Ruptura</th><th class="px-2">Pedir até</th><th class="px-2">Chegada</th><th class="px-2 num">Qtd MRP</th><th class="px-2 num">Ajuste</th><th class="px-2 num">Qtd final</th><th class="px-2 num" title="Dias de consumo cobertos na chegada (estoque projetado + compra)">Cobertura</th><th class="px-2 num">m³</th><th class="px-2 num">Valor</th><th class="px-2">Situação</th></tr></thead><tbody>
+    ${(g.semCbm.length || g.semPeso.length) && g.cap > 0 ? `<div class="px-4 py-1.5 text-[11px] bg-amber-50 text-amber-800 border-b">${g.semCbm.length ? `${g.semCbm.length} item(ns) sem volume (${g.semCbm.slice(0, 8).map(esc).join(', ')}${g.semCbm.length > 8 ? '…' : ''}). ` : ''}${g.semPeso.length ? `${g.semPeso.length} sem peso${g.semPeso.length !== g.semCbm.length ? ` (${g.semPeso.slice(0, 8).map(esc).join(', ')}${g.semPeso.length > 8 ? '…' : ''})` : ''}. ` : ''}Eles ficam fora da conta de container — importe a tabela de medidas (Importar → card 6) ou cadastre em Cadastros → Itens.</div>` : ''}
+    <div class="scroll-x"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="w-8"></th><th class="px-2 py-1.5">Item</th><th class="px-2">Origem</th><th class="px-2 num">Estoque</th><th class="px-2 num">Dem./dia</th><th class="px-2">Ruptura</th><th class="px-2">Pedir até</th><th class="px-2">Chegada</th><th class="px-2 num">Qtd MRP</th><th class="px-2 num">Ajuste</th><th class="px-2 num">Qtd final</th><th class="px-2 num" title="Dias de consumo cobertos na chegada (estoque projetado + compra)">Cobertura</th><th class="px-2 num">m³</th><th class="px-2 num">kg</th><th class="px-2 num">Valor</th><th class="px-2">Situação</th></tr></thead><tbody>
     ${g.linhas.map(l => { const x = l.x; const o = ORIG[l.origem]; return `<tr class="border-t hover:bg-sky-50"><td class="text-center"><input type="checkbox" class="sugck" value="${esc(l.cod)}" ${l.origem === 'mrp' ? '' : ''}></td>
       <td class="px-2 py-1.5 cursor-pointer" onclick="openItem('${esc(l.cod)}')"><div class="font-semibold text-sky-800">${esc(l.cod)}</div><div class="text-slate-400 truncate max-w-[220px]">${esc(x.produto.desc)}</div></td>
       <td class="px-2"><span class="badge ${o[1]}" title="${o[2]}">${o[0]}</span></td>
@@ -1153,7 +1204,7 @@ function pgSugestoes(el) {
       <td class="px-2 num ${l.qExtra ? 'text-teal-700 font-semibold' : 'text-slate-300'}">${l.fixo ? '<span class="text-slate-500" title="quantidade digitada">manual</span>' : l.qExtra ? '+' + f0(l.qExtra) : '–'}</td>
       <td class="px-2 num"><input type="number" class="cell-input font-semibold ${l.fixo ? 'bg-amber-50' : ''}" value="${l.qFinal}" onchange="ui.sugQtd['${esc(l.cod)}']=this.value===''?undefined:Number(this.value);render()"></td>
       <td class="px-2 num">${l.cobertura === null ? '–' : f0(l.cobertura) + 'd'}</td>
-      <td class="px-2 num">${l.cbmUn ? f1(l.qFinal * l.cbmUn) : '<span class="text-amber-500" title="sem volume cadastrado">?</span>'}</td><td class="px-2 num">${l.valUn ? brl.format(l.qFinal * l.valUn) : '–'}</td><td class="px-2">${badge(x.status)}</td></tr>`; }).join('')}
+      <td class="px-2 num">${l.cbmUn ? f1(l.qFinal * l.cbmUn) : '<span class="text-amber-500" title="sem volume cadastrado">?</span>'}</td><td class="px-2 num">${l.kgUn ? f0(l.qFinal * l.kgUn) : '<span class="text-amber-500" title="sem peso cadastrado">?</span>'}</td><td class="px-2 num">${l.valUn ? brl.format(l.qFinal * l.valUn) : '–'}</td><td class="px-2">${badge(x.status)}</td></tr>`; }).join('')}
     </tbody></table></div></div>`;
   }).join('') || '<div class="bg-white rounded-xl border p-6 text-slate-500">Nenhuma sugestão para este filtro.</div>'}`;
   document.getElementById('sst').onchange = e => { F.status = e.target.value; render(); };
@@ -1173,7 +1224,7 @@ function editForn(nome) {
     <label class="block"><span class="text-xs text-slate-500">Moeda do pedido mínimo</span><select id="ff_moedaMinimo" class="w-full border rounded px-2 py-1.5">${['USD', 'CNY', 'BRL'].map(m => opt(m, f.moedaMinimo || 'USD')).join('')}</select></label>
     <label class="block col-span-2"><span class="text-xs text-slate-500">Antecipar (carona) itens com pedido ideal nos próximos (dias)</span><input id="ff_janelaCarona" type="number" value="${f.janelaCarona ?? ''}" placeholder="${s.janelaCaronaDias} (padrão)" class="w-full border rounded px-2 py-1.5"></label>
   </div>
-  <div class="text-[11px] text-slate-500 mt-2">Capacidade usada: 20' = ${C.capacidadeContainer(DB, "20'")} m³ · 40' = ${C.capacidadeContainer(DB, "40'")} m³ · 40HC = ${C.capacidadeContainer(DB, '40HC')} m³ úteis (ajuste em Configurações).</div>
+  <div class="text-[11px] text-slate-500 mt-2">Capacidade usada: 20' = ${C.capacidadeContainer(DB, "20'")} m³ / ${f0(C.pesoMaxContainer(DB, "20'"))} kg · 40' = ${C.capacidadeContainer(DB, "40'")} m³ / ${f0(C.pesoMaxContainer(DB, "40'"))} kg · 40HC = ${C.capacidadeContainer(DB, '40HC')} m³ / ${f0(C.pesoMaxContainer(DB, '40HC'))} kg (ajuste em Configurações).</div>
   <div class="flex mt-4"><button onclick="closeModal()" class="ml-auto border rounded-lg px-3 py-1.5">Cancelar</button><button onclick="saveForn('${esc(nome)}')" class="ml-2 bg-sky-600 text-white rounded-lg px-4 py-1.5">Salvar</button></div>`, 'max-w-xl');
 }
 function saveForn(nome) {
@@ -1363,8 +1414,8 @@ function pgCadastros(el) {
   const b = document.getElementById('cadBody');
   if (tab === 'itens') {
     b.innerHTML = `<div class="flex mb-2"><span class="text-xs text-slate-500">${DB.produtos.length} itens. Campos em branco usam o padrão do fornecedor ou das Configurações.</span><button onclick="editProd()" class="ml-auto rounded-lg px-3 py-1.5 bg-sky-600 text-white">+ Novo item</button></div>
-    <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 230px)"><table class="w-full tbl text-xs"><thead><tr class="text-left">${['Código', 'Descrição', 'Família', 'Fornecedor', 'Custo', 'Moeda', 'Múltiplo', 'Pç/cx', 'm³/cx', 'Pç/cont.', 'LT prod.', 'Trânsito', 'Seg. (d)', 'Cobert. (d)', 'Ativo', ''].map(h => `<th class="px-2 py-2">${h}</th>`).join('')}</tr></thead><tbody>
-    ${DB.produtos.map(p => `<tr class="border-t hover:bg-slate-50 ${p.ativo === false ? 'opacity-50' : ''}"><td class="px-2 py-1 font-medium">${esc(p.cod)}</td><td class="px-2 truncate max-w-[280px]" title="${esc(p.desc)}">${esc(p.desc)}</td><td class="px-2">${esc(p.familia)}</td><td class="px-2">${esc(p.fornecedor)}</td><td class="px-2 num">${p.custo ? nf2.format(p.custo) : '–'}</td><td class="px-2">${esc(p.moeda)}</td><td class="px-2 num">${f0(p.multiplo)}</td><td class="px-2 num">${f0(p.pcsCx)}</td><td class="px-2 num">${p.cbmCx ? nf2.format(p.cbmCx) : '–'}</td><td class="px-2 num">${p.pcsContainer ? f0(p.pcsContainer) : ((C.num(p.cbmCx) && C.num(p.pcsCx)) ? '<span class="text-slate-300">via m³</span>' : '<span class="text-amber-500">–</span>')}</td><td class="px-2 num">${p.leadTime ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2 num">${p.transitTime ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2 num">${p.segurancaDias ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2 num">${p.coberturaDias ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2">${p.ativo === false ? 'não' : 'sim'}</td><td class="px-2"><button class="text-sky-700 hover:underline" onclick="editProd('${esc(p.cod)}')">editar</button></td></tr>`).join('')}
+    <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 230px)"><table class="w-full tbl text-xs"><thead><tr class="text-left">${['Código', 'Descrição', 'Família', 'Fornecedor', 'Custo', 'Moeda', 'Múltiplo', 'm³/un', 'kg/un', 'Medida de', 'LT prod.', 'Trânsito', 'Seg. (d)', 'Cobert. (d)', 'Ativo', ''].map(h => `<th class="px-2 py-2">${h}</th>`).join('')}</tr></thead><tbody>
+    ${DB.produtos.map(p => `<tr class="border-t hover:bg-slate-50 ${p.ativo === false ? 'opacity-50' : ''}"><td class="px-2 py-1 font-medium">${esc(p.cod)}</td><td class="px-2 truncate max-w-[280px]" title="${esc(p.desc)}">${esc(p.desc)}</td><td class="px-2">${esc(p.familia)}</td><td class="px-2">${esc(p.fornecedor)}</td><td class="px-2 num">${p.custo ? nf2.format(p.custo) : '–'}</td><td class="px-2">${esc(p.moeda)}</td><td class="px-2 num">${f0(p.multiplo)}</td>${(() => { const m3 = C.num(p.m3Un) || ((C.num(p.cbmCx) && C.num(p.pcsCx)) ? C.num(p.cbmCx) / C.num(p.pcsCx) : C.num(p.pcsContainer) ? (C.num(DB.settings.cbmContainer) || 68) / C.num(p.pcsContainer) : 0); return `<td class="px-2 num">${m3 ? (m3 < 0.01 ? m3.toFixed(5) : m3.toFixed(4)).replace('.', ',') : '<span class="text-amber-500">–</span>'}</td><td class="px-2 num">${p.pesoUn ? nf2.format(p.pesoUn) : '<span class="text-amber-500">–</span>'}</td><td class="px-2 text-slate-400">${esc(p.medidaFonte || (p.cbmCx ? 'caixa' : p.pcsContainer ? 'pç/container' : ''))}</td>`; })()}<td class="px-2 num">${p.leadTime ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2 num">${p.transitTime ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2 num">${p.segurancaDias ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2 num">${p.coberturaDias ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2">${p.ativo === false ? 'não' : 'sim'}</td><td class="px-2"><button class="text-sky-700 hover:underline" onclick="editProd('${esc(p.cod)}')">editar</button></td></tr>`).join('')}
     </tbody></table></div>`;
   } else if (tab === 'estrutura') {
     const q = (ui.estQ || '').toLowerCase();
@@ -1386,14 +1437,14 @@ function pgCadastros(el) {
     <td class="px-2 num"><input class="cell-input" type="number" placeholder="${DB.settings.transitPadrao}" value="${f.transitTime ?? ''}" onchange="DB.fornecedores[${i}].transitTime=this.value===''?null:Number(this.value);changed('fornecedores')"></td>
     <td class="px-2">${esc(f.container || DB.settings.containerPadrao)}${f.completarContainer === false ? ' <span class="text-slate-400">(não completa)</span>' : ''}</td><td class="px-2">${f.pedidoMinimo ? esc(f.moedaMinimo || 'USD') + ' ' + f0(f.pedidoMinimo) : '<span class="text-slate-300">–</span>'}</td><td class="px-2 num">${f.janelaCarona ?? '<span class="text-slate-300">' + DB.settings.janelaCaronaDias + '</span>'}</td>
     <td class="px-2 num">${DB.produtos.filter(p => p.fornecedor === f.nome).length}</td>
-    <td class="px-2 num">${(() => { const n = DB.produtos.filter(p => p.fornecedor === f.nome && p.ativo !== false && !((C.num(p.cbmCx) && C.num(p.pcsCx)) || C.num(p.pcsContainer))).length; return n ? `<span class="text-amber-600">${n}</span>` : '<span class="text-emerald-600">0</span>'; })()}</td>
+    <td class="px-2 num">${(() => { const n = DB.produtos.filter(p => p.fornecedor === f.nome && p.ativo !== false && !(C.num(p.m3Un) || (C.num(p.cbmCx) && C.num(p.pcsCx)) || C.num(p.pcsContainer))).length; return n ? `<span class="text-amber-600">${n}</span>` : '<span class="text-emerald-600">0</span>'; })()}</td>
     <td class="px-2 whitespace-nowrap"><button class="text-sky-700 underline mr-2" onclick="editForn('${esc(f.nome)}')">parâmetros</button><button class="text-red-500" onclick="if(confirm('Remover fornecedor ${esc(f.nome)}?')){DB.fornecedores.splice(${i},1);changed('fornecedores')}">remover</button></td></tr>`).join('')}
     </tbody></table></div>`;
   }
 }
 function addEst() { const pa = document.getElementById('ne_pa').value.trim(), mp = document.getElementById('ne_mp').value.trim(), q = Number(document.getElementById('ne_q').value) || 1; if (!pa || !mp) { toast('Informe produto e componente'); return; } DB.estrutura.push({ pa, mp, qtd: q }); changed('estrutura'); }
 function addForn() { const n = prompt('Nome do fornecedor:'); if (!n) return; const nome = n.trim().toUpperCase(); if (DB.fornecedores.some(f => f.nome === nome)) { toast('Já existe'); return; } DB.fornecedores.push({ nome, leadTime: null, transitTime: null, contato: '', linha: '' }); DB.fornecedores.sort((a, b) => a.nome.localeCompare(b.nome)); changed('fornecedores'); }
-const PROD_F = [['cod', 'Código'], ['desc', 'Descrição'], ['familia', 'Família'], ['fornecedor', 'Fornecedor'], ['custo', 'Custo unitário', 'number'], ['moeda', 'Moeda'], ['multiplo', 'Múltiplo de compra', 'number'], ['pcsCx', 'Peças por caixa/pallet', 'number'], ['cbmCx', 'm³ por caixa/pallet', 'number'], ['pcsContainer', 'Peças por container 40HC (se não tiver m³)', 'number'], ['leadTime', 'Lead time produção (d)', 'number'], ['transitTime', 'Trânsito (d)', 'number'], ['segurancaDias', 'Estoque segurança (dias)', 'number'], ['coberturaDias', 'Cobertura por pedido (dias)', 'number'], ['estoque', 'Estoque atual', 'number']];
+const PROD_F = [['cod', 'Código'], ['desc', 'Descrição'], ['familia', 'Família'], ['fornecedor', 'Fornecedor'], ['custo', 'Custo unitário', 'number'], ['moeda', 'Moeda'], ['multiplo', 'Múltiplo de compra', 'number'], ['pcsCx', 'Peças por caixa/pallet', 'number'], ['m3Un', 'm³ por unidade', 'number'], ['pesoUn', 'Peso por unidade (kg)', 'number'], ['cbmCx', 'm³ por caixa/pallet', 'number'], ['pcsContainer', 'Peças por container 40HC (se não tiver m³)', 'number'], ['leadTime', 'Lead time produção (d)', 'number'], ['transitTime', 'Trânsito (d)', 'number'], ['segurancaDias', 'Estoque segurança (dias)', 'number'], ['coberturaDias', 'Cobertura por pedido (dias)', 'number'], ['estoque', 'Estoque atual', 'number']];
 function editProd(cod) {
   const p = cod ? prodByCod(cod) : { moeda: 'USD', multiplo: 1, ativo: true };
   openModal(cod ? 'Editar item ' + esc(cod) : 'Novo item', `<datalist id="dlForn2">${DB.fornecedores.map(f => `<option value="${esc(f.nome)}">`).join('')}</datalist><div class="grid grid-cols-2 md:grid-cols-3 gap-3">
@@ -1417,6 +1468,9 @@ function pgImportar(el) {
   ${card('1. Planilha MRP atual (.xlsb / .xlsx)', 'Migração completa: lê as abas MRP, Structure, Forecast, Stock_Structure, Stock_System, COSTS, Tab_CBM, Purchase_Order, Suppliers e Follow-up. <b>Substitui todos os dados do site</b> (as configurações são mantidas).', `<input type="file" id="fMRP" accept=".xlsb,.xlsx,.xlsm" class="text-xs"><div id="logMRP" class="text-xs mt-3 text-slate-600 whitespace-pre-line"></div>`)}
   ${card('2. Atualizar estoque (export do ERP)', 'Planilha com as colunas <b>SKU</b> e <b>Total disponível</b> (formato da aba Stock_System / relatório de estoque do Olist). Atualiza só o estoque dos itens do cadastro.', `<input type="file" id="fEst" accept=".xlsx,.xls,.xlsb,.csv" class="text-xs"><div id="logEst" class="text-xs mt-3 text-slate-600 whitespace-pre-line"></div>`)}
   ${card('3. Relatório de vendas (efetivo)', 'Export de vendas do e-commerce (CSV ou Excel) com as colunas <b>Data do pedido</b>, <b>SKU</b>, <b>Qtd</b>, <b>Status expedição</b> e <b>Canal</b>. Pedidos cancelados são ignorados; vendas de "Proposta comercial" ficam separadas. Só os totais por SKU e dia são guardados (nenhum dado de cliente). Importar um novo período substitui apenas os dias daquele período.', `<input type="file" id="fVend" accept=".csv,.txt,.xlsx,.xls" class="text-xs"><div id="logVend" class="text-xs mt-3 text-slate-600 whitespace-pre-line">${DB.vendas ? `Histórico no site: ${fd(DB.vendas.base)} a ${fd(C.addDays(DB.vendas.base, DB.vendas.dias - 1))} · ${Object.keys(DB.vendas.skus).length} SKUs` : ''}</div><div id="vincBox"></div>`)}
+  ${card('6. Medidas e pesos dos produtos', 'Tabela de dimensões (Peso, Largura, Altura, Comprimento, Cubagem) por código. Usada para calcular m³ e peso dos containers. Códigos de produto vendido são levados ao componente pela estrutura (ex.: PBG0007-5 ÷ 40 → PPBG0007).', `<div class="flex gap-2"><input id="medUrl" placeholder="Link da planilha Google" value="${esc(DB.settings.medidasUrl || '')}" class="border rounded px-2 py-1 text-xs flex-1"><button class="bg-sky-600 text-white rounded px-3 py-1 text-xs" onclick="buscarMedidasUrl()">Buscar</button></div>
+    <div class="text-[11px] text-slate-500 mt-1">O link precisa estar compartilhado como "Qualquer pessoa com o link pode ver". Se não estiver, baixe a planilha (Arquivo → Fazer download → .xlsx ou .csv) e envie abaixo.</div>
+    <input type="file" id="fMed" accept=".csv,.xlsx,.xls" class="text-xs mt-2"><div id="logMed" class="text-xs mt-3 text-slate-600 whitespace-pre-line"></div>`)}
   ${card('4. Exportar', 'Baixe o resultado do MRP e as sugestões em Excel, ou um backup completo dos dados.', `<div class="flex flex-wrap gap-2"><button onclick="exportMRP()" class="border rounded-lg px-3 py-1.5">MRP (Excel)</button><button onclick="exportSug()" class="border rounded-lg px-3 py-1.5">Sugestões (Excel)</button><button onclick="exportGrade()" class="border rounded-lg px-3 py-1.5">Grade diária (Excel)</button><button onclick="download('backup-mrp-'+C.todayISO()+'.json',JSON.stringify(DB))" class="border rounded-lg px-3 py-1.5">Backup (JSON)</button></div>`)}
   ${card('5. Restaurar backup', 'Carrega um arquivo de backup JSON gerado acima. Substitui todos os dados.', `<input type="file" id="fBk" accept=".json" class="text-xs">`)}
   </div>`;
@@ -1453,10 +1507,35 @@ function pgImportar(el) {
     } catch (err) { console.error(err); log.innerHTML = '<span class="text-red-600">Erro: ' + esc(err.message) + '</span>'; }
   };
   renderVinculos();
+  document.getElementById('fMed').onchange = async e => {
+    const f = e.target.files[0]; if (!f) return;
+    try { const M = /\.csv$/i.test(f.name) ? C.parseMedidasCSV(await f.text()) : C.parseMedidasSheet(XLSX, XLSX.read(await f.arrayBuffer(), { type: 'array' })); aplicarMedidasUI(M, f.name); }
+    catch (err) { document.getElementById('logMed').innerHTML = '<span class="text-red-600">Erro: ' + esc(err.message) + '</span>'; }
+  };
   document.getElementById('fBk').onchange = async e => {
     const f = e.target.files[0]; if (!f) return; if (!confirm('Substituir todos os dados pelo backup?')) return;
     try { const d = JSON.parse(await f.text()); DB = { ...C.emptyDB(), ...d, settings: { ...C.emptyDB().settings, ...d.settings } }; recalc(); Store.save(); render(); toast('Backup restaurado'); } catch (err) { toast('Arquivo inválido'); }
   };
+}
+function urlGviz(u) {
+  const m = String(u).match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/); if (!m) return null;
+  const g = String(u).match(/[#&?]gid=(\d+)/); return `https://docs.google.com/spreadsheets/d/${m[1]}/gviz/tq?tqx=out:csv&gid=${g ? g[1] : 0}`;
+}
+async function buscarMedidasUrl() {
+  const u = document.getElementById('medUrl').value.trim(), log = document.getElementById('logMed');
+  const g = urlGviz(u); if (!g) { log.innerHTML = '<span class="text-red-600">Link de planilha Google inválido.</span>'; return; }
+  log.textContent = 'Buscando planilha…';
+  try {
+    const r = await fetch(g); const t = await r.text();
+    if (!r.ok || /^\s*</.test(t)) throw new Error('acesso negado');
+    DB.settings.medidasUrl = u; aplicarMedidasUI(C.parseMedidasCSV(t), 'planilha Google');
+  } catch (err) { log.innerHTML = `<span class="text-red-600">Não consegui ler a planilha (${esc(err.message)}). Verifique se ela está compartilhada como "Qualquer pessoa com o link pode ver" ou envie o arquivo baixado.</span>`; }
+}
+function aplicarMedidasUI(M, origem) {
+  const r = C.aplicarMedidas(DB, M); recalc(); Store.save('produtos', 'settings'); renderNav();
+  const log = document.getElementById('logMed');
+  if (log) log.innerHTML = `<b class="text-emerald-700">Medidas aplicadas (${esc(origem)})</b>\n${Object.keys(M).length} códigos na tabela · ${r.diretos.length} itens pelo mesmo código · ${r.viaEstrutura.length} pela estrutura\n${r.viaEstrutura.length ? '<span class="text-slate-500">' + r.viaEstrutura.map(esc).join(' · ') + '</span>\n' : ''}${r.semMedida.length ? `<span class="text-amber-700">${r.semMedida.length} itens sem medida (inclua na tabela ou cadastre em Cadastros → Itens): ${r.semMedida.slice(0, 40).map(esc).join(', ')}${r.semMedida.length > 40 ? '…' : ''}</span>` : ''}`;
+  toast('Medidas e pesos atualizados');
 }
 function xlsxDownload(name, sheets) { const wb = XLSX.utils.book_new(); sheets.forEach(([n, rows]) => XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), n)); XLSX.writeFile(wb, name); }
 function exportMRP() {
@@ -1465,8 +1544,8 @@ function exportMRP() {
 function exportSug() {
   const G = C.fecharPedidos(DB, R, sugRows(), { ativo: ui.sugFiltro.fechar !== false, overrides: ui.sugQtd || {} });
   const ORIG = { mrp: 'MRP', carona: 'Carona', complemento: 'Complemento' };
-  const rows = []; G.forEach(g => g.linhas.forEach(l => { const x = l.x; rows.push({ Fornecedor: g.fornecedor, Item: l.cod, Descrição: x.produto.desc, Origem: ORIG[l.origem], Estoque: C.num(x.produto.estoque), 'Demanda/dia': Math.round(x.avg30 * 100) / 100, Ruptura: x.ruptura || '', 'Pedir até': x.prox?.dataPedidoIdeal || '', 'Chegada prevista': l.dataChegada, 'Qtd MRP': l.origem === 'complemento' ? 0 : l.qBase, Ajuste: l.qExtra, 'Qtd final': l.qFinal, 'Cobertura (dias)': l.cobertura === null ? '' : Math.round(l.cobertura), 'm³': Math.round(l.qFinal * (l.cbmUn || 0) * 100) / 100, 'Custo unit.': C.num(x.produto.custo), Moeda: x.produto.moeda, 'Valor R$': Math.round(l.qFinal * l.valUn), Situação: STATUS_LBL[x.status] }); }));
-  const res = G.map(g => ({ Fornecedor: g.fornecedor, Container: g.tipo, 'm³': Math.round(g.cbm * 100) / 100, Containers: g.containers || '', 'Ocupação %': g.ocupacao ? Math.round(g.ocupacao * 100) : '', 'Pedido mínimo': g.moq ? g.moqMoeda + ' ' + g.moq : '', 'Mínimo atingido': g.moq ? (g.moqAtingido ? 'sim' : 'não') : '', 'Valor R$': Math.round(g.valor), 'Itens sem m³': g.semCbm.join(', ') }));
+  const rows = []; G.forEach(g => g.linhas.forEach(l => { const x = l.x; rows.push({ Fornecedor: g.fornecedor, Item: l.cod, Descrição: x.produto.desc, Origem: ORIG[l.origem], Estoque: C.num(x.produto.estoque), 'Demanda/dia': Math.round(x.avg30 * 100) / 100, Ruptura: x.ruptura || '', 'Pedir até': x.prox?.dataPedidoIdeal || '', 'Chegada prevista': l.dataChegada, 'Qtd MRP': l.origem === 'complemento' ? 0 : l.qBase, Ajuste: l.qExtra, 'Qtd final': l.qFinal, 'Cobertura (dias)': l.cobertura === null ? '' : Math.round(l.cobertura), 'm³': Math.round(l.qFinal * (l.cbmUn || 0) * 100) / 100, 'kg': Math.round(l.qFinal * (l.kgUn || 0)), 'Custo unit.': C.num(x.produto.custo), Moeda: x.produto.moeda, 'Valor R$': Math.round(l.qFinal * l.valUn), Situação: STATUS_LBL[x.status] }); }));
+  const res = G.map(g => ({ Fornecedor: g.fornecedor, Container: g.tipo, 'm³': Math.round(g.cbm * 100) / 100, kg: Math.round(g.kg || 0), Containers: g.containers || '', 'Ocupação %': g.ocupacao ? Math.round(g.ocupacao * 100) : '', 'Limitado por': g.limitadoPor || '', 'Pedido mínimo': g.moq ? g.moqMoeda + ' ' + g.moq : '', 'Mínimo atingido': g.moq ? (g.moqAtingido ? 'sim' : 'não') : '', 'Valor R$': Math.round(g.valor), 'Itens sem m³': g.semCbm.join(', ') }));
   xlsxDownload(`Sugestoes_compra_${R.opts.today}.xlsx`, [['Resumo por fornecedor', res], ['Itens', rows]]);
 }
 function exportGrade() {
@@ -1692,6 +1771,7 @@ function pgConfig(el) {
     ${f('cbmContainer', "m³ úteis — 40HC", 'number', '40HC ≈ 68 m³ aproveitáveis')}
     <label class="block"><span class="text-xs text-slate-600 font-semibold">m³ úteis — 20'</span><input id="cf_c20" type="number" step="any" value="${s.containers?.["20'"] ?? 28}" class="w-full border rounded px-2 py-1.5"></label>
     <label class="block"><span class="text-xs text-slate-600 font-semibold">m³ úteis — 40'</span><input id="cf_c40" type="number" step="any" value="${s.containers?.["40'"] ?? 58}" class="w-full border rounded px-2 py-1.5"></label>
+    <label class="block"><span class="text-xs text-slate-600 font-semibold">Peso máximo de carga (kg) — 20' / 40' / 40HC</span><div class="flex gap-1">${["20'", "40'", '40HC'].map((t, i) => `<input id="cf_kg${i}" type="number" value="${(s.pesoMaxContainer || {})[t] ?? (i ? 26500 : 25000)}" class="w-full border rounded px-1 py-1.5" title="${t}">`).join('')}</div><span class="text-[11px] text-slate-400">Confirme com o agente de carga (limite rodoviário)</span></label>
     <label class="block"><span class="text-xs text-slate-600 font-semibold">Container padrão</span><select id="cf_containerPadrao" class="w-full border rounded px-2 py-1.5">${["20'", "40'", '40HC', 'LCL'].map(t => opt(t, s.containerPadrao)).join('')}</select><span class="text-[11px] text-slate-400">Cada fornecedor pode ter o seu</span></label>
     ${f('coberturaMaxDias', 'Cobertura máxima ao completar (dias)', 'number', 'Limite para não encher estoque de item de giro lento')}
     ${f('janelaCaronaDias', 'Antecipação (carona) padrão (dias)', 'number', 'Itens com pedido ideal até N dias entram no mesmo pedido')}
@@ -1722,6 +1802,7 @@ function saveConfig() {
   const s = DB.settings, g = k => document.getElementById('cf_' + k);
   ['horizonte', 'segurancaDias', 'coberturaDias', 'leadTimePadrao', 'transitPadrao', 'desembaracoDias', 'cbmContainer', 'coberturaMaxDias', 'janelaCaronaDias'].forEach(k => s[k] = Number(g(k).value) || 0);
   s.containers = { "20'": Number(g('c20').value) || 28, "40'": Number(g('c40').value) || 58 }; s.containerPadrao = g('containerPadrao').value;
+  s.pesoMaxContainer = { "20'": Number(g('kg0').value) || 25000, "40'": Number(g('kg1').value) || 26500, '40HC': Number(g('kg2').value) || 26500 };
   if (!s.coberturaMaxDias) s.coberturaMaxDias = 180;
   s.horizonte = Math.min(Math.max(s.horizonte, 30), 730);
   const fonteAntes = s.cambioFonte; s.cambioFonte = g('cambioFonte').value; s.cambioMargem = Number(g('cambioMargem').value) || 0;

@@ -10,6 +10,8 @@ Planejamento de importação: estoque projetado dia a dia, ruptura, ordens de co
 ## Fechamento de pedido por fornecedor
 - Na tela de Sugestões, cada fornecedor vira um pedido: itens de **carona** (pedido ideal nos próximos N dias) entram no mesmo embarque, a quantidade sobe até o **pedido mínimo** e o último **container** é completado.
 - O complemento é distribuído para igualar a cobertura (dias) dos itens, respeitando o múltiplo de compra e a cobertura máxima (padrão 180 dias). Quantidades digitadas ficam fixas.
+- Containers consideram **volume e peso**: o número de containers é o maior entre m³ ÷ capacidade e kg ÷ carga máxima; o complemento para quando qualquer um dos dois enche.
+- Medidas e pesos: importe a tabela de dimensões (link da planilha Google compartilhada ou arquivo) em Importar → card 6. Códigos de produto vendido são levados ao componente pela estrutura (ex.: PBG0007-5 ÷ 40 → PPBG0007).
 - Parâmetros por fornecedor (container 20'/40'/40HC/LCL, completar ou não, pedido mínimo e moeda, janela de carona) em Cadastros → Fornecedores. Volume por item: m³ por caixa + peças por caixa, ou peças por container 40HC.
 
 ## Vendas x Previsão
