@@ -7,6 +7,11 @@ Planejamento de importação: estoque projetado dia a dia, ruptura, ordens de co
 2. Atualize o estoque com o export do ERP (colunas **SKU** e **Total disponível**).
 3. Ajuste os parâmetros em **Configurações** (segurança, cobertura, lead times, câmbio).
 
+## Fechamento de pedido por fornecedor
+- Na tela de Sugestões, cada fornecedor vira um pedido: itens de **carona** (pedido ideal nos próximos N dias) entram no mesmo embarque, a quantidade sobe até o **pedido mínimo** e o último **container** é completado.
+- O complemento é distribuído para igualar a cobertura (dias) dos itens, respeitando o múltiplo de compra e a cobertura máxima (padrão 180 dias). Quantidades digitadas ficam fixas.
+- Parâmetros por fornecedor (container 20'/40'/40HC/LCL, completar ou não, pedido mínimo e moeda, janela de carona) em Cadastros → Fornecedores. Volume por item: m³ por caixa + peças por caixa, ou peças por container 40HC.
+
 ## Vendas x Previsão
 - Importe o relatório de vendas efetivas (CSV/Excel com Data do pedido, SKU, Qtd, Status expedição, Canal) em Importar / Exportar. Cancelados são ignorados e propostas comerciais ficam separadas; só totais por SKU/dia são guardados.
 - As vendas dos produtos acabados são explodidas pela estrutura até os componentes comprados e comparadas com a previsão (janela de 30 a 180 dias, tolerância configurável).

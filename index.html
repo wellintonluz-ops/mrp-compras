@@ -119,7 +119,7 @@ const MRPCore = (function () {
     return {
       settings: {
         horizonte: 240, segurancaDias: 30, coberturaDias: 60, leadTimePadrao: 45, transitPadrao: 35,
-        desembaracoDias: 0, cbmContainer: 68, incluirSimulacoes: true, dataBase: '',
+        desembaracoDias: 0, cbmContainer: 68, containers: { "20'": 28, "40'": 58 }, containerPadrao: '40HC', coberturaMaxDias: 180, janelaCaronaDias: 60, incluirSimulacoes: true, dataBase: '',
         cambio: { USD: 5.40, CNY: 0.76, BRL: 1 }, cambioFonte: 'comercial', cambioMargem: 0, cambioInfo: null, workerUrl: ''
       },
       produtos: [],     // itens comprados (MP)
@@ -567,6 +567,105 @@ const MRPCore = (function () {
     return { weeks, real, b2b, prev };
   }
 
+
+  // ---------- fechamento de pedido por fornecedor ----------
+  // base: itens do MRP com sugestão (R.itens com prox). Retorna um bloco por fornecedor com
+  // carona (itens do mesmo fornecedor a pedir em breve), pedido mínimo e complemento de container.
+  function capacidadeContainer(db, tipo) {
+    const s = db.settings; if (tipo === 'LCL') return 0;
+    if (tipo === '40HC') return num(s.cbmContainer) || 68;
+    return num((s.containers || {})[tipo]) || (tipo === "20'" ? 28 : 58);
+  }
+  function fecharPedidos(db, R, base, o = {}) {
+    const s = db.settings, today = R.opts.today, H = R.opts.horizonte;
+    const covMax = num(s.coberturaMaxDias) || 180;
+    const ativo = o.ativo !== false, ov = o.overrides || {};
+    const grupos = new Map();
+    base.forEach(x => { const f = x.produto.fornecedor || '(sem fornecedor)'; if (!grupos.has(f)) grupos.set(f, []); grupos.get(f).push(x); });
+    const out = [];
+    grupos.forEach((xs, forn) => {
+      const F = db.fornecedores.find(z => z.nome === forn) || {};
+      const tipo = F.container || s.containerPadrao || '40HC';
+      const cap = capacidadeContainer(db, tipo);
+      const completar = ativo && F.completarContainer !== false && cap > 0;
+      const janela = num(F.janelaCarona ?? s.janelaCaronaDias ?? 60);
+      const moq = num(F.pedidoMinimo), moqMoeda = F.moedaMinimo || 'USD';
+      const lines = new Map();
+      const add = (x, origem, qBase) => {
+        const usaProx = origem === 'mrp' && x.prox;
+        const dArr = Math.min(H, Math.max(1, usaProx ? diffDays(today, x.prox.dataChegada) : x.prm.LT));
+        let sd = 0, n = 0; for (let d = dArr; d < Math.min(H + 1, dArr + 90); d++) { sd += x.rates[d]; n++; }
+        const dia = n ? sd / n : x.avg30;
+        const antes = Math.max(0, x.S[dArr - 1] ?? num(x.produto.estoque));
+        const mult = x.prm.mult;
+        const fixo = ov[x.cod] !== undefined && ov[x.cod] !== null && ov[x.cod] !== '';
+        const q0 = fixo ? num(ov[x.cod]) : qBase;
+        const qMax = Math.max(q0, Math.floor(Math.max(0, covMax * dia - antes) / mult) * mult);
+        lines.set(x.cod, { cod: x.cod, x, origem, fixo, qBase: q0, qExtra: 0, mult, dia, antes, qMax, dArr,
+          cbmUn: x.cbmUn, valUn: x.custoBRL, dataChegada: addDays(today, dArr),
+          dataPedido: usaProx ? x.prox.dataPedido : today });
+      };
+      xs.forEach(x => add(x, 'mrp', x.prox ? x.prox.qtd : 0));
+      if (ativo) {
+        R.itens.forEach(x => {
+          if ((x.produto.fornecedor || '(sem fornecedor)') !== forn || lines.has(x.cod)) return;
+          if (x.prox && diffDays(today, x.prox.dataPedidoIdeal) <= janela) add(x, 'carona', x.prox.qtd);
+        });
+        R.itens.forEach(x => {
+          if ((x.produto.fornecedor || '(sem fornecedor)') !== forn || lines.has(x.cod)) return;
+          if (x.avg30 > 0 || x.rates.some(r => r > 0)) add(x, 'complemento', 0);
+        });
+      }
+      const L = [...lines.values()];
+      const q = l => l.qBase + l.qExtra;
+      const cob = l => l.dia > 0 ? (l.antes + q(l)) / l.dia : Infinity;
+      const tot = f => L.reduce((a, l) => a + q(l) * f(l), 0);
+      // adiciona quantidade igualando a cobertura (dias) entre os itens, respeitando múltiplo e cobertura máxima
+      const encher = (unit, gap, permiteUltrapassar) => {
+        let guard = 0;
+        while (gap > 1e-9 && guard++ < 20000) {
+          let best = null, bestStep = 0;
+          for (const l of L) {
+            if (l.fixo || l.dia <= 0 || !(unit(l) > 0)) continue;
+            let step = l.mult * Math.max(1, Math.ceil(Math.max(1, l.dia) / l.mult));
+            if (q(l) + step > l.qMax) step = l.mult;
+            if (q(l) + step > l.qMax) continue;
+            if (!permiteUltrapassar && step * unit(l) > gap + 1e-9) { step = l.mult; if (step * unit(l) > gap + 1e-9) continue; }
+            if (!best || cob(l) < cob(best)) { best = l; bestStep = step; }
+          }
+          if (!best) break;
+          best.qExtra += bestStep; gap -= bestStep * unit(best);
+        }
+        return gap;
+      };
+      const r = { fornecedor: forn, tipo, cap, completar, janela, moq, moqMoeda, linhas: null };
+      // 1) pedido mínimo (em valor)
+      const taxaMoq = taxaPrevisao(db, moqMoeda);
+      r.valorAntes = tot(l => l.valUn);
+      if (ativo && moq > 0 && r.valorAntes > 0) {
+        const alvo = moq * taxaMoq;
+        if (r.valorAntes < alvo) encher(l => l.valUn, alvo - r.valorAntes, true);
+      }
+      r.moqAtingido = !(moq > 0) || tot(l => l.valUn) >= moq * taxaMoq - 1;
+      // 2) completar container (em m³)
+      r.cbmAntes = tot(l => l.cbmUn || 0);
+      if (cap > 0 && r.cbmAntes > 0) {
+        r.containers = Math.max(1, Math.ceil(r.cbmAntes / cap - 1e-6));
+        r.ocupacaoAntes = r.cbmAntes / (r.containers * cap);
+        if (completar) r.sobra = encher(l => l.cbmUn || 0, r.containers * cap - r.cbmAntes, false);
+      }
+      r.cbm = tot(l => l.cbmUn || 0);
+      if (cap > 0 && r.cbm > 0) { r.containers = Math.max(1, Math.ceil(r.cbm / cap - 1e-6)); r.ocupacao = r.cbm / (r.containers * cap); r.sobra = r.containers * cap - r.cbm; }
+      r.valor = tot(l => l.valUn);
+      r.semCbm = L.filter(l => q(l) > 0 && !(l.cbmUn > 0)).map(l => l.cod);
+      const ordem = { mrp: 0, carona: 1, complemento: 2 };
+      r.linhas = L.filter(l => q(l) > 0).map(l => ({ ...l, qFinal: q(l), cobertura: l.dia > 0 ? (l.antes + q(l)) / l.dia : null, x: l.x }))
+        .sort((a, b) => ordem[a.origem] - ordem[b.origem] || a.cod.localeCompare(b.cod));
+      out.push(r);
+    });
+    return out.sort((a, b) => a.fornecedor.localeCompare(b.fornecedor));
+  }
+
   // ---------- motor MRP ----------
   function buildDemandIndex(db) {
     const fcByPa = new Map(db.previsao.map(f => [f.pa, f]));
@@ -661,7 +760,7 @@ const MRPCore = (function () {
     }
     if (avg30 <= 0 && !rates.some(x => x > 0)) status = 'sem_demanda';
     const custoBRL = num(p.custo) * taxaPrevisao(db, p.moeda);
-    const cbmUn = (num(p.cbmCx) && num(p.pcsCx)) ? num(p.cbmCx) / num(p.pcsCx) : 0;
+    const cbmUn = (num(p.cbmCx) && num(p.pcsCx)) ? num(p.cbmCx) / num(p.pcsCx) : num(p.pcsContainer) ? (num(db.settings.cbmContainer) || 68) / num(p.pcsContainer) : 0;
     return {
       cod: p.cod, produto: p, prm, rates, arr, S, lost, perdaTotal, avg30, rupturaDia: rupt, ruptura: rupt >= 0 ? addDays(today, rupt) : null,
       diasEstoque, coberturaComChegadas: rupt >= 0 ? rupt : null, abertas, totalAberto, atrasadas, plano, prox, status, diasParaPedido: dias,
@@ -674,7 +773,7 @@ const MRPCore = (function () {
     const res = db.produtos.filter(p => p.ativo !== false).map(p => computeItem(db, idx, p, opts));
     return { opts, itens: res, byCod: new Map(res.map(r => [r.cod, r])) };
   }
-  return { parseVendasCSV, parseVendasSheet, mergeVendas, sugerirVinculos, analisarVendas, serieSemanal, taxaPrevisao, valorOrdem, emptyDB, importWorkbook, importStock, computeAll, computeItem, buildDemandIndex, itemParams, addDays, diffDays, todayISO, serialToISO, num, str };
+  return { fecharPedidos, capacidadeContainer, parseVendasCSV, parseVendasSheet, mergeVendas, sugerirVinculos, analisarVendas, serieSemanal, taxaPrevisao, valorOrdem, emptyDB, importWorkbook, importStock, computeAll, computeItem, buildDemandIndex, itemParams, addDays, diffDays, todayISO, serialToISO, num, str };
 })();
 
 
@@ -1010,54 +1109,91 @@ function sugRows() {
 function pgSugestoes(el) {
   const F = ui.sugFiltro;
   if (!R || !R.itens.length) { el.innerHTML = ''; return; }
-  const rows = sugRows();
-  const cbmCont = C.num(DB.settings.cbmContainer) || 68;
-  const groups = {}; rows.forEach(x => { const k = x.produto.fornecedor || '(sem fornecedor)'; (groups[k] = groups[k] || []).push(x); });
+  if (F.fechar === undefined) F.fechar = true;
   ui.sugQtd = ui.sugQtd || {};
-  const q = x => ui.sugQtd[x.cod] ?? x.prox.qtd;
+  const rows = sugRows();
+  const G = C.fecharPedidos(DB, R, rows, { ativo: F.fechar, overrides: ui.sugQtd });
+  window._sugLines = new Map(); G.forEach(g => g.linhas.forEach(l => window._sugLines.set(l.cod, l)));
+  const ORIG = { mrp: ['MRP', 'bg-slate-100 text-slate-600', 'Necessidade calculada pelo MRP'], carona: ['Carona', 'bg-violet-100 text-violet-700', 'Item do mesmo fornecedor que precisaria ser pedido em breve — antecipado para o mesmo embarque'], complemento: ['Complemento', 'bg-teal-100 text-teal-700', 'Incluído só para completar o container / pedido mínimo'] };
+  const totVal = G.reduce((a, g) => a + g.valor, 0), totCont = G.reduce((a, g) => a + (g.containers || 0), 0);
   el.innerHTML = `
   <div class="flex flex-wrap gap-2 mb-3 items-center">
     <select id="sst" class="border rounded-lg px-2 py-1.5">${[['acao', 'Ação imediata (atrasado + 7 dias)'], ['atrasado', 'Somente atrasados'], ['janela', 'Pedir nos próximos N dias'], ['todos', 'Todas as sugestões do horizonte']].map(([v, l]) => opt(v, F.status, l)).join('')}</select>
     ${F.status === 'janela' ? `<input id="sjan" type="number" value="${F.janela}" class="border rounded-lg px-2 py-1.5 w-20"> dias` : ''}
     <select id="sforn" class="border rounded-lg px-2 py-1.5"><option value="">Todos os fornecedores</option>${uniq(DB.produtos.map(p => p.fornecedor)).map(f => opt(f, F.fornecedor)).join('')}</select>
-    <span class="text-xs text-slate-500">${rows.length} itens · cobertura padrão ${DB.settings.coberturaDias} dias · segurança ${DB.settings.segurancaDias} dias</span>
+    <label class="flex items-center gap-1.5 text-xs bg-white border rounded-lg px-2 py-1.5"><input type="checkbox" ${F.fechar ? 'checked' : ''} onchange="ui.sugFiltro.fechar=this.checked;render()"> <b>Fechar pedido por fornecedor</b> (carona + pedido mínimo + completar container)</label>
     <div class="ml-auto flex gap-2">
+      ${Object.keys(ui.sugQtd).length ? `<button onclick="ui.sugQtd={};render()" class="border rounded-lg px-3 py-1.5 bg-white hover:bg-slate-50" title="Desfaz as quantidades digitadas">Limpar ajustes manuais</button>` : ''}
       <button onclick="exportSug()" class="border rounded-lg px-3 py-1.5 bg-white hover:bg-slate-50">Exportar Excel</button>
       <button onclick="criarPlanejada([...document.querySelectorAll('.sugck:checked')].map(c=>c.value))" class="rounded-lg px-3 py-1.5 bg-violet-600 text-white hover:bg-violet-700">Criar ordens planejadas (selecionados)</button>
     </div>
   </div>
-  <div class="text-[11px] text-slate-500 mb-3">A quantidade sugerida cobre a demanda de <b>cobertura</b> dias após a chegada + estoque de segurança, descontando o estoque projetado, arredondada para o múltiplo de compra. Você pode ajustar a quantidade antes de criar a ordem.</div>
-  ${Object.keys(groups).sort().map(g => {
-    const xs = groups[g].sort((a, b) => a.prox.dataPedidoIdeal.localeCompare(b.prox.dataPedidoIdeal));
-    const cbm = xs.reduce((s, x) => s + q(x) * x.cbmUn, 0), val = xs.reduce((s, x) => s + q(x) * x.custoBRL, 0);
-    const f = DB.fornecedores.find(z => z.nome === g);
+  <div class="text-[11px] text-slate-500 mb-3">${G.length} fornecedor(es) · ${totCont ? f0(totCont) + ' container(s) · ' : ''}${brl.format(totVal)}. Qtd MRP = demanda de ${DB.settings.coberturaDias} dias após a chegada + segurança − estoque projetado, no múltiplo de compra.${F.fechar ? ` Com o fechamento ligado, entram itens de <b>carona</b> (pedido ideal nos próximos ${DB.settings.janelaCaronaDias} dias) e <b>complementos</b> para atingir o pedido mínimo e completar o último container, distribuindo para igualar a cobertura dos itens, sem passar de ${DB.settings.coberturaMaxDias} dias de cobertura.` : ''} Quantidades digitadas ficam fixas.</div>
+  ${G.map(g => {
+    const f = DB.fornecedores.find(z => z.nome === g.fornecedor);
+    const occ = v => v === undefined ? '' : `${Math.round(v * 100)}%`;
+    const contTxt = g.cap > 0 ? (g.cbm > 0 ? `<b>${f1(g.cbm)} m³</b> = ${g.containers} × ${esc(g.tipo)} · ocupação ${g.completar && g.ocupacaoAntes !== undefined && Math.abs(g.ocupacao - g.ocupacaoAntes) > 0.005 ? `${occ(g.ocupacaoAntes)} → <b class="text-emerald-700">${occ(g.ocupacao)}</b>` : `<b class="${g.ocupacao < 0.85 ? 'text-amber-600' : ''}">${occ(g.ocupacao)}</b>`}${g.sobra > 0.5 ? ` · sobram ${f1(g.sobra)} m³` : ''}` : `<span class="text-amber-600">m³ não informado</span>`) : 'LCL (carga fracionada)';
+    const moqTxt = g.moq > 0 ? `Pedido mínimo ${esc(g.moqMoeda)} ${f0(g.moq)} ${g.moqAtingido ? '<span class="text-emerald-700">✓</span>' : '<span class="text-red-600">não atingido</span>'}` : '';
     return `<div class="bg-white rounded-xl shadow-sm border mb-4">
-    <div class="flex flex-wrap items-center gap-4 px-4 py-2.5 border-b bg-slate-50 rounded-t-xl">
-      <label class="flex items-center gap-2 font-bold"><input type="checkbox" onchange="this.closest('.rounded-xl').querySelectorAll('.sugck').forEach(c=>c.checked=this.checked)"> ${esc(g)}</label>
-      <span class="text-xs text-slate-500">${xs.length} itens · LT ${f?.leadTime ?? DB.settings.leadTimePadrao}+${f?.transitTime ?? DB.settings.transitPadrao} dias</span>
-      <span class="ml-auto text-xs"><b>${f1(cbm)} m³</b> ≈ ${nf2.format(cbm / cbmCont)} container(s) · <b>${brl.format(val)}</b></span>
+    <div class="flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-2.5 border-b bg-slate-50 rounded-t-xl">
+      <label class="flex items-center gap-2 font-bold"><input type="checkbox" onchange="this.closest('.rounded-xl').querySelectorAll('.sugck').forEach(c=>c.checked=this.checked)"> ${esc(g.fornecedor)}</label>
+      <span class="text-xs text-slate-500">LT ${f?.leadTime ?? DB.settings.leadTimePadrao}+${f?.transitTime ?? DB.settings.transitPadrao} dias · ${g.linhas.length} itens</span>
+      <span class="text-xs">${contTxt}</span>${moqTxt ? `<span class="text-xs">${moqTxt}</span>` : ''}
+      <span class="text-xs"><b>${brl.format(g.valor)}</b>${g.valor - g.valorAntes > 1 ? ` <span class="text-slate-400">(+${brl.format(g.valor - g.valorAntes)} de carona/complemento)</span>` : ''}</span>
+      <span class="ml-auto flex gap-2"><button class="text-xs text-sky-700 underline" onclick="editForn('${esc(g.fornecedor)}')">parâmetros do fornecedor</button><button class="text-xs rounded-lg px-2 py-1 bg-violet-600 text-white" onclick="criarPlanejada([...this.closest('.rounded-xl').querySelectorAll('.sugck')].map(c=>c.value))">Criar pedido deste fornecedor</button></span>
     </div>
-    <div class="scroll-x"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="w-8"></th><th class="px-2 py-1.5">Item</th><th class="px-2 num">Estoque</th><th class="px-2 num">Dem./dia</th><th class="px-2 num">Em aberto</th><th class="px-2">Ruptura</th><th class="px-2">Pedir até</th><th class="px-2">Chegada</th><th class="px-2 num">Qtd sugerida</th><th class="px-2 num">m³</th><th class="px-2 num">Valor</th><th class="px-2">Situação</th></tr></thead><tbody>
-    ${xs.map(x => `<tr class="border-t hover:bg-sky-50"><td class="text-center"><input type="checkbox" class="sugck" value="${esc(x.cod)}"></td>
-      <td class="px-2 py-1.5 cursor-pointer" onclick="openItem('${esc(x.cod)}')"><div class="font-semibold text-sky-800">${esc(x.cod)}</div><div class="text-slate-400 truncate max-w-[240px]">${esc(x.produto.desc)}</div></td>
-      <td class="px-2 num">${f0(x.produto.estoque)}</td><td class="px-2 num">${f1(x.avg30)}</td><td class="px-2 num">${x.totalAberto ? f0(x.totalAberto) : '–'}</td>
-      <td class="px-2">${x.ruptura ? fd(x.ruptura) : '–'}</td><td class="px-2 ${x.prox.atrasado ? 'text-red-600 font-semibold' : ''}">${fd(x.prox.dataPedidoIdeal)}</td><td class="px-2">${fd(x.prox.dataChegada)}</td>
-      <td class="px-2 num"><input type="number" class="cell-input font-semibold" value="${q(x)}" onchange="ui.sugQtd['${esc(x.cod)}']=Number(this.value);render()"></td>
-      <td class="px-2 num">${x.cbmUn ? f1(q(x) * x.cbmUn) : '–'}</td><td class="px-2 num">${x.custoBRL ? brl.format(q(x) * x.custoBRL) : '–'}</td><td class="px-2">${badge(x.status)}</td></tr>`).join('')}
+    ${g.semCbm.length && g.cap > 0 ? `<div class="px-4 py-1.5 text-[11px] bg-amber-50 text-amber-800 border-b">${g.semCbm.length} item(ns) sem volume cadastrado (${g.semCbm.slice(0, 8).map(esc).join(', ')}${g.semCbm.length > 8 ? '…' : ''}) — ficam fora do cálculo de container. Cadastre <b>m³ por caixa + peças por caixa</b> ou <b>peças por container</b> em Cadastros → Itens.</div>` : ''}
+    <div class="scroll-x"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="w-8"></th><th class="px-2 py-1.5">Item</th><th class="px-2">Origem</th><th class="px-2 num">Estoque</th><th class="px-2 num">Dem./dia</th><th class="px-2">Ruptura</th><th class="px-2">Pedir até</th><th class="px-2">Chegada</th><th class="px-2 num">Qtd MRP</th><th class="px-2 num">Ajuste</th><th class="px-2 num">Qtd final</th><th class="px-2 num" title="Dias de consumo cobertos na chegada (estoque projetado + compra)">Cobertura</th><th class="px-2 num">m³</th><th class="px-2 num">Valor</th><th class="px-2">Situação</th></tr></thead><tbody>
+    ${g.linhas.map(l => { const x = l.x; const o = ORIG[l.origem]; return `<tr class="border-t hover:bg-sky-50"><td class="text-center"><input type="checkbox" class="sugck" value="${esc(l.cod)}" ${l.origem === 'mrp' ? '' : ''}></td>
+      <td class="px-2 py-1.5 cursor-pointer" onclick="openItem('${esc(l.cod)}')"><div class="font-semibold text-sky-800">${esc(l.cod)}</div><div class="text-slate-400 truncate max-w-[220px]">${esc(x.produto.desc)}</div></td>
+      <td class="px-2"><span class="badge ${o[1]}" title="${o[2]}">${o[0]}</span></td>
+      <td class="px-2 num">${f0(x.produto.estoque)}</td><td class="px-2 num">${f1(x.avg30)}</td><td class="px-2">${x.ruptura ? fd(x.ruptura) : '–'}</td>
+      <td class="px-2 ${x.prox?.atrasado ? 'text-red-600 font-semibold' : ''}">${l.origem === 'mrp' && x.prox ? fd(x.prox.dataPedidoIdeal) : (x.prox ? `<span class="text-slate-400" title="pedido ideal">${fd(x.prox.dataPedidoIdeal)}</span>` : '–')}</td><td class="px-2">${fd(l.dataChegada)}</td>
+      <td class="px-2 num">${l.origem === 'complemento' ? '–' : f0(l.fixo ? (x.prox?.qtd || 0) : l.qBase)}</td>
+      <td class="px-2 num ${l.qExtra ? 'text-teal-700 font-semibold' : 'text-slate-300'}">${l.fixo ? '<span class="text-slate-500" title="quantidade digitada">manual</span>' : l.qExtra ? '+' + f0(l.qExtra) : '–'}</td>
+      <td class="px-2 num"><input type="number" class="cell-input font-semibold ${l.fixo ? 'bg-amber-50' : ''}" value="${l.qFinal}" onchange="ui.sugQtd['${esc(l.cod)}']=this.value===''?undefined:Number(this.value);render()"></td>
+      <td class="px-2 num">${l.cobertura === null ? '–' : f0(l.cobertura) + 'd'}</td>
+      <td class="px-2 num">${l.cbmUn ? f1(l.qFinal * l.cbmUn) : '<span class="text-amber-500" title="sem volume cadastrado">?</span>'}</td><td class="px-2 num">${l.valUn ? brl.format(l.qFinal * l.valUn) : '–'}</td><td class="px-2">${badge(x.status)}</td></tr>`; }).join('')}
     </tbody></table></div></div>`;
   }).join('') || '<div class="bg-white rounded-xl border p-6 text-slate-500">Nenhuma sugestão para este filtro.</div>'}`;
   document.getElementById('sst').onchange = e => { F.status = e.target.value; render(); };
   document.getElementById('sforn').onchange = e => { F.fornecedor = e.target.value; render(); };
   const j = document.getElementById('sjan'); if (j) j.onchange = e => { F.janela = Number(e.target.value) || 30; render(); };
 }
+function editForn(nome) {
+  let f = DB.fornecedores.find(z => z.nome === nome);
+  if (!f) { f = { nome, leadTime: null, transitTime: null, contato: '', linha: '' }; DB.fornecedores.push(f); }
+  const s = DB.settings;
+  openModal('Parâmetros do fornecedor ' + esc(nome), `<div class="grid grid-cols-2 gap-3">
+    <label class="block"><span class="text-xs text-slate-500">Lead time produção (dias)</span><input id="ff_leadTime" type="number" value="${f.leadTime ?? ''}" placeholder="${s.leadTimePadrao}" class="w-full border rounded px-2 py-1.5"></label>
+    <label class="block"><span class="text-xs text-slate-500">Trânsito (dias)</span><input id="ff_transitTime" type="number" value="${f.transitTime ?? ''}" placeholder="${s.transitPadrao}" class="w-full border rounded px-2 py-1.5"></label>
+    <label class="block"><span class="text-xs text-slate-500">Tipo de container</span><select id="ff_container" class="w-full border rounded px-2 py-1.5">${["20'", "40'", '40HC', 'LCL'].map(t => opt(t, f.container || s.containerPadrao)).join('')}</select></label>
+    <label class="flex items-center gap-2 mt-5 text-xs"><input id="ff_completar" type="checkbox" ${f.completarContainer !== false ? 'checked' : ''}> Completar o último container</label>
+    <label class="block"><span class="text-xs text-slate-500">Pedido mínimo (valor)</span><input id="ff_pedidoMinimo" type="number" step="any" value="${f.pedidoMinimo || ''}" placeholder="sem mínimo" class="w-full border rounded px-2 py-1.5"></label>
+    <label class="block"><span class="text-xs text-slate-500">Moeda do pedido mínimo</span><select id="ff_moedaMinimo" class="w-full border rounded px-2 py-1.5">${['USD', 'CNY', 'BRL'].map(m => opt(m, f.moedaMinimo || 'USD')).join('')}</select></label>
+    <label class="block col-span-2"><span class="text-xs text-slate-500">Antecipar (carona) itens com pedido ideal nos próximos (dias)</span><input id="ff_janelaCarona" type="number" value="${f.janelaCarona ?? ''}" placeholder="${s.janelaCaronaDias} (padrão)" class="w-full border rounded px-2 py-1.5"></label>
+  </div>
+  <div class="text-[11px] text-slate-500 mt-2">Capacidade usada: 20' = ${C.capacidadeContainer(DB, "20'")} m³ · 40' = ${C.capacidadeContainer(DB, "40'")} m³ · 40HC = ${C.capacidadeContainer(DB, '40HC')} m³ úteis (ajuste em Configurações).</div>
+  <div class="flex mt-4"><button onclick="closeModal()" class="ml-auto border rounded-lg px-3 py-1.5">Cancelar</button><button onclick="saveForn('${esc(nome)}')" class="ml-2 bg-sky-600 text-white rounded-lg px-4 py-1.5">Salvar</button></div>`, 'max-w-xl');
+}
+function saveForn(nome) {
+  const f = DB.fornecedores.find(z => z.nome === nome); const g = k => document.getElementById('ff_' + k);
+  const n = k => g(k).value === '' ? null : Number(g(k).value);
+  f.leadTime = n('leadTime'); f.transitTime = n('transitTime'); f.container = g('container').value; f.completarContainer = g('completar').checked;
+  f.pedidoMinimo = n('pedidoMinimo') || 0; f.moedaMinimo = g('moedaMinimo').value; f.janelaCarona = n('janelaCarona');
+  closeModal(); changed('fornecedores'); toast('Fornecedor atualizado');
+}
 function criarPlanejada(cods) {
   if (!cods.length) { toast('Selecione ao menos um item'); return; }
-  const t = R.opts.today; let n = 0;
+  const t = R.opts.today; let n = 0; const L = window._sugLines || new Map();
   cods.forEach(cod => {
-    const x = R.byCod.get(cod); if (!x || !x.prox) return;
-    const qtd = (ui.sugQtd || {})[cod] ?? x.prox.qtd;
-    const dp = x.prox.dataPedido < t ? t : x.prox.dataPedido;
-    DB.ordens.push({ id: uid('po'), po: 'PLAN-' + t.replace(/-/g, '').slice(2), fornecedor: x.produto.fornecedor, item: cod, qtd, dataPedido: dp, leadTime: x.prm.leadTime, dataEmbarque: C.addDays(dp, x.prm.leadTime), transitTime: x.prm.transitTime, dataChegada: C.addDays(dp, x.prm.LT), qtdRecebida: 0, status: 'Planejada', custoUnit: C.num(x.produto.custo), moeda: x.produto.moeda, responsavel: user?.email || '', obs: 'Gerada pela sugestão do MRP' });
+    const x = R.byCod.get(cod); if (!x) return;
+    const l = L.get(cod);
+    const qtd = l ? l.qFinal : ((ui.sugQtd || {})[cod] ?? x.prox?.qtd);
+    if (!qtd) return;
+    const dp0 = l ? l.dataPedido : (x.prox?.dataPedido || t); const dp = dp0 < t ? t : dp0;
+    const orig = l?.origem === 'carona' ? ' (carona)' : l?.origem === 'complemento' ? ' (complemento de container/pedido mínimo)' : '';
+    DB.ordens.push({ id: uid('po'), po: 'PLAN-' + t.replace(/-/g, '').slice(2), fornecedor: x.produto.fornecedor, item: cod, qtd, dataPedido: dp, leadTime: x.prm.leadTime, dataEmbarque: C.addDays(dp, x.prm.leadTime), transitTime: x.prm.transitTime, dataChegada: C.addDays(dp, x.prm.LT), qtdRecebida: 0, status: 'Planejada', custoUnit: C.num(x.produto.custo), moeda: x.produto.moeda, cambioPago: null, responsavel: user?.email || '', obs: 'Gerada pela sugestão do MRP' + orig });
     delete (ui.sugQtd || {})[cod]; n++;
   });
   closeModal(); changed('ordens'); toast(`${n} ordem(ns) planejada(s) criada(s). Veja em Ordens de compra.`);
@@ -1227,8 +1363,8 @@ function pgCadastros(el) {
   const b = document.getElementById('cadBody');
   if (tab === 'itens') {
     b.innerHTML = `<div class="flex mb-2"><span class="text-xs text-slate-500">${DB.produtos.length} itens. Campos em branco usam o padrão do fornecedor ou das Configurações.</span><button onclick="editProd()" class="ml-auto rounded-lg px-3 py-1.5 bg-sky-600 text-white">+ Novo item</button></div>
-    <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 230px)"><table class="w-full tbl text-xs"><thead><tr class="text-left">${['Código', 'Descrição', 'Família', 'Fornecedor', 'Custo', 'Moeda', 'Múltiplo', 'Pç/cx', 'm³/cx', 'LT prod.', 'Trânsito', 'Seg. (d)', 'Cobert. (d)', 'Ativo', ''].map(h => `<th class="px-2 py-2">${h}</th>`).join('')}</tr></thead><tbody>
-    ${DB.produtos.map(p => `<tr class="border-t hover:bg-slate-50 ${p.ativo === false ? 'opacity-50' : ''}"><td class="px-2 py-1 font-medium">${esc(p.cod)}</td><td class="px-2 truncate max-w-[280px]" title="${esc(p.desc)}">${esc(p.desc)}</td><td class="px-2">${esc(p.familia)}</td><td class="px-2">${esc(p.fornecedor)}</td><td class="px-2 num">${p.custo ? nf2.format(p.custo) : '–'}</td><td class="px-2">${esc(p.moeda)}</td><td class="px-2 num">${f0(p.multiplo)}</td><td class="px-2 num">${f0(p.pcsCx)}</td><td class="px-2 num">${p.cbmCx ? nf2.format(p.cbmCx) : '–'}</td><td class="px-2 num">${p.leadTime ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2 num">${p.transitTime ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2 num">${p.segurancaDias ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2 num">${p.coberturaDias ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2">${p.ativo === false ? 'não' : 'sim'}</td><td class="px-2"><button class="text-sky-700 hover:underline" onclick="editProd('${esc(p.cod)}')">editar</button></td></tr>`).join('')}
+    <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 230px)"><table class="w-full tbl text-xs"><thead><tr class="text-left">${['Código', 'Descrição', 'Família', 'Fornecedor', 'Custo', 'Moeda', 'Múltiplo', 'Pç/cx', 'm³/cx', 'Pç/cont.', 'LT prod.', 'Trânsito', 'Seg. (d)', 'Cobert. (d)', 'Ativo', ''].map(h => `<th class="px-2 py-2">${h}</th>`).join('')}</tr></thead><tbody>
+    ${DB.produtos.map(p => `<tr class="border-t hover:bg-slate-50 ${p.ativo === false ? 'opacity-50' : ''}"><td class="px-2 py-1 font-medium">${esc(p.cod)}</td><td class="px-2 truncate max-w-[280px]" title="${esc(p.desc)}">${esc(p.desc)}</td><td class="px-2">${esc(p.familia)}</td><td class="px-2">${esc(p.fornecedor)}</td><td class="px-2 num">${p.custo ? nf2.format(p.custo) : '–'}</td><td class="px-2">${esc(p.moeda)}</td><td class="px-2 num">${f0(p.multiplo)}</td><td class="px-2 num">${f0(p.pcsCx)}</td><td class="px-2 num">${p.cbmCx ? nf2.format(p.cbmCx) : '–'}</td><td class="px-2 num">${p.pcsContainer ? f0(p.pcsContainer) : ((C.num(p.cbmCx) && C.num(p.pcsCx)) ? '<span class="text-slate-300">via m³</span>' : '<span class="text-amber-500">–</span>')}</td><td class="px-2 num">${p.leadTime ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2 num">${p.transitTime ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2 num">${p.segurancaDias ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2 num">${p.coberturaDias ?? '<span class="text-slate-300">padrão</span>'}</td><td class="px-2">${p.ativo === false ? 'não' : 'sim'}</td><td class="px-2"><button class="text-sky-700 hover:underline" onclick="editProd('${esc(p.cod)}')">editar</button></td></tr>`).join('')}
     </tbody></table></div>`;
   } else if (tab === 'estrutura') {
     const q = (ui.estQ || '').toLowerCase();
@@ -1242,20 +1378,22 @@ function pgCadastros(el) {
     document.getElementById('eq').oninput = ev => { ui.estQ = ev.target.value; clearTimeout(pgCadastros._t); pgCadastros._t = setTimeout(() => { render(); const i = document.getElementById('eq'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }, 300); };
   } else {
     b.innerHTML = `<div class="flex mb-2"><span class="text-xs text-slate-500">Lead time e trânsito do fornecedor valem para todos os itens dele que não tiverem valor próprio.</span><button onclick="addForn()" class="ml-auto rounded-lg px-3 py-1.5 bg-sky-600 text-white">+ Fornecedor</button></div>
-    <div class="bg-white rounded-xl shadow-sm border scroll-x"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="px-2 py-2">Fornecedor</th><th class="px-2">Linha de produtos</th><th class="px-2">Contato</th><th class="px-2 num">Lead time produção (d)</th><th class="px-2 num">Trânsito (d)</th><th class="px-2 num">Itens</th><th></th></tr></thead><tbody>
+    <div class="bg-white rounded-xl shadow-sm border scroll-x"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="px-2 py-2">Fornecedor</th><th class="px-2">Linha de produtos</th><th class="px-2">Contato</th><th class="px-2 num">Lead time produção (d)</th><th class="px-2 num">Trânsito (d)</th><th class="px-2">Container</th><th class="px-2">Pedido mínimo</th><th class="px-2 num">Carona (d)</th><th class="px-2 num">Itens</th><th class="px-2 num">Itens sem m³</th><th></th></tr></thead><tbody>
     ${DB.fornecedores.map((f, i) => `<tr class="border-t"><td class="px-2 py-1 font-medium">${esc(f.nome)}</td>
     <td class="px-2"><input class="border rounded px-1 py-0.5 w-48" value="${esc(f.linha || '')}" onchange="DB.fornecedores[${i}].linha=this.value;changed('fornecedores')"></td>
     <td class="px-2"><input class="border rounded px-1 py-0.5 w-32" value="${esc(f.contato || '')}" onchange="DB.fornecedores[${i}].contato=this.value;changed('fornecedores')"></td>
     <td class="px-2 num"><input class="cell-input" type="number" placeholder="${DB.settings.leadTimePadrao}" value="${f.leadTime ?? ''}" onchange="DB.fornecedores[${i}].leadTime=this.value===''?null:Number(this.value);changed('fornecedores')"></td>
     <td class="px-2 num"><input class="cell-input" type="number" placeholder="${DB.settings.transitPadrao}" value="${f.transitTime ?? ''}" onchange="DB.fornecedores[${i}].transitTime=this.value===''?null:Number(this.value);changed('fornecedores')"></td>
+    <td class="px-2">${esc(f.container || DB.settings.containerPadrao)}${f.completarContainer === false ? ' <span class="text-slate-400">(não completa)</span>' : ''}</td><td class="px-2">${f.pedidoMinimo ? esc(f.moedaMinimo || 'USD') + ' ' + f0(f.pedidoMinimo) : '<span class="text-slate-300">–</span>'}</td><td class="px-2 num">${f.janelaCarona ?? '<span class="text-slate-300">' + DB.settings.janelaCaronaDias + '</span>'}</td>
     <td class="px-2 num">${DB.produtos.filter(p => p.fornecedor === f.nome).length}</td>
-    <td class="px-2"><button class="text-red-500" onclick="if(confirm('Remover fornecedor ${esc(f.nome)}?')){DB.fornecedores.splice(${i},1);changed('fornecedores')}">remover</button></td></tr>`).join('')}
+    <td class="px-2 num">${(() => { const n = DB.produtos.filter(p => p.fornecedor === f.nome && p.ativo !== false && !((C.num(p.cbmCx) && C.num(p.pcsCx)) || C.num(p.pcsContainer))).length; return n ? `<span class="text-amber-600">${n}</span>` : '<span class="text-emerald-600">0</span>'; })()}</td>
+    <td class="px-2 whitespace-nowrap"><button class="text-sky-700 underline mr-2" onclick="editForn('${esc(f.nome)}')">parâmetros</button><button class="text-red-500" onclick="if(confirm('Remover fornecedor ${esc(f.nome)}?')){DB.fornecedores.splice(${i},1);changed('fornecedores')}">remover</button></td></tr>`).join('')}
     </tbody></table></div>`;
   }
 }
 function addEst() { const pa = document.getElementById('ne_pa').value.trim(), mp = document.getElementById('ne_mp').value.trim(), q = Number(document.getElementById('ne_q').value) || 1; if (!pa || !mp) { toast('Informe produto e componente'); return; } DB.estrutura.push({ pa, mp, qtd: q }); changed('estrutura'); }
 function addForn() { const n = prompt('Nome do fornecedor:'); if (!n) return; const nome = n.trim().toUpperCase(); if (DB.fornecedores.some(f => f.nome === nome)) { toast('Já existe'); return; } DB.fornecedores.push({ nome, leadTime: null, transitTime: null, contato: '', linha: '' }); DB.fornecedores.sort((a, b) => a.nome.localeCompare(b.nome)); changed('fornecedores'); }
-const PROD_F = [['cod', 'Código'], ['desc', 'Descrição'], ['familia', 'Família'], ['fornecedor', 'Fornecedor'], ['custo', 'Custo unitário', 'number'], ['moeda', 'Moeda'], ['multiplo', 'Múltiplo de compra', 'number'], ['pcsCx', 'Peças por caixa/pallet', 'number'], ['cbmCx', 'm³ por caixa/pallet', 'number'], ['leadTime', 'Lead time produção (d)', 'number'], ['transitTime', 'Trânsito (d)', 'number'], ['segurancaDias', 'Estoque segurança (dias)', 'number'], ['coberturaDias', 'Cobertura por pedido (dias)', 'number'], ['estoque', 'Estoque atual', 'number']];
+const PROD_F = [['cod', 'Código'], ['desc', 'Descrição'], ['familia', 'Família'], ['fornecedor', 'Fornecedor'], ['custo', 'Custo unitário', 'number'], ['moeda', 'Moeda'], ['multiplo', 'Múltiplo de compra', 'number'], ['pcsCx', 'Peças por caixa/pallet', 'number'], ['cbmCx', 'm³ por caixa/pallet', 'number'], ['pcsContainer', 'Peças por container 40HC (se não tiver m³)', 'number'], ['leadTime', 'Lead time produção (d)', 'number'], ['transitTime', 'Trânsito (d)', 'number'], ['segurancaDias', 'Estoque segurança (dias)', 'number'], ['coberturaDias', 'Cobertura por pedido (dias)', 'number'], ['estoque', 'Estoque atual', 'number']];
 function editProd(cod) {
   const p = cod ? prodByCod(cod) : { moeda: 'USD', multiplo: 1, ativo: true };
   openModal(cod ? 'Editar item ' + esc(cod) : 'Novo item', `<datalist id="dlForn2">${DB.fornecedores.map(f => `<option value="${esc(f.nome)}">`).join('')}</datalist><div class="grid grid-cols-2 md:grid-cols-3 gap-3">
@@ -1325,8 +1463,11 @@ function exportMRP() {
   xlsxDownload(`MRP_${R.opts.today}.xlsx`, [['MRP', R.itens.map(x => ({ Item: x.cod, Descrição: x.produto.desc, Família: x.produto.familia, Fornecedor: x.produto.fornecedor, Estoque: C.num(x.produto.estoque), 'Demanda/dia': Math.round(x.avg30 * 100) / 100, 'Dias de estoque': x.diasEstoque, 'Em aberto': x.totalAberto, 'Ruptura projetada': x.ruptura || '', 'Pedir até': x.prox?.dataPedidoIdeal || '', 'Qtd sugerida': x.prox?.qtd || '', 'Chegada sugerida': x.prox?.dataChegada || '', Situação: STATUS_LBL[x.status] }))]]);
 }
 function exportSug() {
-  const q = x => (ui.sugQtd || {})[x.cod] ?? x.prox.qtd;
-  xlsxDownload(`Sugestoes_compra_${R.opts.today}.xlsx`, [['Sugestões', sugRows().map(x => ({ Fornecedor: x.produto.fornecedor, Item: x.cod, Descrição: x.produto.desc, Estoque: C.num(x.produto.estoque), 'Demanda/dia': Math.round(x.avg30 * 100) / 100, 'Em aberto': x.totalAberto, Ruptura: x.ruptura || '', 'Pedir até': x.prox.dataPedidoIdeal, 'Chegada prevista': x.prox.dataChegada, 'Qtd sugerida': q(x), 'm³': Math.round(q(x) * x.cbmUn * 100) / 100, 'Custo unit.': C.num(x.produto.custo), Moeda: x.produto.moeda, 'Valor R$': Math.round(q(x) * x.custoBRL), Situação: STATUS_LBL[x.status] }))]]);
+  const G = C.fecharPedidos(DB, R, sugRows(), { ativo: ui.sugFiltro.fechar !== false, overrides: ui.sugQtd || {} });
+  const ORIG = { mrp: 'MRP', carona: 'Carona', complemento: 'Complemento' };
+  const rows = []; G.forEach(g => g.linhas.forEach(l => { const x = l.x; rows.push({ Fornecedor: g.fornecedor, Item: l.cod, Descrição: x.produto.desc, Origem: ORIG[l.origem], Estoque: C.num(x.produto.estoque), 'Demanda/dia': Math.round(x.avg30 * 100) / 100, Ruptura: x.ruptura || '', 'Pedir até': x.prox?.dataPedidoIdeal || '', 'Chegada prevista': l.dataChegada, 'Qtd MRP': l.origem === 'complemento' ? 0 : l.qBase, Ajuste: l.qExtra, 'Qtd final': l.qFinal, 'Cobertura (dias)': l.cobertura === null ? '' : Math.round(l.cobertura), 'm³': Math.round(l.qFinal * (l.cbmUn || 0) * 100) / 100, 'Custo unit.': C.num(x.produto.custo), Moeda: x.produto.moeda, 'Valor R$': Math.round(l.qFinal * l.valUn), Situação: STATUS_LBL[x.status] }); }));
+  const res = G.map(g => ({ Fornecedor: g.fornecedor, Container: g.tipo, 'm³': Math.round(g.cbm * 100) / 100, Containers: g.containers || '', 'Ocupação %': g.ocupacao ? Math.round(g.ocupacao * 100) : '', 'Pedido mínimo': g.moq ? g.moqMoeda + ' ' + g.moq : '', 'Mínimo atingido': g.moq ? (g.moqAtingido ? 'sim' : 'não') : '', 'Valor R$': Math.round(g.valor), 'Itens sem m³': g.semCbm.join(', ') }));
+  xlsxDownload(`Sugestoes_compra_${R.opts.today}.xlsx`, [['Resumo por fornecedor', res], ['Itens', rows]]);
 }
 function exportGrade() {
   const H = R.opts.horizonte, t = R.opts.today, rows = [];
@@ -1548,7 +1689,12 @@ function pgConfig(el) {
     ${f('leadTimePadrao', 'Lead time de produção padrão (dias)')}
     ${f('transitPadrao', 'Trânsito padrão (dias)')}
     ${f('desembaracoDias', 'Desembaraço + entrega (dias)', 'number', 'Somado ao lead time total')}
-    ${f('cbmContainer', 'm³ úteis por container', 'number', '40HC ≈ 68 m³ aproveitáveis')}
+    ${f('cbmContainer', "m³ úteis — 40HC", 'number', '40HC ≈ 68 m³ aproveitáveis')}
+    <label class="block"><span class="text-xs text-slate-600 font-semibold">m³ úteis — 20'</span><input id="cf_c20" type="number" step="any" value="${s.containers?.["20'"] ?? 28}" class="w-full border rounded px-2 py-1.5"></label>
+    <label class="block"><span class="text-xs text-slate-600 font-semibold">m³ úteis — 40'</span><input id="cf_c40" type="number" step="any" value="${s.containers?.["40'"] ?? 58}" class="w-full border rounded px-2 py-1.5"></label>
+    <label class="block"><span class="text-xs text-slate-600 font-semibold">Container padrão</span><select id="cf_containerPadrao" class="w-full border rounded px-2 py-1.5">${["20'", "40'", '40HC', 'LCL'].map(t => opt(t, s.containerPadrao)).join('')}</select><span class="text-[11px] text-slate-400">Cada fornecedor pode ter o seu</span></label>
+    ${f('coberturaMaxDias', 'Cobertura máxima ao completar (dias)', 'number', 'Limite para não encher estoque de item de giro lento')}
+    ${f('janelaCaronaDias', 'Antecipação (carona) padrão (dias)', 'number', 'Itens com pedido ideal até N dias entram no mesmo pedido')}
     ${f('dataBase', 'Data-base simulada', 'date', 'Deixe em branco para usar a data de hoje')}
     <label class="flex items-center gap-2 mt-5 text-xs"><input id="cf_incluirSimulacoes" type="checkbox" ${s.incluirSimulacoes ? 'checked' : ''}> Considerar ordens em "Simulação" no cálculo</label>
   </div>
@@ -1574,7 +1720,9 @@ function pgConfig(el) {
 }
 function saveConfig() {
   const s = DB.settings, g = k => document.getElementById('cf_' + k);
-  ['horizonte', 'segurancaDias', 'coberturaDias', 'leadTimePadrao', 'transitPadrao', 'desembaracoDias', 'cbmContainer'].forEach(k => s[k] = Number(g(k).value) || 0);
+  ['horizonte', 'segurancaDias', 'coberturaDias', 'leadTimePadrao', 'transitPadrao', 'desembaracoDias', 'cbmContainer', 'coberturaMaxDias', 'janelaCaronaDias'].forEach(k => s[k] = Number(g(k).value) || 0);
+  s.containers = { "20'": Number(g('c20').value) || 28, "40'": Number(g('c40').value) || 58 }; s.containerPadrao = g('containerPadrao').value;
+  if (!s.coberturaMaxDias) s.coberturaMaxDias = 180;
   s.horizonte = Math.min(Math.max(s.horizonte, 30), 730);
   const fonteAntes = s.cambioFonte; s.cambioFonte = g('cambioFonte').value; s.cambioMargem = Number(g('cambioMargem').value) || 0;
   if (s.cambioFonte === 'manual') { s.cambio = { ...s.cambio, USD: Number(g('USD').value) || 0, CNY: Number(g('CNY').value) || 0 }; s.cambioInfo = { fonte: 'manual', em: new Date().toISOString(), ref: 'informado manualmente' }; }
