@@ -22,6 +22,7 @@
   .b-comprar { background:#ffedd5; color:#c2410c; }
   .b-planejar { background:#fef9c3; color:#a16207; }
   .b-ok { background:#dcfce7; color:#15803d; }
+  .b-antecipar { background:#fce7f3; color:#be185d; }
   .b-sem_demanda { background:#f1f5f9; color:#64748b; }
   .scroll-x { overflow-x: auto; }
   .cell-input { width: 70px; text-align: right; border: 1px solid transparent; border-radius: 4px; padding: 1px 4px; background: transparent; }
@@ -872,13 +873,19 @@ const MRPCore = (function () {
     // plano de compras sugerido (iterativo)
     const extra = new Array(H + 1).fill(0);
     const plano = [];
-    let from = 0;
+    // necessidades antes do lead time não são resolvidas por um pedido novo (ele não chega a tempo):
+    // a busca começa em hoje + lead time; o que falta antes disso vira alerta de "antecipar".
+    const ssBase = prm.seg * avg(0, 60);
+    const dEarly = firstBelow(S, ssBase, 0);
+    let from = Math.min(H + 1, prm.LT);
     for (let k = 0; k < 8; k++) {
       const px = project(extra), Sx = px.S;
-      const dNeed = firstBelow(Sx, prm.seg * avg(0, 60), from);
+      const dNeed = firstBelow(Sx, ssBase, from);
       if (dNeed < 0) break;
-      const idealPedido = dNeed - prm.LT;            // dias a partir de hoje (negativo = atrasado)
-      const arrivalD = Math.max(dNeed, prm.LT);      // pedido novo não chega antes do lead time
+      // se a falta já existia antes do lead time e continua até ele, o pedido ideal era antes de hoje
+      let idealPedido = dNeed - prm.LT;
+      if (k === 0 && dNeed === prm.LT && dEarly >= 0 && dEarly < prm.LT) idealPedido = dEarly - prm.LT;
+      const arrivalD = Math.max(dNeed, prm.LT);
       if (arrivalD > H) break;
       const before = arrivalD > 0 ? Sx[arrivalD - 1] : num(p.estoque);
       let need = 0; for (let d = arrivalD; d < Math.min(H + 1, arrivalD + prm.cob); d++) need += rates[d];
@@ -913,13 +920,16 @@ const MRPCore = (function () {
       dias = diffDays(today, prox.dataPedidoIdeal);
       status = dias < 0 ? 'atrasado' : dias <= 7 ? 'comprar' : dias <= 30 ? 'planejar' : 'ok';
     }
+    // falta antes de qualquer compra nova conseguir chegar, mas as ordens em aberto resolvem depois
+    let faltaAntesLT = 0; for (let d = 0; d < Math.min(H + 1, prm.LT); d++) faltaAntesLT += lost[d];
+    if (faltaAntesLT >= 1 && (status === 'ok' || status === 'planejar')) status = 'antecipar';
     if (avg30 <= 0 && !rates.some(x => x > 0)) status = 'sem_demanda';
     const custoBRL = num(p.custo) * taxaPrevisao(db, p.moeda);
     const cbmUn = num(p.m3Un) ? num(p.m3Un) : (num(p.cbmCx) && num(p.pcsCx)) ? num(p.cbmCx) / num(p.pcsCx) : num(p.pcsContainer) ? (num(db.settings.cbmContainer) || 68) / num(p.pcsContainer) : 0;
     const pesoUn = num(p.pesoUn);
     return {
       cod: p.cod, produto: p, prm, rates, arr, S, lost, perdaTotal, avg30, rupturaDia: rupt, ruptura: rupt >= 0 ? addDays(today, rupt) : null,
-      diasEstoque, coberturaComChegadas: rupt >= 0 ? rupt : null, abertas, totalAberto, atrasadas, plano, prox, status, diasParaPedido: dias,
+      diasEstoque, faltaAntesLT, coberturaComChegadas: rupt >= 0 ? rupt : null, abertas, totalAberto, atrasadas, plano, prox, status, diasParaPedido: dias,
       custoBRL, cbmUn, pesoUn, estoqueValor: num(p.estoque) * custoBRL
     };
   }
@@ -1023,7 +1033,7 @@ const f1 = v => (v === null || v === undefined || v === '' || isNaN(v)) ? '–' 
 const fd = s => { if (!s) return '–'; const [y, m, d] = s.split('-'); return `${d}/${m}/${y.slice(2)}`; };
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const uid = p => p + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-const STATUS_LBL = { atrasado: 'Atrasado', comprar: 'Comprar agora', planejar: 'Planejar', ok: 'OK', sem_demanda: 'Sem demanda' };
+const STATUS_LBL = { atrasado: 'Atrasado', comprar: 'Comprar agora', planejar: 'Planejar', antecipar: 'Antecipar ordem', ok: 'OK', sem_demanda: 'Sem demanda' };
 const badge = s => `<span class="badge b-${s}">${STATUS_LBL[s] || s}</span>`;
 const ORD_STATUS = ['Planejada', 'Simulação', 'Em produção', 'Em trânsito', 'Recebido', 'Cancelado'];
 const ordBadge = s => { const m = { 'Planejada': 'bg-violet-100 text-violet-700', 'Simulação': 'bg-slate-100 text-slate-600', 'Em produção': 'bg-amber-100 text-amber-700', 'Em trânsito': 'bg-sky-100 text-sky-700', 'Recebido': 'bg-emerald-100 text-emerald-700', 'Cancelado': 'bg-red-100 text-red-600' }; return `<span class="badge ${m[s] || 'bg-slate-100'}">${esc(s)}</span>`; };
@@ -1151,7 +1161,7 @@ function pgPainel(el) {
     </div>
   </div>`;
   const cnt = k => I.filter(x => x.status === k).length;
-  charts.st = new Chart(document.getElementById('chStatus'), { type: 'doughnut', data: { labels: ['Atrasado', 'Comprar agora', 'Planejar', 'OK', 'Sem demanda'], datasets: [{ data: ['atrasado', 'comprar', 'planejar', 'ok', 'sem_demanda'].map(cnt), backgroundColor: ['#ef4444', '#f97316', '#eab308', '#22c55e', '#cbd5e1'] }] }, options: { maintainAspectRatio: false, plugins: { legend: { position: 'right' } } } });
+  charts.st = new Chart(document.getElementById('chStatus'), { type: 'doughnut', data: { labels: ['Atrasado', 'Comprar agora', 'Planejar', 'Antecipar ordem', 'OK', 'Sem demanda'], datasets: [{ data: ['atrasado', 'comprar', 'planejar', 'antecipar', 'ok', 'sem_demanda'].map(cnt), backgroundColor: ['#ef4444', '#f97316', '#eab308', '#db2777', '#22c55e', '#cbd5e1'] }] }, options: { maintainAspectRatio: false, plugins: { legend: { position: 'right' } } } });
   const fams = uniq(I.map(x => x.produto.familia));
   const famData = fams.map(f => { const xs = I.filter(x => x.produto.familia === f && x.avg30 > 0); const s = xs.reduce((a, x) => a + C.num(x.produto.estoque), 0), d = xs.reduce((a, x) => a + x.avg30, 0); return d ? Math.round(s / d) : 0; });
   charts.fam = new Chart(document.getElementById('chFam'), { type: 'bar', data: { labels: fams, datasets: [{ label: 'dias', data: famData, backgroundColor: famData.map(v => v < 60 ? '#f97316' : v < 120 ? '#0ea5e9' : '#94a3b8') }] }, options: { maintainAspectRatio: false, indexAxis: 'y', plugins: { legend: { display: false } } } });
@@ -1164,14 +1174,14 @@ function pgMRP(el) {
   const q = F.q.toLowerCase();
   rows = rows.filter(x => (!q || (x.cod + ' ' + x.produto.desc).toLowerCase().includes(q)) && (!F.familia || x.produto.familia === F.familia) && (!F.fornecedor || x.produto.fornecedor === F.fornecedor)
     && (!F.status || (F.status === 'ruptura30' ? (x.rupturaDia >= 0 && x.rupturaDia <= 30) : F.status === 'ruptura' ? x.rupturaDia >= 0 : x.status === F.status)));
-  rows = sortRows('mrp', rows, { cod: x => x.cod, fam: x => x.produto.familia, forn: x => x.produto.fornecedor, est: x => C.num(x.produto.estoque), dem: x => x.avg30, dias: x => x.diasEstoque, aberto: x => x.totalAberto, rupt: x => x.rupturaDia >= 0 ? x.rupturaDia : 99999, ped: x => x.prox ? x.prox.dataPedidoIdeal : 'zzz', qtd: x => x.prox?.qtd, st: x => ['atrasado', 'comprar', 'planejar', 'ok', 'sem_demanda'].indexOf(x.status) });
+  rows = sortRows('mrp', rows, { cod: x => x.cod, fam: x => x.produto.familia, forn: x => x.produto.fornecedor, est: x => C.num(x.produto.estoque), dem: x => x.avg30, dias: x => x.diasEstoque, aberto: x => x.totalAberto, rupt: x => x.rupturaDia >= 0 ? x.rupturaDia : 99999, ped: x => x.prox ? x.prox.dataPedidoIdeal : 'zzz', qtd: x => x.prox?.qtd, st: x => ['atrasado', 'comprar', 'antecipar', 'planejar', 'ok', 'sem_demanda'].indexOf(x.status) });
   if (!ui.sort.mrp) rows = [...rows].sort((a, b) => (a.rupturaDia >= 0 ? a.rupturaDia : 99999) - (b.rupturaDia >= 0 ? b.rupturaDia : 99999));
   el.innerHTML = `
   <div class="flex flex-wrap gap-2 mb-3 items-center">
     <input id="fq" placeholder="Buscar código ou descrição" value="${esc(F.q)}" class="border rounded-lg px-3 py-1.5 w-64">
     <select id="ffam" class="border rounded-lg px-2 py-1.5"><option value="">Todas as famílias</option>${uniq(DB.produtos.map(p => p.familia)).map(f => opt(f, F.familia)).join('')}</select>
     <select id="fforn" class="border rounded-lg px-2 py-1.5"><option value="">Todos os fornecedores</option>${uniq(DB.produtos.map(p => p.fornecedor)).map(f => opt(f, F.fornecedor)).join('')}</select>
-    <select id="fst" class="border rounded-lg px-2 py-1.5">${[['', 'Todas as situações'], ['ruptura30', 'Ruptura em 30 dias'], ['ruptura', 'Com ruptura no horizonte'], ['atrasado', 'Pedido atrasado'], ['comprar', 'Comprar agora'], ['planejar', 'Planejar'], ['ok', 'OK'], ['sem_demanda', 'Sem demanda']].map(([v, l]) => opt(v, F.status, l)).join('')}</select>
+    <select id="fst" class="border rounded-lg px-2 py-1.5">${[['', 'Todas as situações'], ['ruptura30', 'Ruptura em 30 dias'], ['ruptura', 'Com ruptura no horizonte'], ['atrasado', 'Pedido atrasado'], ['comprar', 'Comprar agora'], ['planejar', 'Planejar'], ['antecipar', 'Antecipar ordem (falta antes da chegada)'], ['ok', 'OK'], ['sem_demanda', 'Sem demanda']].map(([v, l]) => opt(v, F.status, l)).join('')}</select>
     <span class="text-slate-500 text-xs ml-1">${rows.length} itens</span>
     <button onclick="exportMRP()" class="ml-auto border rounded-lg px-3 py-1.5 bg-white hover:bg-slate-50">Exportar Excel</button>
   </div>
@@ -1228,7 +1238,7 @@ function openItem(cod) {
       <table class="w-full text-xs"><thead><tr class="text-left text-slate-500"><th>Pedir até</th><th>Chegada</th><th class="num">Qtd</th><th></th></tr></thead><tbody>
       ${x.plano.map((pl, i) => `<tr class="border-t"><td class="py-1 ${pl.atrasado ? 'text-red-600 font-semibold' : ''}">${fd(pl.dataPedidoIdeal)}${pl.atrasado ? ' (atrasado)' : ''}</td><td>${fd(pl.dataChegada)}${pl.rupturaAntes ? ' <span class="text-red-500" title="há falta antes desta chegada">⚠</span>' : ''}</td><td class="num font-semibold">${f0(pl.qtd)}${pl.parcelas && pl.parcelas.length > 1 ? `<div class="font-normal text-[10px] text-slate-500">${pl.parcelas.map(pc => f0(pc.qtd) + ' em ' + fd(pc.dataChegada)).join(' · ')}</div>` : ''}</td><td class="text-right">${i === 0 ? `<button class="text-sky-700 underline" onclick="criarPlanejada(['${esc(cod)}'])">criar ordem</button>` : ''}</td></tr>`).join('') || '<tr><td class="text-slate-400 py-1" colspan=4>Nenhuma compra necessária no horizonte</td></tr>'}
       </tbody></table>
-      ${x.prox?.faltaAntes >= 1 ? `<div class="mt-2 text-[11px] text-red-600">Mesmo comprando hoje, faltam ≈ ${f0(x.prox.faltaAntes)} pç até a chegada (venda perdida). Avalie embarque aéreo, antecipar uma PO em aberto ou substituto.</div>` : ''}
+      ${x.faltaAntesLT >= 1 ? `<div class="mt-2 text-[11px] text-red-600">Uma compra feita hoje só chega em ${fd(C.addDays(t, x.prm.LT))} (lead time de ${x.prm.LT} dias). Até lá faltam ≈ <b>${f0(x.faltaAntesLT)} pç</b> (venda perdida), e comprar mais não resolve. Avalie antecipar uma ordem em aberto, embarque aéreo ou produto substituto.</div>` : ''}
       <div class="font-semibold mt-4 mb-1">Ordens em aberto</div>
       <table class="w-full text-xs"><tbody>${x.abertas.map(o => `<tr class="border-t"><td class="py-1">${esc(o.po || '—')}</td><td>${ordBadge(o.status)}</td><td>${fd(o.dataChegada)}${o.dataChegada && o.dataChegada < t ? ' <span class="text-red-500">vencida</span>' : ''}</td><td class="num">${f0(o.aberto)}</td></tr>`).join('') || '<tr><td class="text-slate-400 py-1">Nenhuma</td></tr>'}</tbody></table>
       <div class="font-semibold mt-4 mb-1">Usado nos produtos de venda</div>
