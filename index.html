@@ -1340,7 +1340,7 @@ function sugModoSwitch() {
 }
 function qtdSug(x) { const o = (ui.sugQtd || {})[x.cod]; return o !== undefined && o !== null && o !== '' ? Number(o) : x.prox.qtd; }
 function pgSugGeral(el) {
-  const F = ui.sugFiltro; ui.sugQtd = ui.sugQtd || {};
+  const F = ui.sugFiltro; ui.sugQtd = ui.sugQtd || {}; window._sugLines = new Map();
   let rows = sugRows();
   rows = sortRows('sugg', rows, { cod: x => x.cod, fam: x => x.produto.familia, forn: x => x.produto.fornecedor, est: x => C.num(x.produto.estoque), dem: x => x.avg30, rupt: x => x.rupturaDia >= 0 ? x.rupturaDia : 99999, ped: x => x.prox.dataPedidoIdeal, qtd: x => qtdSug(x), val: x => qtdSug(x) * x.custoBRL, st: x => ['atrasado', 'comprar', 'planejar', 'ok'].indexOf(x.status) });
   if (!ui.sort.sugg) rows = [...rows].sort((a, b) => a.prox.dataPedidoIdeal.localeCompare(b.prox.dataPedidoIdeal) || (a.rupturaDia >= 0 ? a.rupturaDia : 99999) - (b.rupturaDia >= 0 ? b.rupturaDia : 99999));
@@ -1470,7 +1470,7 @@ function criarPlanejada(cods) {
   const t = R.opts.today; let n = 0; const L = window._sugLines || new Map();
   cods.forEach(cod => {
     const x = R.byCod.get(cod); if (!x) return;
-    const l = L.get(cod);
+    const l0 = L.get(cod); const l = l0 && l0.x === x ? l0 : null; // ignora linha de uma tela antiga (cálculo já mudou)
     const qtd = l ? l.qFinal : ((ui.sugQtd || {})[cod] ?? x.prox?.qtd);
     if (!qtd) return;
     const dp0 = l ? l.dataPedido : (x.prox?.dataPedido || t); const dp = dp0 < t ? t : dp0;
