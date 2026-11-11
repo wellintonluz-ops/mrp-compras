@@ -1001,7 +1001,7 @@ const STATUS_LBL = { atrasado: 'Atrasado', comprar: 'Comprar agora', planejar: '
 const badge = s => `<span class="badge b-${s}">${STATUS_LBL[s] || s}</span>`;
 const ORD_STATUS = ['Planejada', 'Simulação', 'Em produção', 'Em trânsito', 'Recebido', 'Cancelado'];
 const ordBadge = s => { const m = { 'Planejada': 'bg-violet-100 text-violet-700', 'Simulação': 'bg-slate-100 text-slate-600', 'Em produção': 'bg-amber-100 text-amber-700', 'Em trânsito': 'bg-sky-100 text-sky-700', 'Recebido': 'bg-emerald-100 text-emerald-700', 'Cancelado': 'bg-red-100 text-red-600' }; return `<span class="badge ${m[s] || 'bg-slate-100'}">${esc(s)}</span>`; };
-function toast(msg, ms = 2500) { const t = document.getElementById('toast'); t.textContent = msg; t.style.opacity = 1; clearTimeout(t._h); t._h = setTimeout(() => t.style.opacity = 0, ms); }
+function toast(msg, ms = 2500) { const t = document.getElementById('toast'); t.textContent = msg; t.style.pointerEvents = 'none'; t.style.opacity = 1; clearTimeout(t._h); t._h = setTimeout(() => t.style.opacity = 0, ms); }
 function openModal(title, html, width = 'max-w-5xl') { document.getElementById('modalTitle').innerHTML = title; document.getElementById('modalBody').innerHTML = html; const b = document.getElementById('modalBox'); b.className = 'bg-white rounded-xl shadow-2xl w-full mx-4 ' + width; document.getElementById('modal').classList.remove('hidden'); }
 function closeModal() { document.getElementById('modal').classList.add('hidden'); Object.keys(charts).filter(k => k.startsWith('m_')).forEach(k => { charts[k].destroy(); delete charts[k]; }); }
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
@@ -1343,6 +1343,7 @@ function pgOrdens(el) {
     <select id="ofo" class="border rounded-lg px-2 py-1.5"><option value="">Todos os fornecedores</option>${uniq(DB.ordens.map(o => o.fornecedor)).map(f => opt(f, F.fornecedor)).join('')}</select>
     <span class="text-xs text-slate-500">${rows.length} linhas · ${f0(rows.reduce((s, o) => s + C.num(o.qtd) - C.num(o.qtdRecebida), 0))} pç em aberto</span>
     <div class="ml-auto flex gap-2">
+      <button onclick="excluirOrdens()" class="border border-red-200 text-red-600 rounded-lg px-3 py-1.5 bg-white hover:bg-red-50">Excluir selecionados</button>
       <button onclick="bulkStatus()" class="border rounded-lg px-3 py-1.5 bg-white hover:bg-slate-50">Alterar selecionados (status / câmbio)</button>
       <button onclick="editOrdem()" class="rounded-lg px-3 py-1.5 bg-sky-600 text-white hover:bg-sky-700">+ Nova linha de ordem</button>
     </div>
@@ -1395,6 +1396,26 @@ function saveOrdem(id) {
   closeModal(); changed('ordens'); toast('Ordem salva');
 }
 function delOrdem(id) { if (!confirm('Excluir esta linha de ordem?')) return; DB.ordens = DB.ordens.filter(o => o.id !== id); closeModal(); changed('ordens'); }
+function excluirOrdens() {
+  const ids = [...document.querySelectorAll('.ordck:checked')].map(c => c.value);
+  if (!ids.length) { toast('Selecione as linhas que deseja excluir'); return; }
+  const sel = DB.ordens.filter(o => ids.includes(o.id));
+  const pos = uniq(sel.map(o => o.po || '—'));
+  if (!confirm(`Excluir ${sel.length} linha(s) de ordem de compra?\n\nPO(s): ${pos.slice(0, 8).join(', ')}${pos.length > 8 ? '…' : ''}\nTotal: ${f0(sel.reduce((a, o) => a + C.num(o.qtd), 0))} peças\n\nO MRP e as sugestões serão recalculados.`)) return;
+  window._ordensExcluidas = sel;
+  DB.ordens = DB.ordens.filter(o => !ids.includes(o.id));
+  changed('ordens');
+  const t = document.getElementById('toast');
+  t.innerHTML = `${sel.length} linha(s) excluída(s) · <button class="underline font-semibold text-sky-300" onclick="desfazerExclusao()">Desfazer</button>`;
+  t.style.opacity = 1; t.style.pointerEvents = 'auto'; clearTimeout(t._h);
+  t._h = setTimeout(() => { t.style.opacity = 0; t.style.pointerEvents = 'none'; window._ordensExcluidas = null; }, 10000);
+}
+function desfazerExclusao() {
+  const sel = window._ordensExcluidas; if (!sel) return;
+  DB.ordens.push(...sel); window._ordensExcluidas = null;
+  const t = document.getElementById('toast'); t.style.pointerEvents = 'none';
+  changed('ordens'); toast(`${sel.length} linha(s) restaurada(s)`);
+}
 function bulkStatus() {
   const ids = [...document.querySelectorAll('.ordck:checked')].map(c => c.value);
   if (!ids.length) { toast('Selecione linhas'); return; }
