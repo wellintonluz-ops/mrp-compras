@@ -119,7 +119,7 @@ const MRPCore = (function () {
     return {
       settings: {
         horizonte: 240, segurancaDias: 30, coberturaDias: 60, leadTimePadrao: 45, transitPadrao: 35,
-        desembaracoDias: 0, cbmContainer: 68, containers: { "20'": 28, "40'": 58 }, pesoMaxContainer: { "20'": 25000, "40'": 26500, '40HC': 26500 }, containerPadrao: '40HC', medidasUrl: '', coberturaMaxDias: 180, janelaCaronaDias: 60, incluirSimulacoes: true, dataBase: '',
+        desembaracoDias: 0, cbmContainer: 68, containers: { "20'": 28, "40'": 58 }, pesoMaxContainer: { "20'": 25000, "40'": 26500, '40HC': 26500 }, containerPadrao: '40HC', medidasUrl: '', estoqueSomarAcabados: true, coberturaMaxDias: 180, janelaCaronaDias: 60, incluirSimulacoes: true, dataBase: '',
         cambio: { USD: 5.40, CNY: 0.76, BRL: 1 }, cambioFonte: 'comercial', cambioMargem: 0, cambioInfo: null, workerUrl: ''
       },
       produtos: [],     // itens comprados (MP)
@@ -129,6 +129,7 @@ const MRPCore = (function () {
       embarques: [],    // follow-up de navios
       fornecedores: [], // {nome, leadTime, transitTime, moeda, contato, linha}
       vendas: null,     // vendas efetivas agregadas por SKU/dia
+      estoqueSnap: null, // último relatório de estoque corrente (saldo por SKU)
       estoqueAtualizadoEm: null
     };
   }
@@ -569,6 +570,53 @@ const MRPCore = (function () {
 
 
 
+
+  // ---------- estoque corrente (relatório do ERP) ----------
+  // lê SKU + "Total disponível para venda"; guarda só os SKUs que interessam ao MRP (itens e produtos da estrutura)
+  function parseEstoqueCorrente(XLSX, wb, db, arquivo) {
+    const ws = wb.Sheets[wb.SheetNames.find(n => /estoque|stock/i.test(n)) || wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: '' });
+    let hdr = -1, cSku = -1, cDisp = -1, cLoc = -1, cExt = -1, cFull = -1, cTipo = -1;
+    for (let i = 0; i < Math.min(rows.length, 30); i++) {
+      const hs = (rows[i] || []).map(normH);
+      const sk = hs.findIndex(h => h === 'sku' || h === 'codigo' || h === 'cod');
+      let dp = hs.findIndex(h => h.startsWith('totaldisponivel'));
+      if (dp < 0) dp = hs.findIndex(h => h.includes('disponivel') || h === 'saldo' || h === 'estoque');
+      if (sk >= 0 && dp >= 0) { hdr = i; cSku = sk; cDisp = dp; cLoc = hs.findIndex(h => h.startsWith('fisicolocal')); cExt = hs.findIndex(h => h.startsWith('fisicoexterno')); cFull = hs.findIndex(h => h.startsWith('fisicofull')); cTipo = hs.findIndex(h => h === 'tipo'); break; }
+    }
+    if (hdr < 0) throw new Error('Não encontrei as colunas "SKU" e "Total disponível para venda".');
+    const rel = new Set([...db.produtos.map(p => p.cod), ...db.estrutura.map(e => e.pa)]);
+    const skus = {}; let lidos = 0;
+    for (let i = hdr + 1; i < rows.length; i++) {
+      const r = rows[i]; const sku = str(r[cSku]); if (!sku) continue; lidos++;
+      if (!rel.has(sku)) continue;
+      skus[sku] = { disp: num(r[cDisp]), local: cLoc >= 0 ? num(r[cLoc]) : null, ext: cExt >= 0 ? num(r[cExt]) : null, full: cFull >= 0 ? num(r[cFull]) : null, tipo: cTipo >= 0 ? str(r[cTipo]) : '' };
+    }
+    const m = String(arquivo || '').match(/(20\d{2})(\d{2})(\d{2})/);
+    const data = m ? `${m[1]}-${m[2]}-${m[3]}` : todayISO();
+    return { data, arquivo: arquivo || '', importadoEm: new Date().toISOString(), lidos, skus };
+  }
+  // estoque do componente = saldo próprio + (produtos acabados × quantidade na estrutura)
+  function aplicarEstoque(db) {
+    const S = db.estoqueSnap; if (!S) return null;
+    const somar = db.settings.estoqueSomarAcabados !== false;
+    const res = { semSaldo: [], comAcabados: 0 };
+    db.produtos.forEach(p => {
+      const own = S.skus[p.cod] ? num(S.skus[p.cod].disp) : 0;
+      if (!S.skus[p.cod]) res.semSaldo.push(p.cod);
+      let acab = 0; const det = [];
+      if (somar) db.estrutura.forEach(e => {
+        if (e.mp !== p.cod || e.pa === p.cod || !S.skus[e.pa]) return;
+        const v = num(S.skus[e.pa].disp) * num(e.qtd); if (!v) return;
+        acab += v; det.push(`${e.pa}: ${num(S.skus[e.pa].disp)} × ${num(e.qtd)}`);
+      });
+      p.estoqueProprio = own; p.estoqueAcabados = acab; p.estoqueDet = det; p.estoque = own + acab;
+      if (acab) res.comAcabados++;
+    });
+    db.estoqueAtualizadoEm = S.data;
+    return res;
+  }
+
   // ---------- medidas e pesos (tabela de dimensões dos produtos) ----------
   const dec = v => { if (typeof v === 'number') return v; let t = str(v).replace(/\s/g, ''); if (!t) return 0; if (t.includes(',')) t = t.replace(/\./g, '').replace(',', '.'); const x = parseFloat(t); return isFinite(x) ? x : 0; };
   function parseMedidas(rowsProvider) {
@@ -824,7 +872,7 @@ const MRPCore = (function () {
     const res = db.produtos.filter(p => p.ativo !== false).map(p => computeItem(db, idx, p, opts));
     return { opts, itens: res, byCod: new Map(res.map(r => [r.cod, r])) };
   }
-  return { parseMedidasCSV, parseMedidasSheet, aplicarMedidas, pesoMaxContainer, fecharPedidos, capacidadeContainer, parseVendasCSV, parseVendasSheet, mergeVendas, sugerirVinculos, analisarVendas, serieSemanal, taxaPrevisao, valorOrdem, emptyDB, importWorkbook, importStock, computeAll, computeItem, buildDemandIndex, itemParams, addDays, diffDays, todayISO, serialToISO, num, str };
+  return { parseEstoqueCorrente, aplicarEstoque, parseMedidasCSV, parseMedidasSheet, aplicarMedidas, pesoMaxContainer, fecharPedidos, capacidadeContainer, parseVendasCSV, parseVendasSheet, mergeVendas, sugerirVinculos, analisarVendas, serieSemanal, taxaPrevisao, valorOrdem, emptyDB, importWorkbook, importStock, computeAll, computeItem, buildDemandIndex, itemParams, addDays, diffDays, todayISO, serialToISO, num, str };
 })();
 
 
@@ -837,7 +885,7 @@ const FIREBASE_CONFIG = null;
 const DOMINIO_PERMITIDO = 'grupotbx.com.br';
 const COLECAO = 'mrp';                 // coleção do Firestore
 const LOCAL_KEY = 'mrp_tbx_v1';
-const DATASETS = ['settings', 'produtos', 'estrutura', 'previsao', 'ordens', 'embarques', 'fornecedores', 'vendas', 'meta'];
+const DATASETS = ['settings', 'produtos', 'estrutura', 'previsao', 'ordens', 'embarques', 'fornecedores', 'vendas', 'estoque', 'meta'];
 
 /* ================= ESTADO ================= */
 const C = MRPCore;
@@ -876,7 +924,7 @@ const Store = {
     const base = C.emptyDB();
     if (this.mode === 'firebase') {
       const snaps = await Promise.all(DATASETS.map(k => fsdb.collection(COLECAO).doc(k).get()));
-      snaps.forEach((s, i) => { const k = DATASETS[i]; if (s.exists) { const d = s.data(); if (k === 'settings') base.settings = { ...base.settings, ...d.v, cambio: { ...base.settings.cambio, ...(d.v?.cambio || {}) } }; else if (k === 'meta') base.estoqueAtualizadoEm = d.v?.estoqueAtualizadoEm || null; else if (k === 'vendas') base.vendas = d.v || null; else base[k] = d.v || []; } });
+      snaps.forEach((s, i) => { const k = DATASETS[i]; if (s.exists) { const d = s.data(); if (k === 'settings') base.settings = { ...base.settings, ...d.v, cambio: { ...base.settings.cambio, ...(d.v?.cambio || {}) } }; else if (k === 'meta') base.estoqueAtualizadoEm = d.v?.estoqueAtualizadoEm || null; else if (k === 'vendas') base.vendas = d.v || null; else if (k === 'estoque') base.estoqueSnap = d.v || null; else base[k] = d.v || []; } });
     } else {
       try { const raw = localStorage.getItem(LOCAL_KEY); if (raw) { const d = JSON.parse(raw); Object.assign(base, d); base.settings = { ...C.emptyDB().settings, ...d.settings, cambio: { ...C.emptyDB().settings.cambio, ...(d.settings?.cambio || {}) } }; } } catch (e) { console.warn(e); }
     }
@@ -895,7 +943,7 @@ const Store = {
       if (this.mode === 'firebase') {
         const batch = fsdb.batch();
         keys.forEach(k => {
-          const v = k === 'meta' ? { estoqueAtualizadoEm: DB.estoqueAtualizadoEm } : DB[k];
+          const v = k === 'meta' ? { estoqueAtualizadoEm: DB.estoqueAtualizadoEm } : k === 'estoque' ? DB.estoqueSnap : DB[k];
           batch.set(fsdb.collection(COLECAO).doc(k), { v: JSON.parse(JSON.stringify(v ?? null)), em: firebase.firestore.FieldValue.serverTimestamp(), por: user?.email || '' });
         });
         await batch.commit();
@@ -939,7 +987,7 @@ function setSort(key, col) { const s = ui.sort[key]; ui.sort[key] = s && s.col =
 function download(name, content, type = 'application/json') { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([content], { type })); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); }
 
 /* ================= CÁLCULO ================= */
-function recalc() { R = C.computeAll(DB); try { R.vendas = DB.vendas ? C.analisarVendas(DB, R, ui.vendOpts) : null; } catch (e) { console.error(e); R.vendas = null; } }
+function recalc() { if (DB.estoqueSnap) { try { C.aplicarEstoque(DB); } catch (e) { console.error(e); } } R = C.computeAll(DB); try { R.vendas = DB.vendas ? C.analisarVendas(DB, R, ui.vendOpts) : null; } catch (e) { console.error(e); R.vendas = null; } }
 function prodByCod(cod) { return DB.produtos.find(p => p.cod === cod); }
 
 /* ================= NAVEGAÇÃO ================= */
@@ -979,7 +1027,7 @@ function render() {
   const base = DB.settings.dataBase ? `<span class="text-amber-600 font-semibold">Data-base simulada: ${fd(DB.settings.dataBase)}</span>` : `Data-base: hoje (${fd(hoje())})`;
   const ci = DB.settings.cambioInfo, fonteLbl = { comercial: 'comercial', ptax: 'PTAX', manual: 'manual' }[DB.settings.cambioFonte] || '';
   const cambioTxt = ` · <span title="${ci?.em ? 'Atualizado em ' + new Date(ci.em).toLocaleString('pt-BR') : ''}${ci?.erro ? ' · ' + esc(ci.erro) : ''}">USD ${nf2.format(DB.settings.cambio.USD)} · CNY ${nf2.format(DB.settings.cambio.CNY)} <span class="${ci?.erro ? 'text-red-500' : 'text-slate-400'}">(${fonteLbl}${ci?.erro ? ' ⚠' : ''})</span></span>`;
-  document.getElementById('baseInfo').innerHTML = base + cambioTxt + (DB.estoqueAtualizadoEm ? ` · Estoque atualizado em ${fd(DB.estoqueAtualizadoEm)}` : (DB.produtos.length ? ' · <span class="text-amber-600">Estoque da planilha importada</span>' : ''));
+  document.getElementById('baseInfo').innerHTML = base + cambioTxt + (DB.estoqueAtualizadoEm ? ` · Estoque de ${fd(DB.estoqueAtualizadoEm)}` : (DB.produtos.length ? ' · <span class="text-amber-600">Estoque da planilha importada</span>' : ''));
   document.getElementById('modeInfo').innerHTML = Store.mode === 'firebase' ? '<span class="text-emerald-400">● Nuvem (Firebase)</span>' : '<span class="text-amber-400">● Modo local (este navegador)</span>';
   const fn = { painel: pgPainel, mrp: pgMRP, sugestoes: pgSugestoes, ordens: pgOrdens, embarques: pgEmbarques, previsao: pgPrevisao, vendas: pgVendas, cadastros: pgCadastros, importar: pgImportar, ia: pgIA, config: pgConfig }[page] || pgPainel;
   fn(document.getElementById('page'));
@@ -1075,7 +1123,7 @@ function pgMRP(el) {
   <tbody>${rows.map(x => `<tr class="border-t hover:bg-sky-50 cursor-pointer" onclick="openItem('${esc(x.cod)}')">
     <td class="px-2 py-1.5"><div class="font-semibold">${esc(x.cod)}</div><div class="text-slate-400 truncate max-w-[260px]" title="${esc(x.produto.desc)}">${esc(x.produto.desc)}</div></td>
     <td class="px-2">${esc(x.produto.familia)}</td><td class="px-2">${esc(x.produto.fornecedor)}</td>
-    <td class="px-2 num ${C.num(x.produto.estoque) <= 0 ? 'text-red-600 font-semibold' : ''}">${f0(x.produto.estoque)}</td>
+    <td class="px-2 num ${C.num(x.produto.estoque) <= 0 ? 'text-red-600 font-semibold' : ''}" title="${x.produto.estoqueAcabados ? 'Próprio ' + f0(x.produto.estoqueProprio) + ' + produtos acabados ' + f0(x.produto.estoqueAcabados) : ''}">${f0(x.produto.estoque)}${x.produto.estoqueAcabados ? '<span class="text-slate-400">*</span>' : ''}</td>
     <td class="px-2 num">${f1(x.avg30)}</td><td class="px-2 num">${x.diasEstoque === null ? '–' : (x.diasEstoque >= R.opts.horizonte ? '>' + R.opts.horizonte : f0(x.diasEstoque))}</td>
     <td class="px-2 num">${x.totalAberto ? f0(x.totalAberto) : '–'}${x.atrasadas ? ' <span class="text-red-500" title="chegada vencida">⚠</span>' : ''}</td>
     <td class="px-2 ${x.rupturaDia >= 0 && x.rupturaDia <= 30 ? 'text-red-600 font-semibold' : ''}">${x.ruptura ? fd(x.ruptura) + ` <span class="text-slate-400">(${x.rupturaDia}d)</span>` : '<span class="text-slate-400">sem ruptura</span>'}</td>
@@ -1112,9 +1160,10 @@ function openItem(cod) {
     <div>
       <div class="font-semibold mb-1">Parâmetros de compra</div>
       <div class="grid grid-cols-3 gap-2 text-xs">
-        ${[['leadTime', 'Lead time produção (d)', x.prm.leadTime], ['transitTime', 'Trânsito (d)', x.prm.transitTime], ['multiplo', 'Múltiplo de compra', x.prm.mult], ['segurancaDias', 'Estoque segurança (dias)', x.prm.seg], ['coberturaDias', 'Cobertura por pedido (dias)', x.prm.cob], ['estoque', 'Estoque atual', p.estoque]].map(([k, l, v]) => `<label class="block"><span class="text-slate-500">${l}</span><input type="number" step="any" class="w-full border rounded px-2 py-1" value="${v ?? ''}" onchange="setItemParam('${esc(cod)}','${k}',this.value)"></label>`).join('')}
+        ${[['leadTime', 'Lead time produção (d)', x.prm.leadTime], ['transitTime', 'Trânsito (d)', x.prm.transitTime], ['multiplo', 'Múltiplo de compra', x.prm.mult], ['segurancaDias', 'Estoque segurança (dias)', x.prm.seg], ['coberturaDias', 'Cobertura por pedido (dias)', x.prm.cob], ['estoque', 'Estoque atual', p.estoque]].map(([k, l, v]) => { const ro = k === 'estoque' && DB.estoqueSnap; return `<label class="block"><span class="text-slate-500">${l}</span><input type="number" step="any" class="w-full border rounded px-2 py-1 ${ro ? 'bg-slate-100' : ''}" value="${v ?? ''}" ${ro ? 'disabled title="Vem do relatório de estoque corrente"' : ''} onchange="setItemParam('${esc(cod)}','${k}',this.value)"></label>`; }).join('')}
       </div>
       ${(p.cotacoes || []).length > 1 ? `<div class="text-[11px] text-slate-600 mt-2">Cotações: ${p.cotacoes.map(c => `<span class="${c.fornecedor === p.fornecedor ? 'font-semibold' : ''}">${esc(c.fornecedor)} ${c.moeda} ${nf2.format(c.custo)}</span>`).join(' · ')}</div>` : ''}
+      ${DB.estoqueSnap ? `<div class="text-[11px] text-slate-600 mt-2">Estoque de ${fd(DB.estoqueSnap.data)}: próprio <b>${f0(p.estoqueProprio)}</b>${p.estoqueAcabados ? ` + em produtos acabados <b>${f0(p.estoqueAcabados)}</b> <span class="text-slate-400">(${esc((p.estoqueDet || []).join(' · '))})</span>` : ''}</div>` : ''}
       <div class="text-[11px] text-slate-400 mt-1">Lead time total considerado: ${x.prm.LT} dias (produção + trânsito${x.prm.desembaraco ? ' + desembaraço' : ''}). Estoque de segurança ≈ ${f0(ssQ)} pç.</div>
       <div class="font-semibold mt-4 mb-1">Plano de compras sugerido</div>
       <table class="w-full text-xs"><thead><tr class="text-left text-slate-500"><th>Pedir até</th><th>Chegada</th><th class="num">Qtd</th><th></th></tr></thead><tbody>
@@ -1466,7 +1515,9 @@ function pgImportar(el) {
   const card = (t, d, body) => `<div class="bg-white rounded-xl shadow-sm border p-5"><div class="font-bold text-base">${t}</div><div class="text-xs text-slate-500 mt-1 mb-3">${d}</div>${body}</div>`;
   el.innerHTML = `<div class="grid md:grid-cols-2 gap-4 max-w-5xl">
   ${card('1. Planilha MRP atual (.xlsb / .xlsx)', 'Migração completa: lê as abas MRP, Structure, Forecast, Stock_Structure, Stock_System, COSTS, Tab_CBM, Purchase_Order, Suppliers e Follow-up. <b>Substitui todos os dados do site</b> (as configurações são mantidas).', `<input type="file" id="fMRP" accept=".xlsb,.xlsx,.xlsm" class="text-xs"><div id="logMRP" class="text-xs mt-3 text-slate-600 whitespace-pre-line"></div>`)}
-  ${card('2. Atualizar estoque (export do ERP)', 'Planilha com as colunas <b>SKU</b> e <b>Total disponível</b> (formato da aba Stock_System / relatório de estoque do Olist). Atualiza só o estoque dos itens do cadastro.', `<input type="file" id="fEst" accept=".xlsx,.xls,.xlsb,.csv" class="text-xs"><div id="logEst" class="text-xs mt-3 text-slate-600 whitespace-pre-line"></div>`)}
+  ${card('2. Estoque atual (relatório Estoque Corrente)', 'Relatório de estoque corrente do ERP (.xlsx). Usa a coluna <b>Total disponível para venda</b> (Local + Full − DVG − bloqueados − reserva) de cada SKU. A data do estoque é lida do nome do arquivo.', `<input type="file" id="fEst" accept=".xlsx,.xls,.xlsb,.csv" class="text-xs">
+    <label class="flex items-start gap-2 text-xs mt-2"><input type="checkbox" class="mt-0.5" ${DB.settings.estoqueSomarAcabados !== false ? 'checked' : ''} onchange="DB.settings.estoqueSomarAcabados=this.checked;changed('settings','produtos')"> <span>Somar o estoque de <b>produtos acabados</b> aos componentes pela estrutura (ex.: 1.055 pacotes PBG0007-5 × 40 = 42.200 PPBG0007), como fazia a planilha. Assim o MRP não compra componente que já está pronto em produto acabado.</span></label>
+    <div id="logEst" class="text-xs mt-3 text-slate-600 whitespace-pre-line">${DB.estoqueSnap ? `Estoque no site: <b>${fd(DB.estoqueSnap.data)}</b> (${esc(DB.estoqueSnap.arquivo)}) · ${Object.keys(DB.estoqueSnap.skus).length} SKUs usados` : ''}</div>`)}
   ${card('3. Relatório de vendas (efetivo)', 'Export de vendas do e-commerce (CSV ou Excel) com as colunas <b>Data do pedido</b>, <b>SKU</b>, <b>Qtd</b>, <b>Status expedição</b> e <b>Canal</b>. Pedidos cancelados são ignorados; vendas de "Proposta comercial" ficam separadas. Só os totais por SKU e dia são guardados (nenhum dado de cliente). Importar um novo período substitui apenas os dias daquele período.', `<input type="file" id="fVend" accept=".csv,.txt,.xlsx,.xls" class="text-xs"><div id="logVend" class="text-xs mt-3 text-slate-600 whitespace-pre-line">${DB.vendas ? `Histórico no site: ${fd(DB.vendas.base)} a ${fd(C.addDays(DB.vendas.base, DB.vendas.dias - 1))} · ${Object.keys(DB.vendas.skus).length} SKUs` : ''}</div><div id="vincBox"></div>`)}
   ${card('6. Medidas e pesos dos produtos', 'Tabela de dimensões (Peso, Largura, Altura, Comprimento, Cubagem) por código. Usada para calcular m³ e peso dos containers. Códigos de produto vendido são levados ao componente pela estrutura (ex.: PBG0007-5 ÷ 40 → PPBG0007).', `<div class="flex gap-2"><input id="medUrl" placeholder="Link da planilha Google" value="${esc(DB.settings.medidasUrl || '')}" class="border rounded px-2 py-1 text-xs flex-1"><button class="bg-sky-600 text-white rounded px-3 py-1 text-xs" onclick="buscarMedidasUrl()">Buscar</button></div>
     <div class="text-[11px] text-slate-500 mt-1">O link precisa estar compartilhado como "Qualquer pessoa com o link pode ver". Se não estiver, baixe a planilha (Arquivo → Fazer download → .xlsx ou .csv) e envie abaixo.</div>
@@ -1489,9 +1540,15 @@ function pgImportar(el) {
   };
   document.getElementById('fEst').onchange = async e => {
     const f = e.target.files[0]; if (!f) return; const log = document.getElementById('logEst');
-    try { const wb = XLSX.read(await f.arrayBuffer(), { type: 'array' }); const r = C.importStock(XLSX, wb, DB); recalc(); Store.save('produtos', 'meta'); renderNav();
-      log.innerHTML = `<b class="text-emerald-700">${r.atualizados} itens atualizados</b>` + (r.faltando.length ? `\nNão encontrados no arquivo (${r.faltando.length}): ${esc(r.faltando.slice(0, 40).join(', '))}${r.faltando.length > 40 ? '…' : ''}` : ''); }
-    catch (err) { log.innerHTML = '<span class="text-red-600">Erro: ' + esc(err.message) + '</span>'; }
+    if (!DB.produtos.length) { log.innerHTML = '<span class="text-red-600">Importe primeiro a planilha MRP (card 1) para ter o cadastro de itens.</span>'; return; }
+    log.textContent = 'Lendo relatório…';
+    try {
+      const snap = C.parseEstoqueCorrente(XLSX, XLSX.read(await f.arrayBuffer(), { type: 'array' }), DB, f.name);
+      DB.estoqueSnap = snap; const r = C.aplicarEstoque(DB); recalc(); Store.save('estoque', 'produtos', 'meta'); renderNav();
+      const dias = C.diffDays(snap.data, C.todayISO());
+      log.innerHTML = `<b class="text-emerald-700">Estoque atualizado — posição de ${fd(snap.data)}</b>${dias > 3 ? ` <span class="text-amber-700">(${dias} dias atrás)</span>` : ''}\n${f0(snap.lidos)} SKUs no relatório · ${Object.keys(snap.skus).length} usados pelo MRP · ${r.comAcabados} componentes somando produtos acabados${r.semSaldo.length ? `\n<span class="text-amber-700">${r.semSaldo.length} itens do MRP não estão no relatório (estoque considerado 0): ${r.semSaldo.slice(0, 30).map(esc).join(', ')}</span>` : ''}`;
+      toast('Estoque atualizado');
+    } catch (err) { console.error(err); log.innerHTML = '<span class="text-red-600">Erro: ' + esc(err.message) + '</span>'; }
   };
   document.getElementById('fVend').onchange = async e => {
     const f = e.target.files[0]; if (!f) return; const log = document.getElementById('logVend');

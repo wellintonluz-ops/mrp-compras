@@ -4,7 +4,7 @@ Planejamento de importação: estoque projetado dia a dia, ruptura, ordens de co
 
 ## Como usar
 1. Abra o site e vá em **Importar / Exportar**. Envie a planilha do MRP atual (.xlsb) para migrar itens, estrutura, previsão, estoque, ordens e embarques.
-2. Atualize o estoque com o export do ERP (colunas **SKU** e **Total disponível**).
+2. Atualize o estoque com o relatório **Estoque Corrente** do ERP (colunas **SKU** e **Total disponível para venda**). A data do estoque é lida do nome do arquivo e, por padrão, o estoque de produtos acabados é somado aos componentes pela estrutura (ex.: PBG0007-5 × 40 → PPBG0007).
 3. Ajuste os parâmetros em **Configurações** (segurança, cobertura, lead times, câmbio).
 
 ## Fechamento de pedido por fornecedor
