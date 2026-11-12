@@ -29,6 +29,13 @@
   .cell-input:hover { border-color:#cbd5e1; } .cell-input:focus { border-color:#0ea5e9; background:#fff; outline:none; }
   .modal-bg { background: rgba(15,23,42,.55); }
   .cell-input::-webkit-inner-spin-button, .cell-input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; } .cell-input { -moz-appearance: textfield; }
+  .grade-mrp td, .grade-mrp th { border-bottom: 1px solid #f1f5f9; white-space: nowrap; }
+  .grade-mrp thead th { position: sticky; top: 0; z-index: 3; }
+  .grade-mrp .g-s0 { position: sticky; left: 0; background: #fff; z-index: 2; min-width: 170px; max-width: 170px; border-right: 1px solid #e2e8f0; }
+  .grade-mrp .g-s1 { position: sticky; left: 170px; background: #fff; z-index: 2; min-width: 110px; }
+  .grade-mrp .g-s2 { position: sticky; left: 280px; background: #f8fafc; z-index: 2; min-width: 64px; border-right: 2px solid #cbd5e1; }
+  .grade-mrp thead .g-s0, .grade-mrp thead .g-s1, .grade-mrp thead .g-s2 { z-index: 4; background: #f1f5f9; }
+  .grade-mrp tr.g-first td { border-top: 2px solid #94a3b8; }
   .tab.active { border-color:#0ea5e9; color:#0369a1; }
   #toast { transition: opacity .3s; }
   .md h3{font-weight:700;margin-top:.8em} .md ul{list-style:disc;padding-left:1.2em} .md p{margin:.4em 0} .md table{border-collapse:collapse;margin:.5em 0} .md td,.md th{border:1px solid #e2e8f0;padding:2px 6px}
@@ -961,7 +968,7 @@ let R = null;                 // resultado do cálculo
 let page = 'painel';
 let fsdb = null, user = null;
 const charts = {};
-const ui = { mrpFiltro: { q: '', familia: '', fornecedor: '', status: '' }, sugFiltro: { status: 'acao', janela: 30, fornecedor: '' }, ordFiltro: { q: '', status: 'abertas', fornecedor: '' }, prevFiltro: { q: '', grupo: '' }, cadTab: 'itens', sort: {}, vendOpts: { janela: 60, excluirB2B: true, tolerancia: 25 }, vend: { tab: 'comp', filtro: 'atencao', q: '', grupoAberto: {} } };
+const ui = { mrpFiltro: { q: '', familia: '', fornecedor: '', status: '' }, mrpView: 'lista', grade: { dias: 60, gran: 'dia', ordens: true }, sugFiltro: { status: 'acao', janela: 30, fornecedor: '' }, ordFiltro: { q: '', status: 'abertas', fornecedor: '' }, prevFiltro: { q: '', grupo: '' }, cadTab: 'itens', sort: {}, vendOpts: { janela: 60, excluirB2B: true, tolerancia: 25 }, vend: { tab: 'comp', filtro: 'atencao', q: '', grupoAberto: {} } };
 
 /* ================= PERSISTÊNCIA ================= */
 const Store = {
@@ -1176,16 +1183,23 @@ function pgMRP(el) {
     && (!F.status || (F.status === 'ruptura30' ? (x.rupturaDia >= 0 && x.rupturaDia <= 30) : F.status === 'ruptura' ? x.rupturaDia >= 0 : x.status === F.status)));
   rows = sortRows('mrp', rows, { cod: x => x.cod, fam: x => x.produto.familia, forn: x => x.produto.fornecedor, est: x => C.num(x.produto.estoque), dem: x => x.avg30, dias: x => x.diasEstoque, aberto: x => x.totalAberto, rupt: x => x.rupturaDia >= 0 ? x.rupturaDia : 99999, ped: x => x.prox ? x.prox.dataPedidoIdeal : 'zzz', qtd: x => x.prox?.qtd, st: x => ['atrasado', 'comprar', 'antecipar', 'planejar', 'ok', 'sem_demanda'].indexOf(x.status) });
   if (!ui.sort.mrp) rows = [...rows].sort((a, b) => (a.rupturaDia >= 0 ? a.rupturaDia : 99999) - (b.rupturaDia >= 0 ? b.rupturaDia : 99999));
+  ui.mrpRows = rows;
+  const grade = ui.mrpView === 'grade';
   el.innerHTML = `
   <div class="flex flex-wrap gap-2 mb-3 items-center">
+    <div class="flex rounded-lg border bg-white overflow-hidden text-xs">${[['lista', 'Lista'], ['grade', 'Grade dia a dia']].map(([k, l]) => `<button class="px-3 py-1.5 ${(ui.mrpView || 'lista') === k ? 'bg-slate-800 text-white' : 'hover:bg-slate-50'}" onclick="ui.mrpView='${k}';render()">${l}</button>`).join('')}</div>
     <input id="fq" placeholder="Buscar código ou descrição" value="${esc(F.q)}" class="border rounded-lg px-3 py-1.5 w-64">
     <select id="ffam" class="border rounded-lg px-2 py-1.5"><option value="">Todas as famílias</option>${uniq(DB.produtos.map(p => p.familia)).map(f => opt(f, F.familia)).join('')}</select>
     <select id="fforn" class="border rounded-lg px-2 py-1.5"><option value="">Todos os fornecedores</option>${uniq(DB.produtos.map(p => p.fornecedor)).map(f => opt(f, F.fornecedor)).join('')}</select>
     <select id="fst" class="border rounded-lg px-2 py-1.5">${[['', 'Todas as situações'], ['ruptura30', 'Ruptura em 30 dias'], ['ruptura', 'Com ruptura no horizonte'], ['atrasado', 'Pedido atrasado'], ['comprar', 'Comprar agora'], ['planejar', 'Planejar'], ['antecipar', 'Antecipar ordem (falta antes da chegada)'], ['ok', 'OK'], ['sem_demanda', 'Sem demanda']].map(([v, l]) => opt(v, F.status, l)).join('')}</select>
     <span class="text-slate-500 text-xs ml-1">${rows.length} itens</span>
-    <button onclick="exportMRP()" class="ml-auto border rounded-lg px-3 py-1.5 bg-white hover:bg-slate-50">Exportar Excel</button>
+    ${grade ? `<select class="border rounded-lg px-2 py-1.5 text-xs" onchange="ui.grade.dias=Number(this.value);render()">${[30, 60, 90, 120, 180, 240].map(d => opt(d, ui.grade.dias, `próximos ${d} dias`)).join('')}</select>
+    <select class="border rounded-lg px-2 py-1.5 text-xs" onchange="ui.grade.gran=this.value;render()">${opt('dia', ui.grade.gran, 'por dia')}${opt('semana', ui.grade.gran, 'por semana')}</select>
+    <label class="text-xs flex items-center gap-1"><input type="checkbox" ${ui.grade.ordens ? 'checked' : ''} onchange="ui.grade.ordens=this.checked;render()"> linhas de pedido/embarque</label>` : ''}
+    <button onclick="${grade ? 'exportGrade()' : 'exportMRP()'}" class="ml-auto border rounded-lg px-3 py-1.5 bg-white hover:bg-slate-50">Exportar Excel</button>
   </div>
-  <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 190px)"><table class="w-full tbl text-xs">
+  ${grade ? '<div id="gradeBox"></div>' : ''}
+  ${grade ? '' : `<div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 190px)"><table class="w-full tbl text-xs">
   <thead><tr class="text-left">${th('mrp', 'cod', 'Item')}${th('mrp', 'fam', 'Família')}${th('mrp', 'forn', 'Fornecedor')}${th('mrp', 'est', 'Estoque', 'num')}${th('mrp', 'dem', 'Dem./dia', 'num')}${th('mrp', 'dias', 'Dias estoque', 'num')}${th('mrp', 'aberto', 'Em aberto', 'num')}${th('mrp', 'rupt', 'Ruptura projetada')}${th('mrp', 'ped', 'Pedir até')}${th('mrp', 'qtd', 'Qtd sugerida', 'num')}<th class="px-2">Chegada sugerida</th>${th('mrp', 'st', 'Situação')}</tr></thead>
   <tbody>${rows.map(x => `<tr class="border-t hover:bg-sky-50 cursor-pointer" onclick="openItem('${esc(x.cod)}')">
     <td class="px-2 py-1.5"><div class="font-semibold">${esc(x.cod)}</div><div class="text-slate-400 truncate max-w-[260px]" title="${esc(x.produto.desc)}">${esc(x.produto.desc)}</div></td>
@@ -1196,9 +1210,55 @@ function pgMRP(el) {
     <td class="px-2 ${x.rupturaDia >= 0 && x.rupturaDia <= 30 ? 'text-red-600 font-semibold' : ''}">${x.ruptura ? fd(x.ruptura) + ` <span class="text-slate-400">(${x.rupturaDia}d)</span>` : '<span class="text-slate-400">sem ruptura</span>'}</td>
     <td class="px-2 ${x.prox?.atrasado ? 'text-red-600 font-semibold' : ''}">${x.prox ? fd(x.prox.dataPedidoIdeal) : '–'}</td>
     <td class="px-2 num font-semibold">${x.prox ? f0(x.prox.qtd) : '–'}</td><td class="px-2">${x.prox ? fd(x.prox.dataChegada) : '–'}</td>
-    <td class="px-2">${badge(x.status)}</td></tr>`).join('')}</tbody></table></div>`;
+    <td class="px-2">${badge(x.status)}</td></tr>`).join('')}</tbody></table></div>`}`;
+  if (grade) renderGrade(document.getElementById('gradeBox'), rows);
   const bind = (id, k) => document.getElementById(id).addEventListener(id === 'fq' ? 'input' : 'change', e => { F[k] = e.target.value; if (id === 'fq') { clearTimeout(bind._t); bind._t = setTimeout(() => { render(); const i = document.getElementById('fq'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }, 250); } else render(); });
   bind('fq', 'q'); bind('ffam', 'familia'); bind('fforn', 'fornecedor'); bind('fst', 'status');
+}
+
+
+/* ===== MRP: grade dia a dia (estilo planilha) ===== */
+const MESC = ['jan', 'fev', 'mar', 'abr', 'mai', 'jun', 'jul', 'ago', 'set', 'out', 'nov', 'dez'];
+function gradeLinhas(x, N, gran) {
+  const t = R.opts.today, H = R.opts.horizonte;
+  const ped = new Array(H + 1).fill(0), emb = new Array(H + 1).fill(0), sug = new Array(H + 1).fill(0);
+  x.abertas.forEach(o => { const a = o.dataPedido ? C.diffDays(t, o.dataPedido) : -1, b = o.dataEmbarque ? C.diffDays(t, o.dataEmbarque) : -1; if (a >= 0 && a <= H) ped[a] += o.aberto; if (b >= 0 && b <= H) emb[b] += o.aberto; });
+  x.plano.forEach(pl => (pl.parcelas && pl.parcelas.length ? pl.parcelas : [{ dataChegada: pl.dataChegada, qtd: pl.qtd }]).forEach(pc => { const d = C.diffDays(t, pc.dataChegada); if (d >= 0 && d <= H) sug[d] += pc.qtd; }));
+  // dias de estoque: estoque do dia ÷ demanda média dos 30 dias seguintes
+  const P = [0]; for (let d = 0; d <= H; d++) P.push(P[d] + x.rates[d]);
+  const dias = x.S.map((v, d) => { const e = Math.min(H + 1, d + 30), n = e - d, m = n > 0 ? (P[e] - P[d]) / n : 0; return m > 0 ? v / m : null; });
+  const cols = []; if (gran === 'semana') { for (let d = 0; d < N; d += 7) cols.push([d, Math.min(N, d + 7) - 1]); } else for (let d = 0; d < N; d++) cols.push([d, d]);
+  const soma = arr => cols.map(([a, b]) => { let v = 0; for (let d = a; d <= b; d++) v += arr[d]; return v; });
+  const fim = arr => cols.map(([, b]) => arr[b]);
+  return { cols, prev: soma(x.rates), ped: soma(ped), emb: soma(emb), che: soma(x.arr), sug: soma(sug), est: fim(x.S), dias: fim(dias), falta: soma(x.lost) };
+}
+function renderGrade(box, rows) {
+  const G = ui.grade, t = R.opts.today, N = Math.min(R.opts.horizonte + 1, G.dias), gran = G.gran;
+  if (!rows.length) { box.innerHTML = '<div class="bg-white rounded-xl border p-6 text-slate-500">Nenhum item neste filtro.</div>'; return; }
+  const cols0 = gradeLinhas(rows[0], N, gran).cols;
+  const lbl = ([a]) => { const d = C.addDays(t, a); return `${d.slice(8, 10)}/${MESC[Number(d.slice(5, 7)) - 1]}`; };
+  const wkend = ([a]) => { if (gran !== 'dia') return false; const w = new Date(C.addDays(t, a) + 'T12:00:00').getDay(); return w === 0 || w === 6; };
+  const cell = (v, cls = '') => `<td class="px-1.5 num ${cls}">${v}</td>`;
+  const n0 = v => v ? f0(v) : '<span class="text-slate-300">0</span>';
+  let html = `<div class="text-[11px] text-slate-500 mb-2">Previsão = consumo previsto do componente · Pedido/Embarque/Chegada = ordens em aberto · Sugestão = chegadas sugeridas pelo MRP · Estoque = projetado no fim do ${gran === 'dia' ? 'dia' : 'período'} · Dias de estoque = estoque ÷ consumo médio dos 30 dias seguintes. <span class="inline-block w-3 h-3 align-middle bg-red-500 rounded-sm"></span> ruptura <span class="inline-block w-3 h-3 align-middle bg-amber-300 rounded-sm ml-2"></span> abaixo do estoque de segurança <span class="inline-block w-3 h-3 align-middle bg-emerald-100 rounded-sm ml-2"></span> ok</div>
+  <div class="bg-white rounded-xl shadow-sm border overflow-auto" style="max-height:calc(100vh - 220px)"><table class="text-[11px] grade-mrp" style="border-collapse:separate;border-spacing:0">
+  <thead><tr><th class="g-s0 px-2 py-1.5 text-left">Item</th><th class="g-s1 px-2 text-left">Linha</th><th class="g-s2 px-2 num">Atual</th>${cols0.map(c => `<th class="px-1.5 num font-semibold ${c[0] === 0 ? 'bg-yellow-200' : wkend(c) ? 'bg-slate-200' : 'bg-slate-50'}" style="min-width:${gran === 'dia' ? 44 : 56}px">${lbl(c)}</th>`).join('')}</tr></thead><tbody>`;
+  rows.forEach((x, i) => {
+    const L = gradeLinhas(x, N, gran), seg = x.prm.seg;
+    const linhas = [['Previsão', L.prev.map(v => cell(v ? f1(v) : '<span class="text-slate-300">0</span>'))]];
+    if (G.ordens) { linhas.push(['Pedido (PO)', L.ped.map(v => cell(n0(v), v ? 'font-semibold text-violet-700' : ''))]); linhas.push(['Embarque', L.emb.map(v => cell(n0(v), v ? 'font-semibold text-sky-700' : ''))]); }
+    linhas.push(['Chegada', L.che.map(v => cell(n0(v), v ? 'font-bold text-emerald-700 bg-emerald-50' : ''))]);
+    linhas.push(['Sugestão MRP', L.sug.map(v => cell(n0(v), v ? 'font-semibold text-violet-700 bg-violet-50' : ''))]);
+    linhas.push(['Estoque', L.est.map((v, k) => cell(f0(v), v <= 0 && L.prev[k] > 0 ? 'text-red-600 font-bold' : 'font-semibold'))]);
+    linhas.push(['Dias de estoque', L.dias.map(v => v === null ? cell('–', 'text-slate-300') : cell(f0(v), v < 1 ? 'bg-red-500 text-white font-bold' : v < seg ? 'bg-amber-300 font-semibold' : 'bg-emerald-50'))]);
+    linhas.forEach(([nome, tds], j) => {
+      const primeira = j === 0;
+      html += `<tr class="${primeira ? 'g-first' : ''}">${primeira ? `<td class="g-s0 px-2 py-1 align-top cursor-pointer" rowspan="${linhas.length}" onclick="openItem('${esc(x.cod)}')"><div class="font-bold text-sky-800">${esc(x.cod)}</div><div class="text-slate-400 truncate" style="max-width:150px" title="${esc(x.produto.desc)}">${esc(x.produto.desc)}</div><div class="mt-1">${badge(x.status)}</div><div class="text-slate-400 mt-0.5">${esc(x.produto.familia)}</div></td>` : ''}
+      <td class="g-s1 px-2 whitespace-nowrap ${nome === 'Dias de estoque' ? 'font-semibold' : 'text-slate-600'}">${nome}</td><td class="g-s2 px-2 num text-slate-500">${nome === 'Estoque' ? f0(x.produto.estoque) : nome === 'Dias de estoque' ? (x.diasEstoque === null ? '–' : f0(x.diasEstoque)) : nome === 'Previsão' ? f1(x.avg30) + '/d' : ''}</td>${tds.join('')}</tr>`;
+    });
+  });
+  html += `</tbody></table></div>`;
+  box.innerHTML = html;
 }
 
 /* ===== Detalhe do item ===== */
@@ -1816,9 +1876,11 @@ function exportSug() {
   xlsxDownload(`Sugestoes_compra_${R.opts.today}.xlsx`, [['Resumo por fornecedor', res], ['Itens', rows]]);
 }
 function exportGrade() {
-  const H = R.opts.horizonte, t = R.opts.today, rows = [];
-  R.itens.forEach(x => { [['Demanda', x.rates], ['Chegadas', x.arr], ['Estoque', x.S]].forEach(([lin, arr]) => { const r = { Item: x.cod, Linha: lin }; for (let d = 0; d <= H; d++) r[fd(C.addDays(t, d))] = Math.round(arr[d] * 100) / 100; rows.push(r); }); });
-  xlsxDownload(`MRP_grade_diaria_${t}.xlsx`, [['Grade', rows]]);
+  const G = ui.grade || { dias: R.opts.horizonte + 1, gran: 'dia', ordens: true }, t = R.opts.today, N = Math.min(R.opts.horizonte + 1, G.dias || R.opts.horizonte + 1);
+  const itens = ui.mrpView === 'grade' && ui.mrpRows ? ui.mrpRows : R.itens; const out = [];
+  itens.forEach(x => { const L = gradeLinhas(x, N, G.gran); const nomes = [['Previsão', L.prev], ['Pedido (PO)', L.ped], ['Embarque', L.emb], ['Chegada', L.che], ['Sugestão MRP', L.sug], ['Estoque', L.est], ['Dias de estoque', L.dias]];
+    nomes.forEach(([n, arr]) => { const r = { Item: x.cod, Família: x.produto.familia, Linha: n }; L.cols.forEach((c, k) => { r[fd(C.addDays(t, c[0]))] = arr[k] === null ? '' : Math.round(arr[k] * 10) / 10; }); out.push(r); }); });
+  xlsxDownload(`MRP_grade_${G.gran === 'semana' ? 'semanal' : 'diaria'}_${t}.xlsx`, [['Grade', out]]);
 }
 
 /* ================= ASSISTENTE IA ================= */
