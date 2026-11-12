@@ -603,6 +603,124 @@ const MRPCore = (function () {
 
 
 
+  // ---------- projeção de vendas (tendência + sazonalidade) ----------
+  // Trabalha por produto vendido (SKU), em meses completos, com a venda média por dia de cada mês.
+  // Sazonalidade: índices por família (série somada da família, decomposição clássica 2×12).
+  // Tendência: Holt amortecido (phi 0,9) sobre a série dessazonalizada, parâmetros pelo menor erro de 1 passo.
+  const diasMes = ym => new Date(Number(ym.slice(0, 4)), Number(ym.slice(5, 7)), 0).getDate();
+  const proxMes = (ym, k = 1) => { let y = Number(ym.slice(0, 4)), m = Number(ym.slice(5, 7)) + k; while (m > 12) { m -= 12; y++; } while (m < 1) { m += 12; y--; } return `${y}-${String(m).padStart(2, '0')}`; };
+  function indicesSazonais(serie, meses) {
+    // serie: taxa diária por mês (sem buracos); retorna {idx: [12], n: [12]} ou null
+    const n = serie.length; if (n < 13) return null;
+    const rat = Array.from({ length: 12 }, () => []);
+    for (let t = 6; t < n - 6; t++) {
+      let s = serie[t - 6] / 2 + serie[t + 6] / 2; for (let j = t - 5; j <= t + 5; j++) s += serie[j];
+      const cma = s / 12; if (cma > 0) rat[Number(meses[t].slice(5, 7)) - 1].push(serie[t] / cma);
+    }
+    const pts = rat.reduce((a, r) => a + r.length, 0); if (pts < 6) return null;
+    let idx = rat.map(r => { if (!r.length) return 1; const m = r.reduce((a, b) => a + b, 0) / r.length; const w = r.length / (r.length + 0.5); return 1 + w * (m - 1); });
+    idx = idx.map(v => Math.min(3, Math.max(0.25, v)));
+    const med = idx.reduce((a, b) => a + b, 0) / 12; idx = idx.map(v => v / med);
+    return { idx, n: rat.map(r => r.length) };
+  }
+  function holt(d) {
+    const n = d.length;
+    if (n < 4) { const l = d.slice(-3).reduce((a, b) => a + b, 0) / Math.max(1, d.slice(-3).length); return { L: l, T: 0, phi: 0.9, sigma: l * 0.5, alpha: null, beta: null }; }
+    let best = null;
+    for (const phi of [0.85, 0.9, 0.95]) for (const a of [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8]) for (const b of [0.02, 0.05, 0.1, 0.2, 0.3]) {
+      let L = (d[0] + d[1] + d[2]) / 3, T = 0, sse = 0;
+      for (let t = 1; t < n; t++) { const f = L + phi * T, e = d[t] - f; if (t >= 3) sse += e * e; const L1 = a * d[t] + (1 - a) * (L + phi * T); T = b * (L1 - L) + (1 - b) * phi * T; L = L1; }
+      if (!best || sse < best.sse - 1e-9) best = { sse, L, T, alpha: a, beta: b, phi };
+    }
+    return { L: best.L, T: best.T, phi: best.phi, sigma: Math.sqrt(best.sse / Math.max(1, n - 3)), alpha: best.alpha, beta: best.beta };
+  }
+  function projetarVendas(db, o = {}) {
+    const V = db.vendas; if (!V) return null;
+    const excl = o.excluirB2B !== false, H = Math.max(1, Math.min(24, num(o.meses) || 12));
+    const atip = new Set(o.atipicos || []);
+    const fim = addDays(V.base, V.dias - 1);
+    const m0 = V.base.slice(8, 10) === '01' ? V.base.slice(0, 7) : proxMes(V.base.slice(0, 7));
+    const m1 = fim.slice(8, 10) === String(diasMes(fim.slice(0, 7))).padStart(2, '0') ? fim.slice(0, 7) : proxMes(fim.slice(0, 7), -1);
+    const meses = []; for (let m = m0; m <= m1; m = proxMes(m)) meses.push(m);
+    if (meses.length < 3) return { erro: 'São necessários pelo menos 3 meses completos de vendas.', meses };
+    const futuros = Array.from({ length: H }, (_, i) => proxMes(m1, i + 1));
+    const iDe = ym => diffDays(V.base, ym + '-01');
+    const idx = buildDemandIndex(db);
+    // série mensal (taxa diária) por SKU
+    const skus = Object.entries(V.skus).map(([sku, k]) => {
+      const temB = excl && k.b && Object.keys(k.b).length;
+      const r = meses.map(ym => { const a = iDe(ym), dm = diasMes(ym); let s = 0; for (let i = a; i < a + dm; i++) { const q = k.q[i] || 0; s += temB ? q - (k.b[addDays(V.base, i)] || 0) : q; } return Math.max(0, s) / dm; });
+      return { sku, fam: k.fam || '(sem família)', r };
+    }).filter(s => s.r.some(v => v > 0));
+    // meses atípicos: marcados pelo usuário + zero/quase zero no meio da série (provável ruptura)
+    skus.forEach(s => {
+      const r = s.r, n = r.length; s.ini = r.findIndex(v => v > 0);
+      s.flag = r.map((v, t) => t < s.ini ? 'antes' : atip.has(meses[t]) ? 'marcado' : '');
+      for (let t = s.ini + 1; t < n - 1; t++) {
+        if (s.flag[t]) continue;
+        const viz = [r[t - 2], r[t - 1], r[t + 1], r[t + 2]].filter((v, j) => v !== undefined && v > 0 && (t + [-2, -1, 1, 2][j]) >= s.ini).sort((a, b) => a - b);
+        if (viz.length >= 2) { const med = viz[Math.floor(viz.length / 2)]; if (med * diasMes(meses[t]) >= 5 && r[t] < 0.2 * med) s.flag[t] = 'ruptura'; }
+      }
+      // série limpa: atípicos substituídos pela interpolação dos vizinhos válidos
+      const c = r.slice();
+      for (let t = s.ini; t < n; t++) if (s.flag[t]) {
+        let a = t - 1; while (a >= s.ini && s.flag[a]) a--;
+        let b = t + 1; while (b < n && s.flag[b]) b++;
+        c[t] = a >= s.ini && b < n ? c[a] + (r[b] - c[a]) * (t - a) / (b - a) : a >= s.ini ? c[a] : b < n ? r[b] : 0;
+      }
+      s.limpa = c;
+    });
+    // sazonalidade por família
+    const fams = {}; skus.forEach(s => { (fams[s.fam] = fams[s.fam] || []).push(s); });
+    const totalSerie = meses.map((_, t) => skus.reduce((a, s) => a + (t >= s.ini ? s.limpa[t] : 0), 0));
+    const sazGeral = indicesSazonais(totalSerie, meses);
+    const saz = {};
+    Object.entries(fams).forEach(([f, ss]) => {
+      const serie = meses.map((_, t) => ss.reduce((a, s) => a + (t >= s.ini ? s.limpa[t] : 0), 0));
+      const vol = serie.reduce((a, b) => a + b, 0) / serie.length * 30;
+      saz[f] = (vol >= 60 && indicesSazonais(serie, meses)) || sazGeral;
+      if (saz[f]) saz[f].fonte = saz[f] === sazGeral ? 'geral' : 'família';
+    });
+    const prevMes = (pa, ym) => { const f = idx.fcByPa.get(pa); if (!f) return null; const v = f.meses?.[ym]; return ((v === undefined || v === null || v === '') ? num(f.padrao) : num(v)) * diasMes(ym); };
+    const soma = a => a.reduce((x, y) => x + y, 0);
+    const res = skus.map(s => {
+      const S = saz[s.fam], ix = ym => S ? S.idx[Number(ym.slice(5, 7)) - 1] : 1;
+      const hist = s.limpa.slice(s.ini), mh = meses.slice(s.ini), nh = hist.length;
+      const d = hist.map((v, t) => v / ix(mh[t]));
+      const usaSaz = !!S && nh >= 6;
+      const m = holt(usaSaz ? d : hist);
+      let metodo = nh < 4 ? 'média (pouco histórico)' : usaSaz ? `tendência + sazonalidade (${S.fonte})` : 'tendência';
+      const proj = futuros.map((ym, i) => {
+        const h = i + 1; let tr = 0; for (let j = 1; j <= h; j++) tr += Math.pow(m.phi, j);
+        const base = Math.max(0, m.L + m.T * tr), f = usaSaz ? ix(ym) : 1, dm = diasMes(ym);
+        const banda = 1.28 * m.sigma * Math.sqrt(h);
+        return { ym, v: base * f * dm, lo: Math.max(0, base - banda) * f * dm, hi: (base + banda) * f * dm, dia: base * f };
+      });
+      const real = s.r.map((v, t) => v * diasMes(meses[t]));
+      const tot = soma(proj.map(p => p.v));
+      // mesmo período do ano anterior (só se todos os meses existirem no histórico)
+      const ant = futuros.map(ym => meses.indexOf(proxMes(ym, -12)));
+      const totAnt = ant.every(t => t >= s.ini) ? soma(ant.map(t => real[t])) : null;
+      const n12 = Math.min(12, meses.length - s.ini), ult = soma(real.slice(-n12));
+      // crescimento recente: últimos 3 meses × mesmos 3 meses do ano anterior
+      const t3 = [meses.length - 3, meses.length - 2, meses.length - 1], a3 = t3.map(t => t - 12);
+      const recente = a3.every(t => t >= s.ini) && soma(a3.map(t => real[t])) > 0 ? soma(t3.map(t => real[t])) / soma(a3.map(t => real[t])) - 1 : null;
+      const prevs = futuros.map(ym => prevMes(s.sku, ym)); const totPrev = prevs.every(v => v === null) ? null : soma(prevs.map(v => v || 0));
+      const avisos = [];
+      if (s.ini > 0 && nh < 12) avisos.push('produto novo');
+      if (s.flag.some(f => f === 'ruptura')) avisos.push(`${s.flag.filter(f => f === 'ruptura').length} mês(es) tratado(s) como ruptura`);
+      const ult3 = soma(s.r.slice(-4, -1)) / 3; if (nh >= 4 && ult3 > 0 && s.r[s.r.length - 1] < 0.3 * ult3) avisos.push('queda forte no último mês — confira ruptura');
+      return { sku: s.sku, fam: s.fam, metodo, usaSaz, saz: usaSaz ? S : null, real, flag: s.flag, proj, tot, totAnt, cresc: totAnt > 0 ? tot / totAnt - 1 : null, ult12: ult, n12, recente, prevs, totPrev, vsPrev: totPrev > 0 ? tot / totPrev - 1 : null, avisos, modelo: { alpha: m.alpha, beta: m.beta, phi: m.phi } };
+    });
+    // por componente (projeção × estrutura) comparado à previsão usada no MRP
+    const struct = new Map(); db.estrutura.forEach(e => { if (!struct.has(e.pa)) struct.set(e.pa, []); struct.get(e.pa).push({ mp: e.mp, qtd: num(e.qtd) }); });
+    const prods = new Set(db.produtos.map(p => p.cod));
+    const comp = new Map();
+    res.forEach(s => { const cs = struct.get(s.sku) || (prods.has(s.sku) ? [{ mp: s.sku, qtd: 1 }] : []); cs.forEach(c => { if (!comp.has(c.mp)) comp.set(c.mp, { cod: c.mp, proj: futuros.map(() => 0), skus: [] }); const x = comp.get(c.mp); s.proj.forEach((p, i) => { x.proj[i] += p.v * c.qtd; }); x.skus.push(s.sku); }); });
+    const comps = [...comp.values()].map(x => { const prev = futuros.map(ym => mpRateForMonth(idx, x.cod, ym) * diasMes(ym)); const tp = soma(prev), tj = soma(x.proj); return { ...x, prev, tot: tj, totPrev: tp, vsPrev: tp > 0 ? tj / tp - 1 : null }; });
+    return { meses, futuros, H, skus: res, comps, saz, sazGeral, ultimo: m1, fimVendas: fim, excl };
+  }
+
   // ---------- estoque corrente (relatório do ERP) ----------
   // lê SKU + "Total disponível para venda"; guarda só os SKUs que interessam ao MRP (itens e produtos da estrutura)
   function parseEstoqueCorrente(XLSX, wb, db, arquivo) {
@@ -1007,7 +1125,7 @@ const MRPCore = (function () {
     const res = db.produtos.filter(p => p.ativo !== false).map(p => computeItem(db, idx, p, opts));
     return { opts, itens: res, byCod: new Map(res.map(r => [r.cod, r])) };
   }
-  return { revisarOrdens, itemParams, aplicarFatoresPacote, parseEstoqueCorrente, aplicarEstoque, parseMedidasCSV, parseMedidasSheet, aplicarMedidas, pesoMaxContainer, fecharPedidos, capacidadeContainer, parseVendasCSV, parseVendasSheet, mergeVendas, sugerirVinculos, analisarVendas, serieSemanal, taxaPrevisao, valorOrdem, emptyDB, importWorkbook, importStock, computeAll, computeItem, buildDemandIndex, itemParams, addDays, diffDays, todayISO, serialToISO, num, str };
+  return { projetarVendas, proxMes, diasMes, revisarOrdens, itemParams, aplicarFatoresPacote, parseEstoqueCorrente, aplicarEstoque, parseMedidasCSV, parseMedidasSheet, aplicarMedidas, pesoMaxContainer, fecharPedidos, capacidadeContainer, parseVendasCSV, parseVendasSheet, mergeVendas, sugerirVinculos, analisarVendas, serieSemanal, taxaPrevisao, valorOrdem, emptyDB, importWorkbook, importStock, computeAll, computeItem, buildDemandIndex, itemParams, addDays, diffDays, todayISO, serialToISO, num, str };
 })();
 
 
@@ -1029,7 +1147,7 @@ let R = null;                 // resultado do cálculo
 let page = 'painel';
 let fsdb = null, user = null;
 const charts = {};
-const ui = { mrpFiltro: { q: '', familia: '', fornecedor: '', status: '' }, mrpView: 'lista', grade: { dias: 60, gran: 'dia', ordens: true }, sugFiltro: { status: 'acao', janela: 30, fornecedor: '' }, ordFiltro: { q: '', status: 'abertas', fornecedor: '' }, ordTab: 'ordens', hist: { q: '', origem: '', periodo: 30 }, rev: { base: 'mrp', tolerancia: 15, acao: 'acoes' }, prevFiltro: { q: '', grupo: '' }, cadTab: 'itens', sort: {}, vendOpts: { janela: 60, excluirB2B: true, tolerancia: 25 }, vend: { tab: 'comp', filtro: 'atencao', q: '', grupoAberto: {} } };
+const ui = { mrpFiltro: { q: '', familia: '', fornecedor: '', status: '' }, mrpView: 'lista', grade: { dias: 60, gran: 'dia', ordens: true }, sugFiltro: { status: 'acao', janela: 30, fornecedor: '' }, ordFiltro: { q: '', status: 'abertas', fornecedor: '' }, ordTab: 'ordens', hist: { q: '', origem: '', periodo: 30 }, rev: { base: 'mrp', tolerancia: 15, acao: 'acoes' }, prevFiltro: { q: '', grupo: '' }, cadTab: 'itens', sort: {}, vendOpts: { janela: 60, excluirB2B: true, tolerancia: 25 }, proj: { meses: 12, fam: '', q: '', tab: 'sku' }, vend: { tab: 'comp', filtro: 'atencao', q: '', grupoAberto: {} } };
 
 /* ================= PERSISTÊNCIA ================= */
 const Store = {
@@ -1134,6 +1252,7 @@ const ICON = {
   embarques: 'M3 17l2 3h14l2-3M5 17V9h14v8M9 9V5h6v4',
   previsao: 'M7 12l3-3 3 3 4-4M8 21l4-4 4 4M3 4h18M4 4h16v12a1 1 0 01-1 1H5a1 1 0 01-1-1V4z',
   vendas: 'M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z',
+  projecao: 'M3 17l6-6 4 4 8-8M14 7h7v7',
   cadastros: 'M4 6h16M4 10h16M4 14h16M4 18h16',
   importar: 'M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12',
   ia: 'M9.7 17L9 20l-1 1h8l-1-1-.8-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z',
@@ -1141,7 +1260,7 @@ const ICON = {
 };
 const PAGES = [
   ['painel', 'Painel'], ['mrp', 'MRP por item'], ['sugestoes', 'Sugestões de compra'], ['ordens', 'Ordens de compra'], ['embarques', 'Embarques'],
-  ['previsao', 'Previsão de demanda'], ['vendas', 'Vendas x Previsão'], ['cadastros', 'Cadastros'], ['importar', 'Importar / Exportar'], ['ia', 'Assistente IA'], ['config', 'Configurações']
+  ['previsao', 'Previsão de demanda'], ['vendas', 'Vendas x Previsão'], ['projecao', 'Projeção de vendas'], ['cadastros', 'Cadastros'], ['importar', 'Importar / Exportar'], ['ia', 'Assistente IA'], ['config', 'Configurações']
 ];
 function renderNav() {
   document.getElementById('nav').innerHTML = PAGES.map(([k, l]) => {
@@ -1165,7 +1284,7 @@ function render() {
   const cambioTxt = ` · <span title="${ci?.em ? 'Atualizado em ' + new Date(ci.em).toLocaleString('pt-BR') : ''}${ci?.erro ? ' · ' + esc(ci.erro) : ''}">USD ${nf2.format(DB.settings.cambio.USD)} · CNY ${nf2.format(DB.settings.cambio.CNY)} <span class="${ci?.erro ? 'text-red-500' : 'text-slate-400'}">(${fonteLbl}${ci?.erro ? ' ⚠' : ''})</span></span>`;
   document.getElementById('baseInfo').innerHTML = base + cambioTxt + (DB.estoqueAtualizadoEm ? ` · Estoque de ${fd(DB.estoqueAtualizadoEm)}` : (DB.produtos.length ? ' · <span class="text-amber-600">Estoque da planilha importada</span>' : ''));
   document.getElementById('modeInfo').innerHTML = Store.mode === 'firebase' ? '<span class="text-emerald-400">● Nuvem (Firebase)</span>' : '<span class="text-amber-400">● Modo local (este navegador)</span>';
-  const fn = { painel: pgPainel, mrp: pgMRP, sugestoes: pgSugestoes, ordens: pgOrdens, embarques: pgEmbarques, previsao: pgPrevisao, vendas: pgVendas, cadastros: pgCadastros, importar: pgImportar, ia: pgIA, config: pgConfig }[page] || pgPainel;
+  const fn = { painel: pgPainel, mrp: pgMRP, sugestoes: pgSugestoes, ordens: pgOrdens, embarques: pgEmbarques, previsao: pgPrevisao, vendas: pgVendas, projecao: pgProjecao, cadastros: pgCadastros, importar: pgImportar, ia: pgIA, config: pgConfig }[page] || pgPainel;
   fn(document.getElementById('page'));
 }
 function changed(...keys) { recalc(); Store.save(...keys); render(); }
@@ -2290,6 +2409,152 @@ Zerar a previsão deles para não contar a demanda em dobro? (OK = zerar, Cancel
     Object.keys(f.meses || {}).forEach(k => { if (k >= ym) delete f.meses[k]; });
   });
   closeModal(); changed('previsao'); toast(`Previsão atualizada para ${rows.length} produto(s)${zerar ? ` · ${duplos.length} código(s) antigo(s) zerado(s)` : ''}`);
+}
+/* ================= PROJEÇÃO DE VENDAS ================= */
+function calcProjecao() {
+  if (!DB.vendas) return null;
+  const o = ui.proj, k = JSON.stringify([DB.vendas.base, DB.vendas.dias, Object.keys(DB.vendas.skus).length, o.meses, ui.vendOpts.excluirB2B, DB.settings.projAtipicos || [], DB.previsao, DB.estrutura.length, ui.projRev || 0]);
+  if (calcProjecao._k !== k || calcProjecao._ref !== DB.vendas) { calcProjecao._k = k; calcProjecao._ref = DB.vendas; calcProjecao._v = C.projetarVendas(DB, { meses: o.meses, excluirB2B: ui.vendOpts.excluirB2B, atipicos: DB.settings.projAtipicos || [] }); }
+  return calcProjecao._v;
+}
+const ymBr = ym => MES[Number(ym.slice(5)) - 1] + '/' + ym.slice(2, 4);
+function projFiltro(P) {
+  const o = ui.proj, q = o.q.toLowerCase();
+  return P.skus.filter(s => (!o.fam || s.fam === o.fam) && (!q || s.sku.toLowerCase().includes(q)));
+}
+function pgProjecao(el) {
+  const P = calcProjecao(), o = ui.proj;
+  if (!P) { el.innerHTML = `<div class="bg-white rounded-xl border p-6 max-w-2xl"><div class="font-bold text-base">Nenhum relatório de vendas importado</div><div class="text-slate-600 mt-2">A projeção usa o histórico de vendas. Importe em <a class="text-sky-700 underline cursor-pointer" onclick="go('importar')">Importar / Exportar → card 3</a>.</div></div>`; return; }
+  if (P.erro) { el.innerHTML = `<div class="bg-white rounded-xl border p-6 max-w-2xl">${esc(P.erro)}</div>`; return; }
+  const rows0 = projFiltro(P), soma = a => a.reduce((x, y) => x + y, 0);
+  const tot = soma(rows0.map(s => s.tot)), comAnt = rows0.filter(s => s.totAnt !== null), totAnt = soma(comAnt.map(s => s.totAnt)), totAntP = soma(comAnt.map(s => s.tot));
+  const comPrev = rows0.filter(s => s.totPrev !== null), totPrev = soma(comPrev.map(s => s.totPrev)), totPrevP = soma(comPrev.map(s => s.tot));
+  const n = P.meses.length, i3 = [n - 3, n - 2, n - 1], a3 = i3.map(i => i - 12);
+  const rec3 = a3[0] >= 0 ? (() => { const a = soma(rows0.map(s => soma(a3.map(i => s.real[i])))), b = soma(rows0.map(s => soma(i3.map(i => s.real[i])))); return a > 0 ? b / a - 1 : null; })() : null;
+  const fams = uniq(P.skus.map(s => s.fam)).sort();
+  const atip = new Set(DB.settings.projAtipicos || []);
+  const defas = C.diffDays(P.fimVendas, hoje());
+  const sz = o.fam ? P.saz[o.fam] : P.sazGeral;
+  el.innerHTML = `
+  <div class="flex flex-wrap gap-2 mb-3 items-center text-xs">
+    <label>Projetar <select class="border rounded-lg px-2 py-1.5 ml-1" onchange="ui.proj.meses=Number(this.value);render()">${[6, 12, 18].map(m => opt(m, o.meses, `próximos ${m} meses`)).join('')}</select></label>
+    <select class="border rounded-lg px-2 py-1.5" onchange="ui.proj.fam=this.value;render()"><option value="">Todas as famílias</option>${fams.map(f => opt(f, o.fam)).join('')}</select>
+    <label class="flex items-center gap-1"><input type="checkbox" ${ui.vendOpts.excluirB2B ? 'checked' : ''} onchange="setVendOpt('excluirB2B',this.checked)"> Excluir propostas comerciais (B2B)</label>
+    <span class="text-slate-500">Histórico usado: ${ymBr(P.meses[0])} a ${ymBr(P.ultimo)} (${n} meses completos) · projeção: ${ymBr(P.futuros[0])} a ${ymBr(P.futuros.at(-1))}</span>
+  </div>
+  ${defas > 20 ? `<div class="mb-3 p-2 rounded bg-amber-50 border border-amber-200 text-amber-900 text-xs">⚠ As vendas importadas vão até ${fd(P.fimVendas)}. Meses incompletos não entram; importe vendas recentes para a projeção partir do mês atual.</div>` : ''}
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+    ${kpi(`Projeção ${o.meses} meses`, f0(tot), `unidades vendidas${o.fam ? ' · ' + esc(o.fam) : ''}`, 'text-slate-800')}
+    ${kpi('Crescimento projetado', pct(totAnt > 0 ? totAntP / totAnt - 1 : null), totAnt > 0 ? `vs mesmos meses do ano anterior (${ymBr(C.proxMes(P.futuros[0], -12))}–${ymBr(C.proxMes(P.futuros.at(-1), -12))})` : 'sem histórico do ano anterior para esses meses', totAnt > 0 && totAntP / totAnt - 1 >= 0 ? 'text-emerald-700' : 'text-sky-700')}
+    ${kpi('Crescimento recente', pct(rec3), rec3 !== null ? `${ymBr(P.meses[n - 3])}–${ymBr(P.ultimo)} vs mesmo trimestre do ano anterior` : 'precisa de 15 meses de histórico', rec3 >= 0 ? 'text-emerald-700' : 'text-sky-700')}
+    ${kpi('Projeção vs previsão atual', pct(totPrev > 0 ? totPrevP / totPrev - 1 : null), totPrev > 0 ? `${f0(totPrevP)} projetado × ${f0(totPrev)} na previsão (${comPrev.length} produtos)` : 'produtos sem previsão cadastrada', 'text-violet-700')}
+  </div>
+  <div class="bg-white rounded-xl shadow-sm border p-4 mt-4">
+    <div class="flex flex-wrap items-center gap-2"><div class="font-semibold">Vendas por mês: real, projeção e previsão atual</div><span class="text-[11px] text-slate-500">${o.fam ? esc(o.fam) : 'todas as famílias'} · faixa = intervalo provável (80%)</span></div>
+    <div class="h-72 mt-2"><canvas id="chProj"></canvas></div>
+    <div class="mt-3 text-[11px] text-slate-600"><b>Meses atípicos</b> (clique para ignorar no cálculo — promoção, anúncio pausado, falta de estoque geral): <span class="inline-flex flex-wrap gap-1 align-middle">${P.meses.map(ym => `<button class="px-1.5 py-0.5 rounded border ${atip.has(ym) ? 'bg-amber-100 border-amber-400 text-amber-900 font-semibold' : 'bg-white hover:bg-slate-50'}" onclick="toggleAtipico('${ym}')">${ymBr(ym)}</button>`).join('')}</span></div>
+    ${sz ? `<div class="mt-2 text-[11px] text-slate-600"><b>Sazonalidade ${o.fam && sz.fonte === 'família' ? 'da família' : 'geral'}</b> (1,00 = mês médio): ${sz.idx.map((v, i) => `<span class="${v >= 1.1 ? 'text-orange-600 font-semibold' : v <= 0.9 ? 'text-sky-700' : ''}">${MES[i]} ${nf2.format(v)}</span>`).join(' · ')}</div>` : `<div class="mt-2 text-[11px] text-amber-700">Sazonalidade desligada: são necessários pelo menos 13 meses completos de vendas.</div>`}
+  </div>
+  <div class="flex gap-4 border-b mt-5 mb-3">${[['sku', 'Produtos vendidos (SKU)'], ['comp', 'Componentes (itens comprados)']].map(([k, l]) => `<button class="tab border-b-2 border-transparent px-1 pb-2 font-semibold ${o.tab === k ? 'active' : 'text-slate-500'}" onclick="ui.proj.tab='${k}';render()">${l}</button>`).join('')}</div>
+  <div id="projTab"></div>`;
+  // gráfico
+  const hist = P.meses.slice(-24), off = P.meses.length - hist.length;
+  const labels = [...hist, ...P.futuros].map(ymBr), nh = hist.length;
+  const real = hist.map((_, i) => soma(rows0.map(s => s.real[off + i])));
+  const pj = P.futuros.map((_, i) => soma(rows0.map(s => s.proj[i].v))), lo = P.futuros.map((_, i) => soma(rows0.map(s => s.proj[i].lo))), hi = P.futuros.map((_, i) => soma(rows0.map(s => s.proj[i].hi)));
+  const prv = P.futuros.map((_, i) => soma(rows0.map(s => s.prevs[i] || 0)));
+  const pad = a => [...new Array(nh).fill(null), ...a.map(Math.round)];
+  charts.proj = new Chart(document.getElementById('chProj'), { data: { labels, datasets: [
+    { type: 'bar', label: 'Vendido', data: [...real.map(Math.round), ...new Array(P.futuros.length).fill(null)], backgroundColor: hist.map(ym => atip.has(ym) ? '#fcd34d' : '#0ea5e9'), order: 3 },
+    { type: 'line', label: 'Faixa provável (mín.)', data: pad(lo), borderColor: 'transparent', pointRadius: 0, fill: false, order: 2 },
+    { type: 'line', label: 'Faixa provável', data: pad(hi), borderColor: 'transparent', backgroundColor: 'rgba(139,92,246,.15)', pointRadius: 0, fill: '-1', order: 2 },
+    { type: 'line', label: 'Projeção', data: [...new Array(nh - 1).fill(null), Math.round(real[nh - 1]), ...pj.map(Math.round)], borderColor: '#8b5cf6', backgroundColor: '#8b5cf6', borderWidth: 2, pointRadius: 2, order: 1 },
+    { type: 'line', label: 'Previsão atual', data: pad(prv), borderColor: '#f97316', borderDash: [5, 4], borderWidth: 1.5, pointRadius: 0, order: 1 }
+  ] }, options: { maintainAspectRatio: false, interaction: { mode: 'index', intersect: false }, plugins: { legend: { labels: { filter: it => it.text !== 'Faixa provável (mín.)' } } }, scales: { y: { beginAtZero: true } } } });
+  (o.tab === 'comp' ? projTabComp : projTabSku)(document.getElementById('projTab'), P, rows0);
+}
+function toggleAtipico(ym) { const s = new Set(DB.settings.projAtipicos || []); s.has(ym) ? s.delete(ym) : s.add(ym); DB.settings.projAtipicos = [...s].sort(); Store.save('settings'); render(); }
+function projTabSku(el, P, rows0) {
+  const o = ui.proj;
+  let rows = sortRows('proj', rows0, { sku: s => s.sku, fam: s => s.fam, ult: s => s.ult12, ant: s => s.totAnt ?? -1, tot: s => s.tot, cr: s => s.cresc ?? -9, rec: s => s.recente ?? -9, prev: s => s.totPrev ?? -1, vp: s => s.vsPrev ?? -9 });
+  if (!ui.sort.proj) rows = [...rows].sort((a, b) => b.tot - a.tot);
+  el.innerHTML = `<div class="flex flex-wrap gap-2 mb-2 items-center"><input id="pq" placeholder="Buscar SKU" value="${esc(o.q)}" class="border rounded-lg px-3 py-1.5 w-48"><span class="text-xs text-slate-500">${rows.length} produtos</span>
+    <button class="ml-auto rounded-lg px-3 py-1.5 bg-violet-600 text-white hover:bg-violet-700" onclick="adotarProjecao([...document.querySelectorAll('.pjk:checked')].map(c=>c.value))">Usar projeção como previsão (selecionados)</button></div>
+  <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 220px)"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="w-8 text-center"><input type="checkbox" onchange="document.querySelectorAll('.pjk').forEach(c=>c.checked=this.checked)"></th>
+  ${th('proj', 'sku', 'SKU vendido')}${th('proj', 'fam', 'Família')}${th('proj', 'ant', 'Vendido nos mesmos meses do ano anterior', 'num')}${th('proj', 'tot', `Projeção ${o.meses} meses`, 'num')}${th('proj', 'cr', 'Crescimento projetado', 'num')}${th('proj', 'rec', 'Crescimento recente (3 meses)', 'num')}${th('proj', 'prev', 'Previsão atual', 'num')}${th('proj', 'vp', 'Projeção vs previsão', 'num')}<th class="px-2">Método / avisos</th></tr></thead><tbody>
+  ${rows.map(s => `<tr class="border-t hover:bg-sky-50"><td class="text-center"><input type="checkbox" class="pjk" value="${esc(s.sku)}"></td>
+    <td class="px-2 py-1.5 font-semibold text-sky-800 cursor-pointer hover:underline" onclick="openProj('${esc(s.sku)}')">${esc(s.sku)}</td><td class="px-2">${esc(s.fam)}</td>
+<td class="px-2 num">${s.totAnt === null ? '–' : f0(s.totAnt)}</td><td class="px-2 num font-semibold">${f0(s.tot)}</td>
+    <td class="px-2 num ${s.cresc > 0.05 ? 'text-emerald-700 font-semibold' : s.cresc < -0.05 ? 'text-sky-700 font-semibold' : ''}">${pct(s.cresc)}</td><td class="px-2 num">${pct(s.recente)}</td>
+    <td class="px-2 num">${s.totPrev === null ? '<span class="text-violet-600">sem previsão</span>' : f0(s.totPrev)}</td><td class="px-2 num ${s.vsPrev > 0.25 ? 'text-orange-600 font-semibold' : s.vsPrev < -0.25 ? 'text-sky-700 font-semibold' : ''}">${pct(s.vsPrev)}</td>
+    <td class="px-2 text-slate-500 whitespace-normal min-w-[200px]">${esc(s.metodo)}${s.avisos.length ? `<div class="text-amber-700">${s.avisos.map(esc).join(' · ')}</div>` : ''}</td></tr>`).join('') || '<tr><td colspan=11 class="p-4 text-slate-400">Nenhum produto neste filtro</td></tr>'}
+  </tbody></table></div>`;
+  const i = document.getElementById('pq'); i.oninput = e => { ui.proj.q = e.target.value; clearTimeout(i._t); i._t = setTimeout(() => { render(); const j = document.getElementById('pq'); j.focus(); j.setSelectionRange(j.value.length, j.value.length); }, 250); };
+}
+function projTabComp(el, P) {
+  const fam = ui.proj.fam, q = ui.proj.q.toLowerCase();
+  const skuSet = new Set(projFiltro(P).map(s => s.sku));
+  let rows = P.comps.filter(c => (!fam || c.skus.some(s => skuSet.has(s))) && (!q || c.cod.toLowerCase().includes(q)));
+  rows = sortRows('projc', rows, { cod: c => c.cod, tot: c => c.tot, prev: c => c.totPrev, vp: c => c.vsPrev ?? -9 });
+  if (!ui.sort.projc) rows = [...rows].sort((a, b) => Math.abs(b.vsPrev ?? 0) * b.tot - Math.abs(a.vsPrev ?? 0) * a.tot);
+  el.innerHTML = `<div class="text-[11px] text-slate-500 mb-2">Consumo projetado = projeção de cada produto vendido × quantidade na estrutura. Compare com a previsão que o MRP usa hoje para os mesmos meses; diferenças grandes indicam onde revisar a previsão antes de comprar.</div>
+  <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 220px)"><table class="w-full tbl text-xs"><thead><tr class="text-left">
+  ${th('projc', 'cod', 'Componente')}<th class="px-2">Família</th>${th('projc', 'tot', `Consumo projetado ${ui.proj.meses} meses`, 'num')}${th('projc', 'prev', 'Previsão do MRP', 'num')}${th('projc', 'vp', 'Diferença', 'num')}<th class="px-2">Produtos vendidos</th></tr></thead><tbody>
+  ${rows.map(c => { const p = DB.produtos.find(z => z.cod === c.cod); return `<tr class="border-t hover:bg-sky-50 ${p ? 'cursor-pointer' : ''}" ${p ? `onclick="openItem('${esc(c.cod)}')"` : ''}><td class="px-2 py-1.5"><div class="font-semibold">${esc(c.cod)}</div><div class="text-slate-400 truncate max-w-[220px]">${esc(p?.desc || '')}</div></td><td class="px-2">${esc(p?.familia || '')}</td>
+    <td class="px-2 num font-semibold">${f0(c.tot)}</td><td class="px-2 num">${f0(c.totPrev)}</td><td class="px-2 num ${c.vsPrev > 0.25 ? 'text-orange-600 font-semibold' : c.vsPrev < -0.25 ? 'text-sky-700 font-semibold' : ''}">${pct(c.vsPrev)}</td>
+    <td class="px-2 text-slate-500 truncate max-w-[260px]" title="${esc(c.skus.join(', '))}">${esc(c.skus.slice(0, 4).join(', '))}${c.skus.length > 4 ? ` +${c.skus.length - 4}` : ''}</td></tr>`; }).join('') || '<tr><td colspan=6 class="p-4 text-slate-400">Nenhum componente</td></tr>'}
+  </tbody></table></div>`;
+}
+function openProj(sku) {
+  const P = calcProjecao(); const s = P?.skus.find(z => z.sku === sku); if (!s) return;
+  const hist = P.meses.slice(-24), off = P.meses.length - hist.length, nh = hist.length;
+  const labels = [...hist, ...P.futuros].map(ymBr);
+  const box = (l, v) => `<div class="bg-slate-50 rounded-lg p-2"><div class="text-slate-500">${l}</div><div class="font-bold text-sm">${v}</div></div>`;
+  openModal(`${esc(sku)} <span class="font-normal text-slate-500 text-sm">· projeção de vendas</span>`, `
+    <div class="grid grid-cols-2 md:grid-cols-5 gap-2 mb-3 text-xs">${box(`Projeção ${P.H} meses`, f0(s.tot))}${box('Crescimento projetado', pct(s.cresc))}${box('Crescimento recente', pct(s.recente))}${box('Previsão atual', s.totPrev === null ? 'sem previsão' : f0(s.totPrev))}${box('Projeção vs previsão', pct(s.vsPrev))}</div>
+    <div class="h-72"><canvas id="chProjItem"></canvas></div>
+    <div class="grid md:grid-cols-2 gap-4 mt-3 text-xs">
+      <div><div class="font-semibold mb-1">Mês a mês</div><table class="w-full"><thead><tr class="text-left text-slate-500"><th>Mês</th><th class="num">Projeção</th><th class="num">Faixa provável</th><th class="num">Ano anterior</th><th class="num">Previsão atual</th></tr></thead><tbody>
+      ${s.proj.map((p, i) => { const ia = P.meses.indexOf(C.proxMes(p.ym, -12)); return `<tr class="border-t"><td class="py-0.5">${ymBr(p.ym)}</td><td class="num font-semibold">${f0(p.v)}</td><td class="num text-slate-500">${f0(p.lo)}–${f0(p.hi)}</td><td class="num">${ia >= 0 ? f0(s.real[ia]) : '–'}</td><td class="num">${s.prevs[i] === null ? '–' : f0(s.prevs[i])}</td></tr>`; }).join('')}</tbody></table></div>
+      <div class="text-slate-600"><div class="font-semibold text-sm text-slate-800 mb-1">Como foi calculado</div>
+        <div>Método: <b>${esc(s.metodo)}</b>${s.modelo.alpha !== null ? ` (nível ${nf2.format(s.modelo.alpha)}, tendência ${nf2.format(s.modelo.beta)}, amortecimento ${nf2.format(s.modelo.phi)})` : ''}.</div>
+        ${s.saz ? `<div class="mt-1">Sazonalidade usada: ${s.saz.idx.map((v, i) => `${MES[i]} ${nf2.format(v)}`).join(' · ')}</div>` : ''}
+        ${s.flag.some(f => f === 'ruptura' || f === 'marcado') ? `<div class="mt-1 text-amber-700">Meses ignorados (substituídos pela média dos vizinhos): ${P.meses.filter((_, i) => s.flag[i] === 'ruptura' || s.flag[i] === 'marcado').map(ymBr).join(', ')}</div>` : ''}
+        ${s.avisos.length ? `<div class="mt-1 text-amber-700">${s.avisos.map(esc).join(' · ')}</div>` : ''}
+        <div class="mt-2">A projeção não sabe de lançamentos, mudança de preço, novos canais ou promoções futuras. Use como referência para conferir a previsão.</div>
+        <div class="mt-3"><button class="rounded-lg px-3 py-1.5 bg-violet-600 text-white" onclick="adotarProjecao(['${esc(sku)}'])">Usar esta projeção como previsão</button></div></div>
+    </div>`, 'max-w-5xl');
+  const pad = a => [...new Array(nh).fill(null), ...a.map(Math.round)];
+  charts.m_proj = new Chart(document.getElementById('chProjItem'), { data: { labels, datasets: [
+    { type: 'bar', label: 'Vendido', data: [...hist.map((_, i) => Math.round(s.real[off + i])), ...new Array(P.futuros.length).fill(null)], backgroundColor: hist.map((_, i) => s.flag[off + i] === 'ruptura' || s.flag[off + i] === 'marcado' ? '#fcd34d' : '#0ea5e9'), order: 3 },
+    { type: 'line', label: 'mín', data: pad(s.proj.map(p => p.lo)), borderColor: 'transparent', pointRadius: 0, fill: false, order: 2 },
+    { type: 'line', label: 'Faixa provável', data: pad(s.proj.map(p => p.hi)), borderColor: 'transparent', backgroundColor: 'rgba(139,92,246,.15)', pointRadius: 0, fill: '-1', order: 2 },
+    { type: 'line', label: 'Projeção', data: [...new Array(nh - 1).fill(null), Math.round(s.real[off + nh - 1]), ...s.proj.map(p => Math.round(p.v))], borderColor: '#8b5cf6', backgroundColor: '#8b5cf6', borderWidth: 2, pointRadius: 2, order: 1 },
+    { type: 'line', label: 'Previsão atual', data: pad(s.prevs.map(v => v || 0)), borderColor: '#f97316', borderDash: [5, 4], borderWidth: 1.5, pointRadius: 0, order: 1 }
+  ] }, options: { maintainAspectRatio: false, interaction: { mode: 'index', intersect: false }, plugins: { legend: { labels: { filter: it => it.text !== 'mín' } } }, scales: { y: { beginAtZero: true } } } });
+}
+function adotarProjecao(skus) {
+  const P = calcProjecao(); if (!P || !skus.length) { toast('Selecione produtos'); return; }
+  const rows = skus.map(s => P.skus.find(z => z.sku === s)).filter(Boolean);
+  const ym0 = hoje().slice(0, 7), meses = P.futuros.filter(ym => ym >= ym0);
+  if (!meses.length) { toast('A projeção termina antes do mês atual — importe vendas recentes'); return; }
+  if (!confirm(`Gravar a projeção como previsão de ${rows.length} produto(s)?\n\nCada mês de ${ymBr(meses[0])} a ${ymBr(meses.at(-1))} recebe a venda projetada por dia daquele mês; o valor padrão passa a ser a média projetada (vale para os meses depois). Ajustes mensais existentes nesses meses serão substituídos. O MRP e as sugestões serão recalculados.`)) return;
+  const alvo = new Set(rows.map(s => s.sku));
+  const comps = new Set(rows.flatMap(s => DB.estrutura.filter(e => e.pa === s.sku).map(e => e.mp)));
+  const duplos = DB.previsao.filter(f => !alvo.has(f.pa) && C.num(f.padrao) > 0 && !(DB.vendas.skus[f.pa]) && DB.estrutura.some(e => e.pa === f.pa && comps.has(e.mp)));
+  let zerar = false;
+  if (duplos.length) zerar = confirm(`Atenção: ${duplos.map(f => f.pa).join(', ')} também têm previsão para os mesmos componentes, mas não aparecem nas vendas (provavelmente código antigo).\n\nZerar a previsão deles para não contar a demanda em dobro? (OK = zerar, Cancelar = manter)`);
+  if (zerar) duplos.forEach(f => { f.padrao = 0; Object.keys(f.meses || {}).forEach(k => { if (k >= ym0) delete f.meses[k]; }); });
+  rows.forEach(s => {
+    let f = DB.previsao.find(z => z.pa === s.sku);
+    if (!f) { f = { pa: s.sku, grupo: s.fam, padrao: 0, meses: {} }; DB.previsao.push(f); }
+    f.meses = f.meses || {};
+    const ps = s.proj.filter(p => p.ym >= ym0);
+    ps.forEach(p => { f.meses[p.ym] = Math.round(p.dia * 100) / 100; });
+    f.padrao = Math.round(ps.reduce((a, p) => a + p.dia, 0) / ps.length * 100) / 100;
+  });
+  ui.projRev = (ui.projRev || 0) + 1;
+  closeModal(); changed('previsao'); toast(`Previsão atualizada com a projeção para ${rows.length} produto(s)${zerar ? ` · ${duplos.length} código(s) antigo(s) zerado(s)` : ''}`, 4000);
 }
 function openVenda(cod, nivel) {
   const V = R?.vendas; if (!V) return;
