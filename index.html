@@ -29,11 +29,12 @@
   .cell-input:hover { border-color:#cbd5e1; } .cell-input:focus { border-color:#0ea5e9; background:#fff; outline:none; }
   .modal-bg { background: rgba(15,23,42,.55); }
   .cell-input::-webkit-inner-spin-button, .cell-input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; } .cell-input { -moz-appearance: textfield; }
-  .grade-mrp td, .grade-mrp th { border-bottom: 1px solid #f1f5f9; white-space: nowrap; }
+  .grade-mrp td, .grade-mrp th { border-bottom: 1px solid #f1f5f9; white-space: nowrap; height: 18px; line-height: 17px; padding-top: 0; padding-bottom: 0; overflow: hidden; }
+  .grade-mrp td.num, .grade-mrp th.num { padding-left: 4px; padding-right: 6px; }
   .grade-mrp thead th { position: sticky; top: 0; z-index: 3; }
-  .grade-mrp .g-s0 { position: sticky; left: 0; background: #fff; z-index: 2; min-width: 170px; max-width: 170px; border-right: 1px solid #e2e8f0; }
-  .grade-mrp .g-s1 { position: sticky; left: 170px; background: #fff; z-index: 2; min-width: 110px; }
-  .grade-mrp .g-s2 { position: sticky; left: 280px; background: #f8fafc; z-index: 2; min-width: 64px; border-right: 2px solid #cbd5e1; }
+  .grade-mrp .g-s0 { position: sticky; left: 0; background: #fff; z-index: 2; width: 170px; max-width: 170px; border-right: 1px solid #e2e8f0; height: auto; }
+  .grade-mrp .g-s1 { position: sticky; left: 170px; background: #fff; z-index: 2; width: 110px; }
+  .grade-mrp .g-s2 { position: sticky; left: 280px; background: #f8fafc; z-index: 2; width: 64px; border-right: 2px solid #cbd5e1; }
   .grade-mrp thead .g-s0, .grade-mrp thead .g-s1, .grade-mrp thead .g-s2 { z-index: 4; background: #f1f5f9; }
   .grade-mrp tr.g-first td { border-top: 2px solid #94a3b8; }
   .tab.active { border-color:#0ea5e9; color:#0369a1; }
@@ -1232,35 +1233,67 @@ function gradeLinhas(x, N, gran) {
   const fim = arr => cols.map(([, b]) => arr[b]);
   return { cols, prev: soma(x.rates), ped: soma(ped), emb: soma(emb), che: soma(x.arr), sug: soma(sug), est: fim(x.S), dias: fim(dias), falta: soma(x.lost) };
 }
+// grade virtualizada: só desenha os itens e dias visíveis na tela (rápido mesmo com 240 dias)
 function renderGrade(box, rows) {
   const G = ui.grade, t = R.opts.today, N = Math.min(R.opts.horizonte + 1, G.dias), gran = G.gran;
   if (!rows.length) { box.innerHTML = '<div class="bg-white rounded-xl border p-6 text-slate-500">Nenhum item neste filtro.</div>'; return; }
-  const cols0 = gradeLinhas(rows[0], N, gran).cols;
+  const data = rows.map(x => ({ x, L: gradeLinhas(x, N, gran) }));
+  const cols = data[0].L.cols, CW = gran === 'dia' ? 46 : 58, RH = 18, W0 = 170, W1 = 110, W2 = 64;
+  const nomes = ['Previsão', ...(G.ordens ? ['Pedido (PO)', 'Embarque'] : []), 'Chegada', 'Sugestão MRP', 'Estoque', 'Dias de estoque'];
+  let BH = nomes.length * RH + 2;
   const lbl = ([a]) => { const d = C.addDays(t, a); return `${d.slice(8, 10)}/${MESC[Number(d.slice(5, 7)) - 1]}`; };
-  const wkend = ([a]) => { if (gran !== 'dia') return false; const w = new Date(C.addDays(t, a) + 'T12:00:00').getDay(); return w === 0 || w === 6; };
-  const cell = (v, cls = '') => `<td class="px-1.5 num ${cls}">${v}</td>`;
+  const wkend = cols.map(([a]) => { if (gran !== 'dia') return false; const w = new Date(C.addDays(t, a) + 'T12:00:00').getDay(); return w === 0 || w === 6; });
   const n0 = v => v ? f0(v) : '<span class="text-slate-300">0</span>';
-  let html = `<div class="text-[11px] text-slate-500 mb-2">Previsão = consumo previsto do componente · Pedido/Embarque/Chegada = ordens em aberto · Sugestão = chegadas sugeridas pelo MRP · Estoque = projetado no fim do ${gran === 'dia' ? 'dia' : 'período'} · Dias de estoque = estoque ÷ consumo médio dos 30 dias seguintes. <span class="inline-block w-3 h-3 align-middle bg-red-500 rounded-sm"></span> ruptura <span class="inline-block w-3 h-3 align-middle bg-amber-300 rounded-sm ml-2"></span> abaixo do estoque de segurança <span class="inline-block w-3 h-3 align-middle bg-emerald-100 rounded-sm ml-2"></span> ok</div>
-  <div class="bg-white rounded-xl shadow-sm border overflow-auto" style="max-height:calc(100vh - 220px)"><table class="text-[11px] grade-mrp" style="border-collapse:separate;border-spacing:0">
-  <thead><tr><th class="g-s0 px-2 py-1.5 text-left">Item</th><th class="g-s1 px-2 text-left">Linha</th><th class="g-s2 px-2 num">Atual</th>${cols0.map(c => `<th class="px-1.5 num font-semibold ${c[0] === 0 ? 'bg-yellow-200' : wkend(c) ? 'bg-slate-200' : 'bg-slate-50'}" style="min-width:${gran === 'dia' ? 44 : 56}px">${lbl(c)}</th>`).join('')}</tr></thead><tbody>`;
-  rows.forEach((x, i) => {
-    const L = gradeLinhas(x, N, gran), seg = x.prm.seg;
-    const linhas = [['Previsão', L.prev.map(v => cell(v ? f1(v) : '<span class="text-slate-300">0</span>'))]];
-    if (G.ordens) { linhas.push(['Pedido (PO)', L.ped.map(v => cell(n0(v), v ? 'font-semibold text-violet-700' : ''))]); linhas.push(['Embarque', L.emb.map(v => cell(n0(v), v ? 'font-semibold text-sky-700' : ''))]); }
-    linhas.push(['Chegada', L.che.map(v => cell(n0(v), v ? 'font-bold text-emerald-700 bg-emerald-50' : ''))]);
-    linhas.push(['Sugestão MRP', L.sug.map(v => cell(n0(v), v ? 'font-semibold text-violet-700 bg-violet-50' : ''))]);
-    linhas.push(['Estoque', L.est.map((v, k) => cell(f0(v), v <= 0 && L.prev[k] > 0 ? 'text-red-600 font-bold' : 'font-semibold'))]);
-    linhas.push(['Dias de estoque', L.dias.map(v => v === null ? cell('–', 'text-slate-300') : cell(f0(v), v < 1 ? 'bg-red-500 text-white font-bold' : v < seg ? 'bg-amber-300 font-semibold' : 'bg-emerald-50'))]);
-    linhas.forEach(([nome, tds], j) => {
-      const primeira = j === 0;
-      html += `<tr class="${primeira ? 'g-first' : ''}">${primeira ? `<td class="g-s0 px-2 py-1 align-top cursor-pointer" rowspan="${linhas.length}" onclick="openItem('${esc(x.cod)}')"><div class="font-bold text-sky-800">${esc(x.cod)}</div><div class="text-slate-400 truncate" style="max-width:150px" title="${esc(x.produto.desc)}">${esc(x.produto.desc)}</div><div class="mt-1">${badge(x.status)}</div><div class="text-slate-400 mt-0.5">${esc(x.produto.familia)}</div></td>` : ''}
-      <td class="g-s1 px-2 whitespace-nowrap ${nome === 'Dias de estoque' ? 'font-semibold' : 'text-slate-600'}">${nome}</td><td class="g-s2 px-2 num text-slate-500">${nome === 'Estoque' ? f0(x.produto.estoque) : nome === 'Dias de estoque' ? (x.diasEstoque === null ? '–' : f0(x.diasEstoque)) : nome === 'Previsão' ? f1(x.avg30) + '/d' : ''}</td>${tds.join('')}</tr>`;
-    });
-  });
-  html += `</tbody></table></div>`;
-  box.innerHTML = html;
+  const celula = (nome, L, k, seg) => {
+    let v, cls = '';
+    switch (nome) {
+      case 'Previsão': v = L.prev[k]; return `<td class="num">${v ? f1(v) : '<span class="text-slate-300">0</span>'}</td>`;
+      case 'Pedido (PO)': v = L.ped[k]; return `<td class="num ${v ? 'font-semibold text-violet-700' : ''}">${n0(v)}</td>`;
+      case 'Embarque': v = L.emb[k]; return `<td class="num ${v ? 'font-semibold text-sky-700' : ''}">${n0(v)}</td>`;
+      case 'Chegada': v = L.che[k]; return `<td class="num ${v ? 'font-bold text-emerald-700 bg-emerald-50' : ''}">${n0(v)}</td>`;
+      case 'Sugestão MRP': v = L.sug[k]; return `<td class="num ${v ? 'font-semibold text-violet-700 bg-violet-50' : ''}">${n0(v)}</td>`;
+      case 'Estoque': v = L.est[k]; return `<td class="num ${v <= 0 && L.prev[k] > 0 ? 'text-red-600 font-bold' : 'font-semibold'}">${f0(v)}</td>`;
+      default: v = L.dias[k]; if (v === null) return '<td class="num text-slate-300">–</td>';
+        cls = v < 1 ? 'bg-red-500 text-white font-bold' : v < seg ? 'bg-amber-300 font-semibold' : 'bg-emerald-50'; return `<td class="num ${cls}">${f0(v)}</td>`;
+    }
+  };
+  box.innerHTML = `<div class="text-[11px] text-slate-500 mb-2">Previsão = consumo previsto do componente · Pedido/Embarque/Chegada = ordens em aberto · Sugestão = chegadas sugeridas pelo MRP · Estoque = projetado no fim do ${gran === 'dia' ? 'dia' : 'período'} · Dias de estoque = estoque ÷ consumo médio dos 30 dias seguintes. <span class="inline-block w-3 h-3 align-middle bg-red-500 rounded-sm"></span> ruptura <span class="inline-block w-3 h-3 align-middle bg-amber-300 rounded-sm ml-2"></span> abaixo do estoque de segurança <span class="inline-block w-3 h-3 align-middle bg-emerald-100 rounded-sm ml-2"></span> ok</div>
+  <div id="gScroll" class="bg-white rounded-xl shadow-sm border overflow-auto" style="height:calc(100vh - 240px)"><table id="gTbl" class="text-[11px] grade-mrp" style="table-layout:fixed;border-collapse:separate;border-spacing:0;width:${W0 + W1 + W2 + cols.length * CW}px"></table></div>`;
+  const sc = box.querySelector('#gScroll'), tbl = box.querySelector('#gTbl');
+  let last = null;
+  const draw = (force) => {
+    const top = sc.scrollTop, h = sc.clientHeight || 600, left = sc.scrollLeft, w = (sc.clientWidth || 1200) - (W0 + W1 + W2);
+    // faixa visível; só redesenha quando ela sai da faixa já desenhada (que tem folga)
+    const v0 = Math.floor(top / BH), v1 = Math.ceil((top + h) / BH), w0 = Math.floor(left / CW), w1 = Math.ceil((left + w) / CW);
+    if (!force && last && v0 >= last[0] && v1 <= last[1] && w0 >= last[2] && w1 <= last[3]) return;
+    const r0 = Math.max(0, v0 - 4), r1 = Math.min(data.length, v1 + 4), c0 = Math.max(0, w0 - 15), c1 = Math.min(cols.length, w1 + 15);
+    last = [r0 === 0 ? 0 : r0 + 1, r1 === data.length ? r1 : r1 - 1, c0 === 0 ? 0 : c0 + 3, c1 === cols.length ? c1 : c1 - 3];
+    const espL = c0 * CW, espR = (cols.length - c1) * CW;
+    let hh = `<thead><tr><th class="g-s0 px-2 py-1.5 text-left" style="width:${W0}px">Item</th><th class="g-s1 px-2 text-left" style="width:${W1}px">Linha</th><th class="g-s2 px-2 num" style="width:${W2}px">Atual</th>${espL ? `<th style="width:${espL}px"></th>` : ''}`;
+    for (let k = c0; k < c1; k++) hh += `<th class="num font-semibold ${cols[k][0] === 0 ? 'bg-yellow-200' : wkend[k] ? 'bg-slate-200' : 'bg-slate-50'}" style="width:${CW}px">${lbl(cols[k])}</th>`;
+    hh += `${espR ? `<th style="width:${espR}px"></th>` : ''}</tr></thead><tbody>`;
+    if (r0 > 0) hh += `<tr><td colspan="${3 + (c1 - c0) + (espL ? 1 : 0) + (espR ? 1 : 0)}" style="height:${r0 * BH}px;padding:0;border:0"></td></tr>`;
+    for (let i = r0; i < r1; i++) {
+      const { x, L } = data[i], seg = x.prm.seg;
+      nomes.forEach((nome, j) => {
+        hh += `<tr class="${j === 0 ? 'g-first' : ''}">`;
+        if (j === 0) hh += `<td class="g-s0 px-2 align-top cursor-pointer" rowspan="${nomes.length}" onclick="openItem('${esc(x.cod)}')"><div class="font-bold text-sky-800 leading-4 pt-0.5">${esc(x.cod)}</div><div class="text-slate-400 truncate leading-4" title="${esc(x.produto.desc)}">${esc(x.produto.desc)}</div><div class="leading-5">${badge(x.status)}</div><div class="text-slate-400 leading-4 truncate">${esc(x.produto.familia)}</div></td>`;
+        hh += `<td class="g-s1 px-2 ${nome === 'Dias de estoque' ? 'font-semibold' : 'text-slate-600'}">${nome}</td><td class="g-s2 px-2 num text-slate-500">${nome === 'Estoque' ? f0(x.produto.estoque) : nome === 'Dias de estoque' ? (x.diasEstoque === null ? '–' : f0(x.diasEstoque)) : nome === 'Previsão' ? f1(x.avg30) + '/d' : ''}</td>`;
+        if (espL) hh += '<td></td>';
+        for (let k = c0; k < c1; k++) hh += celula(nome, L, k, seg);
+        if (espR) hh += '<td></td>';
+        hh += '</tr>';
+      });
+    }
+    if (r1 < data.length) hh += `<tr><td colspan="${3 + (c1 - c0) + (espL ? 1 : 0) + (espR ? 1 : 0)}" style="height:${(data.length - r1) * BH}px;padding:0;border:0"></td></tr>`;
+    tbl.innerHTML = hh + '</tbody>';
+  };
+  let raf = 0; sc.addEventListener('scroll', () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; draw(); }); });
+  draw(true);
+  // mede a altura real de um bloco de item e redesenha se for diferente da estimada
+  const linhas = tbl.querySelectorAll('tbody tr.g-first');
+  if (linhas.length > 1) { const real = linhas[1].offsetTop - linhas[0].offsetTop; if (real > 0 && Math.abs(real - BH) > 0.5) { BH = real; draw(true); } }
 }
-
 /* ===== Detalhe do item ===== */
 function openItem(cod) {
   const x = R.byCod.get(cod); if (!x) return;
