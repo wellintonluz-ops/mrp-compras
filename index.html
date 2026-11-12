@@ -699,8 +699,12 @@ const MRPCore = (function () {
       const real = s.r.map((v, t) => v * diasMes(meses[t]));
       const tot = soma(proj.map(p => p.v));
       // mesmo período do ano anterior (só se todos os meses existirem no histórico)
+      // compara só os meses projetados que têm o mesmo mês do ano anterior no histórico (mínimo 3)
       const ant = futuros.map(ym => meses.indexOf(proxMes(ym, -12)));
-      const totAnt = ant.every(t => t >= s.ini) ? soma(ant.map(t => real[t])) : null;
+      const okA = ant.map(t => t >= 0 && t >= s.ini), nComp = okA.filter(Boolean).length;
+      const totAnt = nComp >= 3 ? soma(ant.filter((t, i) => okA[i]).map(t => real[t])) : null;
+      const totComp = nComp >= 3 ? soma(proj.filter((p, i) => okA[i]).map(p => p.v)) : null;
+      const compDe = nComp >= 3 ? futuros.find((_, i) => okA[i]) : null, compAte = nComp >= 3 ? futuros.filter((_, i) => okA[i]).at(-1) : null;
       const n12 = Math.min(12, meses.length - s.ini), ult = soma(real.slice(-n12));
       // crescimento recente: últimos 3 meses × mesmos 3 meses do ano anterior
       const t3 = [meses.length - 3, meses.length - 2, meses.length - 1], a3 = t3.map(t => t - 12);
@@ -710,7 +714,7 @@ const MRPCore = (function () {
       if (s.ini > 0 && nh < 12) avisos.push('produto novo');
       if (s.flag.some(f => f === 'ruptura')) avisos.push(`${s.flag.filter(f => f === 'ruptura').length} mês(es) tratado(s) como ruptura`);
       const ult3 = soma(s.r.slice(-4, -1)) / 3; if (nh >= 4 && ult3 > 0 && s.r[s.r.length - 1] < 0.3 * ult3) avisos.push('queda forte no último mês — confira ruptura');
-      return { sku: s.sku, fam: s.fam, metodo, usaSaz, saz: usaSaz ? S : null, real, flag: s.flag, proj, tot, totAnt, cresc: totAnt > 0 ? tot / totAnt - 1 : null, ult12: ult, n12, recente, prevs, totPrev, vsPrev: totPrev > 0 ? tot / totPrev - 1 : null, avisos, modelo: { alpha: m.alpha, beta: m.beta, phi: m.phi } };
+      return { sku: s.sku, fam: s.fam, metodo, usaSaz, saz: usaSaz ? S : null, real, flag: s.flag, proj, tot, totAnt, cresc: totAnt > 0 ? totComp / totAnt - 1 : null, totComp, nComp, compDe, compAte, ult12: ult, n12, recente, prevs, totPrev, vsPrev: totPrev > 0 ? tot / totPrev - 1 : null, avisos, modelo: { alpha: m.alpha, beta: m.beta, phi: m.phi } };
     });
     // por componente (projeção × estrutura) comparado à previsão usada no MRP
     const struct = new Map(); db.estrutura.forEach(e => { if (!struct.has(e.pa)) struct.set(e.pa, []); struct.get(e.pa).push({ mp: e.mp, qtd: num(e.qtd) }); });
@@ -2427,7 +2431,8 @@ function pgProjecao(el) {
   if (!P) { el.innerHTML = `<div class="bg-white rounded-xl border p-6 max-w-2xl"><div class="font-bold text-base">Nenhum relatório de vendas importado</div><div class="text-slate-600 mt-2">A projeção usa o histórico de vendas. Importe em <a class="text-sky-700 underline cursor-pointer" onclick="go('importar')">Importar / Exportar → card 3</a>.</div></div>`; return; }
   if (P.erro) { el.innerHTML = `<div class="bg-white rounded-xl border p-6 max-w-2xl">${esc(P.erro)}</div>`; return; }
   const rows0 = projFiltro(P), soma = a => a.reduce((x, y) => x + y, 0);
-  const tot = soma(rows0.map(s => s.tot)), comAnt = rows0.filter(s => s.totAnt !== null), totAnt = soma(comAnt.map(s => s.totAnt)), totAntP = soma(comAnt.map(s => s.tot));
+  const tot = soma(rows0.map(s => s.tot)), comAnt = rows0.filter(s => s.totAnt !== null), totAnt = soma(comAnt.map(s => s.totAnt)), totAntP = soma(comAnt.map(s => s.totComp));
+  const cmpDe = comAnt.map(s => s.compDe).sort()[0], cmpAte = comAnt.map(s => s.compAte).sort().at(-1);
   const comPrev = rows0.filter(s => s.totPrev !== null), totPrev = soma(comPrev.map(s => s.totPrev)), totPrevP = soma(comPrev.map(s => s.tot));
   const n = P.meses.length, i3 = [n - 3, n - 2, n - 1], a3 = i3.map(i => i - 12);
   const rec3 = a3[0] >= 0 ? (() => { const a = soma(rows0.map(s => soma(a3.map(i => s.real[i])))), b = soma(rows0.map(s => soma(i3.map(i => s.real[i])))); return a > 0 ? b / a - 1 : null; })() : null;
@@ -2445,7 +2450,7 @@ function pgProjecao(el) {
   ${defas > 20 ? `<div class="mb-3 p-2 rounded bg-amber-50 border border-amber-200 text-amber-900 text-xs">⚠ As vendas importadas vão até ${fd(P.fimVendas)}. Meses incompletos não entram; importe vendas recentes para a projeção partir do mês atual.</div>` : ''}
   <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
     ${kpi(`Projeção ${o.meses} meses`, f0(tot), `unidades vendidas${o.fam ? ' · ' + esc(o.fam) : ''}`, 'text-slate-800')}
-    ${kpi('Crescimento projetado', pct(totAnt > 0 ? totAntP / totAnt - 1 : null), totAnt > 0 ? `vs mesmos meses do ano anterior (${ymBr(C.proxMes(P.futuros[0], -12))}–${ymBr(C.proxMes(P.futuros.at(-1), -12))})` : 'sem histórico do ano anterior para esses meses', totAnt > 0 && totAntP / totAnt - 1 >= 0 ? 'text-emerald-700' : 'text-sky-700')}
+    ${kpi('Crescimento projetado', pct(totAnt > 0 ? totAntP / totAnt - 1 : null), totAnt > 0 ? `${ymBr(cmpDe)}–${ymBr(cmpAte)} projetado vs ${ymBr(C.proxMes(cmpDe, -12))}–${ymBr(C.proxMes(cmpAte, -12))} vendido` : 'sem histórico do ano anterior para esses meses', totAnt > 0 && totAntP / totAnt - 1 >= 0 ? 'text-emerald-700' : 'text-sky-700')}
     ${kpi('Crescimento recente', pct(rec3), rec3 !== null ? `${ymBr(P.meses[n - 3])}–${ymBr(P.ultimo)} vs mesmo trimestre do ano anterior` : 'precisa de 15 meses de histórico', rec3 >= 0 ? 'text-emerald-700' : 'text-sky-700')}
     ${kpi('Projeção vs previsão atual', pct(totPrev > 0 ? totPrevP / totPrev - 1 : null), totPrev > 0 ? `${f0(totPrevP)} projetado × ${f0(totPrev)} na previsão (${comPrev.length} produtos)` : 'produtos sem previsão cadastrada', 'text-violet-700')}
   </div>
@@ -2484,7 +2489,7 @@ function projTabSku(el, P, rows0) {
   ${th('proj', 'sku', 'SKU vendido')}${th('proj', 'fam', 'Família')}${th('proj', 'ant', 'Vendido nos mesmos meses do ano anterior', 'num')}${th('proj', 'tot', `Projeção ${o.meses} meses`, 'num')}${th('proj', 'cr', 'Crescimento projetado', 'num')}${th('proj', 'rec', 'Crescimento recente (3 meses)', 'num')}${th('proj', 'prev', 'Previsão atual', 'num')}${th('proj', 'vp', 'Projeção vs previsão', 'num')}<th class="px-2">Método / avisos</th></tr></thead><tbody>
   ${rows.map(s => `<tr class="border-t hover:bg-sky-50"><td class="text-center"><input type="checkbox" class="pjk" value="${esc(s.sku)}"></td>
     <td class="px-2 py-1.5 font-semibold text-sky-800 cursor-pointer hover:underline" onclick="openProj('${esc(s.sku)}')">${esc(s.sku)}</td><td class="px-2">${esc(s.fam)}</td>
-<td class="px-2 num">${s.totAnt === null ? '–' : f0(s.totAnt)}</td><td class="px-2 num font-semibold">${f0(s.tot)}</td>
+<td class="px-2 num" title="${s.totAnt === null ? '' : `${ymBr(C.proxMes(s.compDe, -12))} a ${ymBr(C.proxMes(s.compAte, -12))}`}">${s.totAnt === null ? '–' : f0(s.totAnt)}${s.totAnt !== null && s.nComp < P.H ? `<span class="text-slate-400"> (${s.nComp}m)</span>` : ''}</td><td class="px-2 num font-semibold">${f0(s.tot)}</td>
     <td class="px-2 num ${s.cresc > 0.05 ? 'text-emerald-700 font-semibold' : s.cresc < -0.05 ? 'text-sky-700 font-semibold' : ''}">${pct(s.cresc)}</td><td class="px-2 num">${pct(s.recente)}</td>
     <td class="px-2 num">${s.totPrev === null ? '<span class="text-violet-600">sem previsão</span>' : f0(s.totPrev)}</td><td class="px-2 num ${s.vsPrev > 0.25 ? 'text-orange-600 font-semibold' : s.vsPrev < -0.25 ? 'text-sky-700 font-semibold' : ''}">${pct(s.vsPrev)}</td>
     <td class="px-2 text-slate-500 whitespace-normal min-w-[200px]">${esc(s.metodo)}${s.avisos.length ? `<div class="text-amber-700">${s.avisos.map(esc).join(' · ')}</div>` : ''}</td></tr>`).join('') || '<tr><td colspan=11 class="p-4 text-slate-400">Nenhum produto neste filtro</td></tr>'}
@@ -2511,7 +2516,7 @@ function openProj(sku) {
   const labels = [...hist, ...P.futuros].map(ymBr);
   const box = (l, v) => `<div class="bg-slate-50 rounded-lg p-2"><div class="text-slate-500">${l}</div><div class="font-bold text-sm">${v}</div></div>`;
   openModal(`${esc(sku)} <span class="font-normal text-slate-500 text-sm">· projeção de vendas</span>`, `
-    <div class="grid grid-cols-2 md:grid-cols-5 gap-2 mb-3 text-xs">${box(`Projeção ${P.H} meses`, f0(s.tot))}${box('Crescimento projetado', pct(s.cresc))}${box('Crescimento recente', pct(s.recente))}${box('Previsão atual', s.totPrev === null ? 'sem previsão' : f0(s.totPrev))}${box('Projeção vs previsão', pct(s.vsPrev))}</div>
+    <div class="grid grid-cols-2 md:grid-cols-5 gap-2 mb-3 text-xs">${box(`Projeção ${P.H} meses`, f0(s.tot))}${box('Crescimento projetado', pct(s.cresc) + (s.cresc !== null && s.nComp < P.H ? `<div class="text-[10px] font-normal text-slate-500">${ymBr(s.compDe)}–${ymBr(s.compAte)} vs ano anterior</div>` : ''))}${box('Crescimento recente', pct(s.recente))}${box('Previsão atual', s.totPrev === null ? 'sem previsão' : f0(s.totPrev))}${box('Projeção vs previsão', pct(s.vsPrev))}</div>
     <div class="h-72"><canvas id="chProjItem"></canvas></div>
     <div class="grid md:grid-cols-2 gap-4 mt-3 text-xs">
       <div><div class="font-semibold mb-1">Mês a mês</div><table class="w-full"><thead><tr class="text-left text-slate-500"><th>Mês</th><th class="num">Projeção</th><th class="num">Faixa provável</th><th class="num">Ano anterior</th><th class="num">Previsão atual</th></tr></thead><tbody>
