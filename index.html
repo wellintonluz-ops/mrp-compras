@@ -1982,7 +1982,7 @@ function pgVendas(el) {
   const grupos = {}; V.alertas.forEach(a => (grupos[a.tipo] = grupos[a.tipo] || []).push(a));
   el.innerHTML = `
   <div class="flex flex-wrap items-center gap-3 mb-3">
-    <label class="text-xs">Janela analisada <select class="border rounded-lg px-2 py-1 ml-1" onchange="setVendOpt('janela',Number(this.value))">${[30, 60, 90, 120, 180].map(d => opt(d, O.janela, `últimos ${d} dias`)).join('')}</select></label>
+    <label class="text-xs">Janela analisada <select class="border rounded-lg px-2 py-1 ml-1" onchange="setVendOpt('janela',Number(this.value))">${[7, 15, 30, 60, 90, 120, 180].map(d => opt(d, O.janela, `últimos ${d} dias`)).join('')}</select></label>
     <label class="text-xs">Tolerância <input type="number" value="${O.tolerancia}" class="border rounded-lg px-2 py-1 w-16" onchange="setVendOpt('tolerancia',Number(this.value)||25)">%</label>
     <label class="text-xs flex items-center gap-1"><input type="checkbox" ${O.excluirB2B ? 'checked' : ''} onchange="setVendOpt('excluirB2B',this.checked)"> Excluir propostas comerciais (B2B)</label>
     <span class="text-xs text-slate-500">Vendas no site: ${fd(DB.vendas.base)} a ${fd(V.fim)} · janela: ${fd(V.ini)} a ${fd(V.fim)} (${V.nd} dias)</span>
