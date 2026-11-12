@@ -29,6 +29,10 @@ Planejamento de importação: estoque projetado dia a dia, ruptura, ordens de co
 - Pontos de atenção: ruptura antecipada, risco de comprar demais, vendas fora da estrutura, cobertura excessiva, mudança de tendência, vendas B2B pontuais e previsão sem venda.
 - SKUs vendidos em pacote (ex.: PBG0007-5) recebem sugestão de vínculo com o componente, usando o mesmo fator do código _MKT.
 
+## Revisão de ordens (postergar / reduzir / cancelar)
+- Em Ordens de compra → aba Revisão, cada ordem em aberto é comparada com a demanda considerada (previsão do MRP ou ritmo real de vendas): postergar quando a necessidade só ocorre bem depois da chegada, cancelar quando não há necessidade no horizonte, reduzir quando sobra mais que segurança + uma cobertura no fim do horizonte.
+- Ordens "Em trânsito" aparecem só como aviso. As ações são aplicadas nas ordens selecionadas (canceladas ficam com status Cancelado).
+
 ## Câmbio
 - Previsões usam o câmbio em tempo real: comercial (AwesomeAPI, venda) ou PTAX do Banco Central (fechamento), atualizado a cada 30 minutos, com margem de segurança opcional. Também dá para informar manualmente.
 - Ordens com câmbio fechado: informe o **câmbio pago** na linha da ordem (ou em várias linhas de uma vez). O valor dessas ordens usa o câmbio pago; as demais usam o de previsão.

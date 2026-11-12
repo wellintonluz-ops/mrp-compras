@@ -805,6 +805,65 @@ const MRPCore = (function () {
     return out.sort((a, b) => a.fornecedor.localeCompare(b.fornecedor));
   }
 
+
+  // ---------- revisão de ordens em aberto (postergar / reduzir / cancelar) ----------
+  // base 'mrp' = previsão usada no MRP; 'real' = ritmo real de vendas (análise Vendas x Previsão)
+  function revisarOrdens(db, R, o = {}) {
+    const today = R.opts.today, H = R.opts.horizonte, tol = num(o.tolerancia ?? 15);
+    const real = o.base === 'real' && R.vendas ? new Map(R.vendas.itens.map(a => [a.cod, a.realDia])) : null;
+    const MOVEL = ['Planejada', 'Simulação', 'Em produção'];
+    const recs = [];
+    R.itens.forEach(x => {
+      if (!x.abertas.length) return;
+      const p = x.produto, prm = x.prm;
+      const rates = real ? new Array(H + 1).fill(real.get(x.cod) || 0) : x.rates;
+      const avg = (from, n) => { let s = 0, c = 0; for (let d = Math.max(0, from); d < Math.min(H + 1, from + n); d++) { s += rates[d]; c++; } return c ? s / c : 0; };
+      const ss = prm.seg * avg(0, 60);
+      const proj = list => { const a = new Array(H + 1).fill(0); list.forEach(e => { if (e.dia <= H) a[Math.max(0, e.dia)] += e.q; }); const S = new Array(H + 1); let v = num(p.estoque); for (let d = 0; d <= H; d++) { v = Math.max(0, v + a[d] - rates[d]); S[d] = v; } return S; };
+      const ords = x.abertas.map(oo => ({ o: oo, q: oo.aberto, dia: diffDays(today, oo.chegadaEfetiva), movel: MOVEL.includes(oo.status) })).sort((a, b) => a.dia - b.dia);
+      // 1ª passada: data em que cada ordem é realmente necessária (considerando as anteriores, em cascata)
+      const kept = [];
+      ords.forEach(e => {
+        const S = proj(kept);
+        let need = -1; for (let d = 0; d <= H; d++) if (rates[d] > 0 && S[d] < ss - 1e-9) { need = d; break; }
+        e.need = need;
+        if (!e.movel) { e.novo = e.dia; kept.push(e); if (need < 0 || need > e.dia + tol) e.acao = 'excesso'; return; }
+        if (need < 0) { e.acao = 'cancelar'; e.novo = null; return; }
+        if (need > e.dia + tol) { e.acao = 'postergar'; e.novo = need; kept.push({ ...e, dia: need, ref: e }); return; }
+        e.novo = e.dia; kept.push(e);
+      });
+      // 2ª passada: quantidade que sobra no fim do horizonte (mantendo segurança + uma cobertura) → reduzir/cancelar, da última ordem para a primeira
+      const S = proj(kept);
+      const fim = prm.seg * avg(H - 59, 60) + prm.cob * avg(H - 29, 30);
+      [...kept].sort((a, b) => b.dia - a.dia).forEach(k => {
+        const e = k.ref || k; if (!e.movel) return;
+        let folga = S[H] - fim; for (let d = Math.max(0, k.dia); d <= H; d++) folga = Math.min(folga, S[d] - ss);
+        let corte = Math.floor(Math.max(0, Math.min(k.q, folga)) / prm.mult) * prm.mult;
+        if (corte <= 0) return;
+        if (corte >= k.q * 0.95) { corte = k.q; e.acao = 'cancelar'; }
+        else if (corte >= Math.max(prm.mult, k.q * 0.1)) { e.qNova = k.q - corte; if (!e.acao) e.acao = 'reduzir'; }
+        else return;
+        for (let d = Math.max(0, k.dia); d <= H; d++) S[d] -= corte;
+      });
+      ords.forEach(e => {
+        if (!e.acao) return;
+        const unit = valorOrdem(db, { ...e.o, qtd: 1, qtdRecebida: 0 }, p).valorTotal;
+        const qLib = e.acao === 'cancelar' ? e.q : e.qNova !== undefined ? e.q - e.qNova : 0;
+        const fdd = d => d === null || d === undefined || d < 0 ? '–' : addDays(today, d);
+        const br = d => { const v = fdd(d); return v === '–' ? v : v.slice(8, 10) + '/' + v.slice(5, 7) + '/' + v.slice(2, 4); };
+        let motivo = '';
+        if (e.acao === 'cancelar') motivo = e.need < 0 ? `Estoque e ordens anteriores cobrem a demanda até o fim do horizonte (${br(H)}), mantendo o estoque de segurança.` : `As ordens anteriores já deixam estoque suficiente até o fim do horizonte, com segurança e uma cobertura de ${prm.cob} dias.`;
+        else if (e.acao === 'postergar') motivo = `O estoque só atinge a segurança em ${br(e.need)}; a ordem pode chegar ${e.need - e.dia} dias depois${e.qNova !== undefined ? ` e com ${e.qNova} pç em vez de ${e.q}` : ''}.`;
+        else if (e.acao === 'reduzir') motivo = `Só ${e.qNova} de ${e.q} pç são necessárias até o fim do horizonte mantendo segurança + cobertura de ${prm.cob} dias.`;
+        else motivo = e.need < 0 ? 'Ordem já embarcada; não há necessidade no horizonte — avaliar destino/estoque.' : `Ordem já embarcada; chegará ${e.need - e.dia} dias antes do necessário.`;
+        recs.push({ cod: x.cod, x, ordem: e.o, acao: e.acao, chegadaAtual: e.o.chegadaEfetiva, novaChegada: e.acao === 'postergar' ? fdd(e.novo) : null, dias: e.acao === 'postergar' ? e.novo - e.dia : (e.need >= 0 ? e.need - e.dia : null),
+          qtdAtual: e.q, qtdNova: e.acao === 'cancelar' ? 0 : (e.qNova !== undefined ? e.qNova : e.q), qtdLiberada: qLib, valorLiberado: qLib * unit, valorOrdem: e.q * unit, necessidade: e.need >= 0 ? fdd(e.need) : null, motivo });
+      });
+    });
+    const ordem = { cancelar: 0, reduzir: 1, postergar: 2, excesso: 3 };
+    return recs.sort((a, b) => ordem[a.acao] - ordem[b.acao] || b.valorLiberado - a.valorLiberado || (b.dias || 0) - (a.dias || 0));
+  }
+
   // ---------- motor MRP ----------
   function buildDemandIndex(db) {
     const fcByPa = new Map(db.previsao.map(f => [f.pa, f]));
@@ -947,7 +1006,7 @@ const MRPCore = (function () {
     const res = db.produtos.filter(p => p.ativo !== false).map(p => computeItem(db, idx, p, opts));
     return { opts, itens: res, byCod: new Map(res.map(r => [r.cod, r])) };
   }
-  return { itemParams, aplicarFatoresPacote, parseEstoqueCorrente, aplicarEstoque, parseMedidasCSV, parseMedidasSheet, aplicarMedidas, pesoMaxContainer, fecharPedidos, capacidadeContainer, parseVendasCSV, parseVendasSheet, mergeVendas, sugerirVinculos, analisarVendas, serieSemanal, taxaPrevisao, valorOrdem, emptyDB, importWorkbook, importStock, computeAll, computeItem, buildDemandIndex, itemParams, addDays, diffDays, todayISO, serialToISO, num, str };
+  return { revisarOrdens, itemParams, aplicarFatoresPacote, parseEstoqueCorrente, aplicarEstoque, parseMedidasCSV, parseMedidasSheet, aplicarMedidas, pesoMaxContainer, fecharPedidos, capacidadeContainer, parseVendasCSV, parseVendasSheet, mergeVendas, sugerirVinculos, analisarVendas, serieSemanal, taxaPrevisao, valorOrdem, emptyDB, importWorkbook, importStock, computeAll, computeItem, buildDemandIndex, itemParams, addDays, diffDays, todayISO, serialToISO, num, str };
 })();
 
 
@@ -969,7 +1028,7 @@ let R = null;                 // resultado do cálculo
 let page = 'painel';
 let fsdb = null, user = null;
 const charts = {};
-const ui = { mrpFiltro: { q: '', familia: '', fornecedor: '', status: '' }, mrpView: 'lista', grade: { dias: 60, gran: 'dia', ordens: true }, sugFiltro: { status: 'acao', janela: 30, fornecedor: '' }, ordFiltro: { q: '', status: 'abertas', fornecedor: '' }, prevFiltro: { q: '', grupo: '' }, cadTab: 'itens', sort: {}, vendOpts: { janela: 60, excluirB2B: true, tolerancia: 25 }, vend: { tab: 'comp', filtro: 'atencao', q: '', grupoAberto: {} } };
+const ui = { mrpFiltro: { q: '', familia: '', fornecedor: '', status: '' }, mrpView: 'lista', grade: { dias: 60, gran: 'dia', ordens: true }, sugFiltro: { status: 'acao', janela: 30, fornecedor: '' }, ordFiltro: { q: '', status: 'abertas', fornecedor: '' }, ordTab: 'ordens', rev: { base: 'mrp', tolerancia: 15, acao: 'acoes' }, prevFiltro: { q: '', grupo: '' }, cadTab: 'itens', sort: {}, vendOpts: { janela: 60, excluirB2B: true, tolerancia: 25 }, vend: { tab: 'comp', filtro: 'atencao', q: '', grupoAberto: {} } };
 
 /* ================= PERSISTÊNCIA ================= */
 const Store = {
@@ -1062,7 +1121,7 @@ function setSort(key, col) { const s = ui.sort[key]; ui.sort[key] = s && s.col =
 function download(name, content, type = 'application/json') { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([content], { type })); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); }
 
 /* ================= CÁLCULO ================= */
-function recalc() { try { if (C.aplicarFatoresPacote(DB)) Store.save('estrutura'); } catch (e) { console.error(e); } if (DB.medidasTab) { try { C.aplicarMedidas(DB, DB.medidasTab); } catch (e) { console.error(e); } } if (DB.estoqueSnap) { try { C.aplicarEstoque(DB); } catch (e) { console.error(e); } } R = C.computeAll(DB); try { R.vendas = DB.vendas ? C.analisarVendas(DB, R, ui.vendOpts) : null; } catch (e) { console.error(e); R.vendas = null; } }
+function recalc() { try { if (C.aplicarFatoresPacote(DB)) Store.save('estrutura'); } catch (e) { console.error(e); } if (DB.medidasTab) { try { C.aplicarMedidas(DB, DB.medidasTab); } catch (e) { console.error(e); } } if (DB.estoqueSnap) { try { C.aplicarEstoque(DB); } catch (e) { console.error(e); } } R = C.computeAll(DB); try { R.vendas = DB.vendas ? C.analisarVendas(DB, R, ui.vendOpts) : null; } catch (e) { console.error(e); R.vendas = null; } try { if (ui.rev.base === 'real' && !R.vendas) ui.rev.base = 'mrp'; R.revisao = C.revisarOrdens(DB, R, ui.rev); } catch (e) { console.error(e); R.revisao = []; } }
 function prodByCod(cod) { return DB.produtos.find(p => p.cod === cod); }
 
 /* ================= NAVEGAÇÃO ================= */
@@ -1087,6 +1146,7 @@ function renderNav() {
   document.getElementById('nav').innerHTML = PAGES.map(([k, l]) => {
     let extra = '';
     if (k === 'sugestoes' && R) { const n = R.itens.filter(x => x.status === 'atrasado' || x.status === 'comprar').length; if (n) extra = `<span class="ml-auto bg-red-500 text-white text-[10px] rounded-full px-1.5">${n}</span>`; }
+    if (k === 'ordens' && R?.revisao) { const n = R.revisao.filter(r => r.acao !== 'excesso').length; if (n) extra = `<span class="ml-auto bg-sky-600 text-white text-[10px] rounded-full px-1.5" title="ordens para postergar/reduzir/cancelar">${n}</span>`; }
     if (k === 'vendas' && R?.vendas) { const n = R.vendas.alertas.filter(a => a.sev === 3).length; if (n) extra = `<span class="ml-auto bg-amber-500 text-white text-[10px] rounded-full px-1.5" title="pontos de atenção críticos">${n}</span>`; }
     return `<button class="nav-btn w-full flex items-center gap-2.5 px-3 py-2 rounded-lg hover:bg-slate-800 hover:text-white text-left ${page === k ? 'active' : ''}" onclick="go('${k}')">
     <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="${ICON[k]}"/></svg><span>${l}</span>${extra}</button>`;
@@ -1137,6 +1197,8 @@ function pgPainel(el) {
     ${kpi('Em aberto (ordens)', brl.format(valOrd(abertas)), `${uniq(abertas.map(o => o.po)).length} POs · ${brl.format(valOrd(transito))} em trânsito · ${comCambio} linha(s) com câmbio fechado`, 'text-sky-700', "go('ordens')")}
     ${kpi('Estoque (custo)', brl.format(estoqueValor), 'custo FOB × câmbio')}
   </div>
+  ${(R.revisao || []).some(r => r.acao !== 'excesso') ? (() => { const rv = R.revisao.filter(r => r.acao !== 'excesso'); const lib = rv.reduce((a, r) => a + r.valorLiberado, 0); return `<div class="mt-4 bg-white rounded-xl shadow-sm border p-4 flex flex-wrap items-center gap-4 cursor-pointer hover:border-sky-300" onclick="ui.ordTab='revisao';go('ordens')">
+    <div class="font-semibold">Revisão de ordens em aberto</div><span class="text-xs"><b class="text-red-600">${rv.filter(r => r.acao === 'cancelar').length}</b> para cancelar</span><span class="text-xs"><b class="text-orange-600">${rv.filter(r => r.acao === 'reduzir').length}</b> para reduzir</span><span class="text-xs"><b class="text-sky-700">${rv.filter(r => r.acao === 'postergar').length}</b> para postergar</span>${lib ? `<span class="text-xs">libera ≈ <b>${brl.format(lib)}</b></span>` : ''}<span class="ml-auto text-sky-700 text-xs underline">revisar</span></div>`; })() : ''}
   ${R.vendas ? (() => { const V = R.vendas, c3 = V.alertas.filter(a => a.sev === 3); const acima = V.itens.filter(a => a.status === 'acima').length, abaixo = V.itens.filter(a => a.status === 'abaixo' || a.status === 'sem_venda').length; return `<div class="mt-4 bg-white rounded-xl shadow-sm border p-4 flex flex-wrap items-center gap-4 cursor-pointer hover:border-sky-300" onclick="go('vendas')">
     <div class="font-semibold">Vendas x Previsão <span class="font-normal text-xs text-slate-500">(${fd(V.ini)} a ${fd(V.fim)})</span></div>
     <span class="text-xs"><b class="text-orange-600">${acima}</b> componentes vendendo acima da previsão</span><span class="text-xs"><b class="text-sky-700">${abaixo}</b> abaixo ou sem venda</span>
@@ -1582,11 +1644,12 @@ function criarPlanejada(cods) {
 
 /* ================= ORDENS ================= */
 function pgOrdens(el) {
+  if (ui.ordTab === 'revisao') return pgRevisao(el);
   const F = ui.ordFiltro, t = hoje();
   let rows = DB.ordens.filter(o => (F.status === 'abertas' ? !['Recebido', 'Cancelado'].includes(o.status) : !F.status || o.status === F.status) && (!F.fornecedor || o.fornecedor === F.fornecedor) && (!F.q || (o.po + ' ' + o.item).toLowerCase().includes(F.q.toLowerCase())));
   rows = sortRows('ord', rows, { po: o => o.po, forn: o => o.fornecedor, item: o => o.item, qtd: o => C.num(o.qtd), ped: o => o.dataPedido, emb: o => o.dataEmbarque, che: o => o.dataChegada, st: o => ORD_STATUS.indexOf(o.status) });
   if (!ui.sort.ord) rows = [...rows].sort((a, b) => (a.dataChegada || 'z').localeCompare(b.dataChegada || 'z'));
-  el.innerHTML = `
+  el.innerHTML = `${ordTabs()}
   <div class="flex flex-wrap gap-2 mb-3 items-center">
     <input id="oq" placeholder="Buscar PO ou item" value="${esc(F.q)}" class="border rounded-lg px-3 py-1.5 w-56">
     <select id="ost" class="border rounded-lg px-2 py-1.5">${opt('abertas', F.status, 'Em aberto')}${opt('', F.status, 'Todos os status')}${ORD_STATUS.map(s => opt(s, F.status)).join('')}</select>
@@ -1611,6 +1674,67 @@ function pgOrdens(el) {
   document.getElementById('ost').onchange = e => { F.status = e.target.value; render(); };
   document.getElementById('ofo').onchange = e => { F.fornecedor = e.target.value; render(); };
 }
+
+/* ===== Revisão de ordens (postergar / reduzir / cancelar) ===== */
+const REV_LBL = { cancelar: ['Cancelar', 'bg-red-100 text-red-700'], reduzir: ['Reduzir', 'bg-orange-100 text-orange-700'], postergar: ['Postergar', 'bg-sky-100 text-sky-700'], excesso: ['Já embarcada — chega cedo', 'bg-slate-100 text-slate-600'] };
+function ordTabs() {
+  const n = (R?.revisao || []).filter(r => r.acao !== 'excesso').length;
+  return `<div class="flex gap-4 border-b mb-4">${[['ordens', 'Ordens de compra'], ['revisao', `Revisão: postergar / reduzir / cancelar${n ? ` <span class="ml-1 bg-sky-600 text-white text-[10px] rounded-full px-1.5">${n}</span>` : ''}`]].map(([k, l]) => `<button class="tab border-b-2 border-transparent px-1 pb-2 font-semibold ${ui.ordTab === k ? 'active' : 'text-slate-500'}" onclick="ui.ordTab='${k}';render()">${l}</button>`).join('')}</div>`;
+}
+function setRev(k, v) { ui.rev[k] = v; recalc(); render(); }
+function pgRevisao(el) {
+  const V = ui.rev, all = R.revisao || [];
+  const rows = all.filter(r => V.acao === 'todas' ? true : V.acao === 'acoes' ? r.acao !== 'excesso' : r.acao === V.acao);
+  const soma = a => all.filter(r => r.acao === a);
+  const lib = all.filter(r => r.acao !== 'excesso').reduce((a, r) => a + r.valorLiberado, 0);
+  el.innerHTML = `${ordTabs()}
+  <div class="flex flex-wrap gap-3 mb-3 items-center text-xs">
+    <label>Demanda considerada <select class="border rounded-lg px-2 py-1.5 ml-1" onchange="setRev('base',this.value)">${opt('mrp', V.base, 'Previsão do MRP')}${R.vendas ? opt('real', V.base, `Ritmo real de vendas (últimos ${R.vendas.nd} dias até ${fd(R.vendas.fim)})`) : ''}</select></label>
+    <label>Postergar só se sobrar mais de <input type="number" value="${V.tolerancia}" class="border rounded-lg px-2 py-1 w-14" onchange="setRev('tolerancia',Number(this.value)||0)"> dias</label>
+    <select class="border rounded-lg px-2 py-1.5" onchange="ui.rev.acao=this.value;render()">${[['acoes', 'Ações recomendadas'], ['cancelar', 'Cancelar'], ['reduzir', 'Reduzir'], ['postergar', 'Postergar'], ['excesso', 'Já embarcadas que chegam cedo'], ['todas', 'Todas']].map(([v, l]) => opt(v, V.acao, l)).join('')}</select>
+    <button onclick="aplicarRevisao()" class="ml-auto rounded-lg px-3 py-1.5 bg-sky-600 text-white hover:bg-sky-700">Aplicar nas ordens selecionadas</button>
+  </div>
+  ${V.base === 'real' && R.vendas?.defasagem > 15 ? `<div class="mb-3 p-2 rounded bg-amber-50 border border-amber-200 text-amber-900 text-xs">⚠ O ritmo real vem de vendas até ${fd(R.vendas.fim)} (${R.vendas.defasagem} dias atrás). Importe vendas recentes antes de cancelar ordens com base nele.</div>` : ''}
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+    ${kpi('Cancelar', f0(soma('cancelar').length), brl.format(soma('cancelar').reduce((a, r) => a + r.valorLiberado, 0)) + ' liberados', 'text-red-600', "ui.rev.acao='cancelar';render()")}
+    ${kpi('Reduzir', f0(soma('reduzir').length), brl.format(soma('reduzir').reduce((a, r) => a + r.valorLiberado, 0)) + ' liberados', 'text-orange-600', "ui.rev.acao='reduzir';render()")}
+    ${kpi('Postergar', f0(soma('postergar').length), soma('postergar').length ? `média de ${f0(soma('postergar').reduce((a, r) => a + r.dias, 0) / soma('postergar').length)} dias` : '', 'text-sky-700', "ui.rev.acao='postergar';render()")}
+    ${kpi('Total liberado', brl.format(lib), 'cancelamentos + reduções', 'text-slate-800')}
+  </div>
+  <div class="text-[11px] text-slate-500 mb-2">Para cada item, as ordens em aberto são analisadas na ordem de chegada: a data em que cada uma é realmente necessária é quando o estoque (com as ordens anteriores) chega ao estoque de segurança. Se isso só acontece bem depois da chegada prevista → <b>postergar</b>; se não acontece no horizonte → <b>cancelar</b>; se no fim do horizonte sobra mais que segurança + uma cobertura → <b>reduzir</b> (começando pela última ordem). Ordens "Em trânsito" não podem ser mudadas e aparecem só como aviso.</div>
+  <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 340px)"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="w-8 text-center"><input type="checkbox" onchange="document.querySelectorAll('.revck').forEach(c=>c.checked=this.checked)"></th>
+  <th class="px-2 py-2">Ação</th><th class="px-2">Item</th><th class="px-2">PO</th><th class="px-2">Fornecedor</th><th class="px-2">Status</th><th class="px-2 num">Qtd</th><th class="px-2">Chegada atual</th><th class="px-2">Proposta</th><th class="px-2 num">Liberado</th><th class="px-2">Motivo</th></tr></thead><tbody>
+  ${rows.map((r, i) => { const L = REV_LBL[r.acao]; const idx = all.indexOf(r); return `<tr class="border-t hover:bg-sky-50 align-top"><td class="text-center pt-2">${r.acao === 'excesso' ? '' : `<input type="checkbox" class="revck" value="${idx}">`}</td>
+    <td class="px-2 py-1.5"><span class="badge ${L[1]}">${L[0]}</span></td>
+    <td class="px-2 cursor-pointer" onclick="openItem('${esc(r.cod)}')"><div class="font-semibold text-sky-800">${esc(r.cod)}</div><div class="text-slate-400 truncate max-w-[200px]">${esc(r.x.produto.desc)}</div></td>
+    <td class="px-2">${esc(r.ordem.po || '—')}</td><td class="px-2">${esc(r.ordem.fornecedor)}</td><td class="px-2">${ordBadge(r.ordem.status)}</td>
+    <td class="px-2 num">${f0(r.qtdAtual)}</td><td class="px-2">${fd(r.chegadaAtual)}</td>
+    <td class="px-2">${r.acao === 'cancelar' ? '<b class="text-red-600">cancelar</b>' : r.acao === 'excesso' ? (r.necessidade ? `necessária em ${fd(r.necessidade)}` : 'sem necessidade no horizonte') : `${r.novaChegada ? `chegar em <b>${fd(r.novaChegada)}</b> (+${r.dias}d)` : ''}${r.qtdNova !== r.qtdAtual ? `${r.novaChegada ? '<br>' : ''}qtd <b>${f0(r.qtdNova)}</b>` : ''}`}</td>
+    <td class="px-2 num">${r.valorLiberado ? brl.format(r.valorLiberado) : '–'}</td><td class="px-2 whitespace-normal min-w-[280px] text-slate-600">${esc(r.motivo)}</td></tr>`; }).join('') || '<tr><td colspan=11 class="p-4 text-slate-400">Nenhuma ordem para revisar com esta demanda — as ordens em aberto estão alinhadas à necessidade.</td></tr>'}
+  </tbody></table></div>`;
+}
+function aplicarRevisao() {
+  const all = R.revisao || [];
+  const sel = [...document.querySelectorAll('.revck:checked')].map(c => all[Number(c.value)]).filter(Boolean);
+  if (!sel.length) { toast('Selecione as ordens'); return; }
+  const c = { cancelar: 0, reduzir: 0, postergar: 0 }; sel.forEach(r => c[r.acao]++);
+  if (!confirm(`Aplicar nas ordens selecionadas?\n\n${c.cancelar} cancelamento(s) · ${c.reduzir} redução(ões) · ${c.postergar} postergação(ões)\nLibera ≈ ${brl.format(sel.reduce((a, r) => a + r.valorLiberado, 0))}\n\nAs ordens canceladas ficam com status "Cancelado" (não são apagadas). Lembre de comunicar o fornecedor.`)) return;
+  const hojeBr = fd(C.todayISO());
+  sel.forEach(r => {
+    const o = DB.ordens.find(z => z.id === r.ordem.id); if (!o) return;
+    if (r.acao === 'cancelar') { o.status = 'Cancelado'; o.obs = `${o.obs ? o.obs + ' · ' : ''}Cancelada pela revisão em ${hojeBr}`; return; }
+    if (r.novaChegada) {
+      const desl = C.diffDays(o.dataChegada || r.chegadaAtual, r.novaChegada);
+      o.dataChegada = r.novaChegada;
+      if (o.dataEmbarque) o.dataEmbarque = C.addDays(o.dataEmbarque, desl);
+      if (['Planejada', 'Simulação'].includes(o.status) && o.dataPedido) { const np = C.addDays(o.dataPedido, desl); o.dataPedido = np < C.todayISO() ? C.todayISO() : np; }
+      o.obs = `${o.obs ? o.obs + ' · ' : ''}Postergada +${desl}d pela revisão em ${hojeBr}`;
+    }
+    if (r.qtdNova !== r.qtdAtual) { o.obs = `${o.obs ? o.obs + ' · ' : ''}Qtd ${o.qtd} → ${C.num(o.qtdRecebida) + r.qtdNova} pela revisão em ${hojeBr}`; o.qtd = C.num(o.qtdRecebida) + r.qtdNova; }
+  });
+  changed('ordens'); toast(`${sel.length} ordem(ns) atualizada(s)`);
+}
+
 function editOrdem(id) {
   const o = id ? DB.ordens.find(x => x.id === id) : { id: '', po: '', fornecedor: '', item: '', qtd: '', dataPedido: C.todayISO(), leadTime: DB.settings.leadTimePadrao, dataEmbarque: '', transitTime: DB.settings.transitPadrao, dataChegada: '', qtdRecebida: 0, status: 'Em produção', custoUnit: '', moeda: 'USD', responsavel: user?.email || '', obs: '' };
   const fld = (k, l, type = 'text', extra = '') => `<label class="block"><span class="text-xs text-slate-500">${l}</span><input id="of_${k}" type="${type}" ${type === 'number' ? 'step="any"' : ''} value="${esc(o[k] ?? '')}" class="w-full border rounded px-2 py-1.5" ${extra}></label>`;
@@ -1927,7 +2051,7 @@ function contextoIA() {
 Data-base: ${t}. Horizonte: ${R.opts.horizonte} dias. Parâmetros padrão: estoque de segurança ${DB.settings.segurancaDias} dias, cobertura por pedido ${DB.settings.coberturaDias} dias.
 Itens (até 80, ordenados por ruptura). Colunas: item;família;fornecedor;estoque;demanda_dia;dias_estoque;em_aberto;ruptura_projetada;pedir_ate;qtd_sugerida;situação
 ${linhas.join('\n')}
-${R.vendas ? `Vendas reais ${R.vendas.ini} a ${R.vendas.fim} (defasagem ${R.vendas.defasagem} dias). Pontos de atenção (previsão x real):\n${R.vendas.alertas.slice(0, 20).map(a => '- ' + a.titulo + ': ' + a.texto).join('\n')}\n` : 'Sem relatório de vendas reais importado.\n'}Ordens em aberto por PO: ${Object.entries(porPO).map(([k, v]) => `${k} (${v.forn}, ${v.status}, chegada ${v.chegada || '?'}, ${v.itens} itens)`).join(' | ')}`;
+${R.vendas ? `Vendas reais ${R.vendas.ini} a ${R.vendas.fim} (defasagem ${R.vendas.defasagem} dias). Pontos de atenção (previsão x real):\n${R.vendas.alertas.slice(0, 20).map(a => '- ' + a.titulo + ': ' + a.texto).join('\n')}\n` : 'Sem relatório de vendas reais importado.\n'}${(R.revisao || []).filter(r => r.acao !== 'excesso').length ? `Revisão de ordens (demanda: ${ui.rev.base === 'real' ? 'ritmo real' : 'previsão'}):\n${R.revisao.filter(r => r.acao !== 'excesso').slice(0, 15).map(r => `- ${r.acao.toUpperCase()} ${r.cod} PO ${r.ordem.po} (${r.ordem.status}, ${r.qtdAtual} pç, chegada ${r.chegadaAtual}): ${r.motivo}`).join('\n')}\n` : ''}Ordens em aberto por PO: ${Object.entries(porPO).map(([k, v]) => `${k} (${v.forn}, ${v.status}, chegada ${v.chegada || '?'}, ${v.itens} itens)`).join(' | ')}`;
 }
 function pgIA(el) {
   const url = DB.settings.workerUrl;
