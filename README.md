@@ -33,6 +33,10 @@ Planejamento de importação: estoque projetado dia a dia, ruptura, ordens de co
 - Em Ordens de compra → aba Revisão, cada ordem em aberto é comparada com a demanda considerada (previsão do MRP ou ritmo real de vendas): postergar quando a necessidade só ocorre bem depois da chegada, cancelar quando não há necessidade no horizonte, reduzir quando sobra mais que segurança + uma cobertura no fim do horizonte.
 - Ordens "Em trânsito" aparecem só como aviso. As ações são aplicadas nas ordens selecionadas (canceladas ficam com status Cancelado).
 
+## Histórico de alterações das ordens
+- Toda criação, alteração (datas, embarque, quantidade, status, custo, câmbio), cancelamento, exclusão e restauração de linhas de ordem é registrada com data/hora, usuário, origem (manual, em lote, embarque, sugestão, montar pedido, revisão do MRP, importação) e valor anterior → novo.
+- Ordens de compra → aba Histórico (filtros e exportação) e no modal de cada linha. Guarda os 2.500 registros mais recentes.
+
 ## Câmbio
 - Previsões usam o câmbio em tempo real: comercial (AwesomeAPI, venda) ou PTAX do Banco Central (fechamento), atualizado a cada 30 minutos, com margem de segurança opcional. Também dá para informar manualmente.
 - Ordens com câmbio fechado: informe o **câmbio pago** na linha da ordem (ou em várias linhas de uma vez). O valor dessas ordens usa o câmbio pago; as demais usam o de previsão.

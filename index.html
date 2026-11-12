@@ -140,6 +140,7 @@ const MRPCore = (function () {
       vendas: null,     // vendas efetivas agregadas por SKU/dia
       estoqueSnap: null, // último relatório de estoque corrente (saldo por SKU)
       medidasTab: null,  // tabela de medidas importada {codigo: {peso, m3}}
+      historico: [],     // histórico de alterações das ordens de compra
       estoqueAtualizadoEm: null
     };
   }
@@ -1019,7 +1020,7 @@ const FIREBASE_CONFIG = null;
 const DOMINIO_PERMITIDO = 'grupotbx.com.br';
 const COLECAO = 'mrp';                 // coleção do Firestore
 const LOCAL_KEY = 'mrp_tbx_v1';
-const DATASETS = ['settings', 'produtos', 'estrutura', 'previsao', 'ordens', 'embarques', 'fornecedores', 'vendas', 'estoque', 'medidas', 'meta'];
+const DATASETS = ['settings', 'produtos', 'estrutura', 'previsao', 'ordens', 'embarques', 'fornecedores', 'vendas', 'estoque', 'medidas', 'historico', 'meta'];
 
 /* ================= ESTADO ================= */
 const C = MRPCore;
@@ -1028,7 +1029,7 @@ let R = null;                 // resultado do cálculo
 let page = 'painel';
 let fsdb = null, user = null;
 const charts = {};
-const ui = { mrpFiltro: { q: '', familia: '', fornecedor: '', status: '' }, mrpView: 'lista', grade: { dias: 60, gran: 'dia', ordens: true }, sugFiltro: { status: 'acao', janela: 30, fornecedor: '' }, ordFiltro: { q: '', status: 'abertas', fornecedor: '' }, ordTab: 'ordens', rev: { base: 'mrp', tolerancia: 15, acao: 'acoes' }, prevFiltro: { q: '', grupo: '' }, cadTab: 'itens', sort: {}, vendOpts: { janela: 60, excluirB2B: true, tolerancia: 25 }, vend: { tab: 'comp', filtro: 'atencao', q: '', grupoAberto: {} } };
+const ui = { mrpFiltro: { q: '', familia: '', fornecedor: '', status: '' }, mrpView: 'lista', grade: { dias: 60, gran: 'dia', ordens: true }, sugFiltro: { status: 'acao', janela: 30, fornecedor: '' }, ordFiltro: { q: '', status: 'abertas', fornecedor: '' }, ordTab: 'ordens', hist: { q: '', origem: '', periodo: 30 }, rev: { base: 'mrp', tolerancia: 15, acao: 'acoes' }, prevFiltro: { q: '', grupo: '' }, cadTab: 'itens', sort: {}, vendOpts: { janela: 60, excluirB2B: true, tolerancia: 25 }, vend: { tab: 'comp', filtro: 'atencao', q: '', grupoAberto: {} } };
 
 /* ================= PERSISTÊNCIA ================= */
 const Store = {
@@ -1058,7 +1059,7 @@ const Store = {
     const base = C.emptyDB();
     if (this.mode === 'firebase') {
       const snaps = await Promise.all(DATASETS.map(k => fsdb.collection(COLECAO).doc(k).get()));
-      snaps.forEach((s, i) => { const k = DATASETS[i]; if (s.exists) { const d = s.data(); if (k === 'settings') base.settings = { ...base.settings, ...d.v, cambio: { ...base.settings.cambio, ...(d.v?.cambio || {}) } }; else if (k === 'meta') base.estoqueAtualizadoEm = d.v?.estoqueAtualizadoEm || null; else if (k === 'vendas') base.vendas = d.v || null; else if (k === 'estoque') base.estoqueSnap = d.v || null; else if (k === 'medidas') base.medidasTab = d.v || null; else base[k] = d.v || []; } });
+      snaps.forEach((s, i) => { const k = DATASETS[i]; if (s.exists) { const d = s.data(); if (k === 'settings') base.settings = { ...base.settings, ...d.v, cambio: { ...base.settings.cambio, ...(d.v?.cambio || {}) } }; else if (k === 'meta') base.estoqueAtualizadoEm = d.v?.estoqueAtualizadoEm || null; else if (k === 'vendas') base.vendas = d.v || null; else if (k === 'estoque') base.estoqueSnap = d.v || null; else if (k === 'medidas') base.medidasTab = d.v || null; else if (k === 'historico') base.historico = d.v || []; else base[k] = d.v || []; } });
     } else {
       try { const raw = localStorage.getItem(LOCAL_KEY); if (raw) { const d = JSON.parse(raw); Object.assign(base, d); base.settings = { ...C.emptyDB().settings, ...d.settings, cambio: { ...C.emptyDB().settings.cambio, ...(d.settings?.cambio || {}) } }; } } catch (e) { console.warn(e); }
     }
@@ -1645,6 +1646,7 @@ function criarPlanejada(cods) {
 /* ================= ORDENS ================= */
 function pgOrdens(el) {
   if (ui.ordTab === 'revisao') return pgRevisao(el);
+  if (ui.ordTab === 'historico') return pgHistorico(el);
   const F = ui.ordFiltro, t = hoje();
   let rows = DB.ordens.filter(o => (F.status === 'abertas' ? !['Recebido', 'Cancelado'].includes(o.status) : !F.status || o.status === F.status) && (!F.fornecedor || o.fornecedor === F.fornecedor) && (!F.q || (o.po + ' ' + o.item).toLowerCase().includes(F.q.toLowerCase())));
   rows = sortRows('ord', rows, { po: o => o.po, forn: o => o.fornecedor, item: o => o.item, qtd: o => C.num(o.qtd), ped: o => o.dataPedido, emb: o => o.dataEmbarque, che: o => o.dataChegada, st: o => ORD_STATUS.indexOf(o.status) });
@@ -1679,7 +1681,7 @@ function pgOrdens(el) {
 const REV_LBL = { cancelar: ['Cancelar', 'bg-red-100 text-red-700'], reduzir: ['Reduzir', 'bg-orange-100 text-orange-700'], postergar: ['Postergar', 'bg-sky-100 text-sky-700'], excesso: ['Já embarcada — chega cedo', 'bg-slate-100 text-slate-600'] };
 function ordTabs() {
   const n = (R?.revisao || []).filter(r => r.acao !== 'excesso').length;
-  return `<div class="flex gap-4 border-b mb-4">${[['ordens', 'Ordens de compra'], ['revisao', `Revisão: postergar / reduzir / cancelar${n ? ` <span class="ml-1 bg-sky-600 text-white text-[10px] rounded-full px-1.5">${n}</span>` : ''}`]].map(([k, l]) => `<button class="tab border-b-2 border-transparent px-1 pb-2 font-semibold ${ui.ordTab === k ? 'active' : 'text-slate-500'}" onclick="ui.ordTab='${k}';render()">${l}</button>`).join('')}</div>`;
+  return `<div class="flex gap-4 border-b mb-4">${[['ordens', 'Ordens de compra'], ['revisao', `Revisão: postergar / reduzir / cancelar${n ? ` <span class="ml-1 bg-sky-600 text-white text-[10px] rounded-full px-1.5">${n}</span>` : ''}`], ['historico', 'Histórico de alterações']].map(([k, l]) => `<button class="tab border-b-2 border-transparent px-1 pb-2 font-semibold ${ui.ordTab === k ? 'active' : 'text-slate-500'}" onclick="ui.ordTab='${k}';render()">${l}</button>`).join('')}</div>`;
 }
 function setRev(k, v) { ui.rev[k] = v; recalc(); render(); }
 function pgRevisao(el) {
@@ -1720,6 +1722,7 @@ function aplicarRevisao() {
   const c = { cancelar: 0, reduzir: 0, postergar: 0 }; sel.forEach(r => c[r.acao]++);
   if (!confirm(`Aplicar nas ordens selecionadas?\n\n${c.cancelar} cancelamento(s) · ${c.reduzir} redução(ões) · ${c.postergar} postergação(ões)\nLibera ≈ ${brl.format(sel.reduce((a, r) => a + r.valorLiberado, 0))}\n\nAs ordens canceladas ficam com status "Cancelado" (não são apagadas). Lembre de comunicar o fornecedor.`)) return;
   const hojeBr = fd(C.todayISO());
+  window._histMotivo = new Map(sel.map(r => [r.ordem.id, `${REV_LBL[r.acao][0]} (base: ${ui.rev.base === 'real' ? 'ritmo real' : 'previsão'}) — ${r.motivo}`]));
   sel.forEach(r => {
     const o = DB.ordens.find(z => z.id === r.ordem.id); if (!o) return;
     if (r.acao === 'cancelar') { o.status = 'Cancelado'; o.obs = `${o.obs ? o.obs + ' · ' : ''}Cancelada pela revisão em ${hojeBr}`; return; }
@@ -1751,6 +1754,7 @@ function editOrdem(id) {
     <label class="block"><span class="text-xs text-slate-500">Câmbio pago (R$ por 1 unid.)</span><input id="of_cambioPago" type="number" step="any" value="${esc(o.cambioPago ?? '')}" placeholder="previsão: ${nf2.format(C.taxaPrevisao(DB, o.moeda || 'USD'))}" class="w-full border rounded px-2 py-1.5"></label>
     <label class="block col-span-2 md:col-span-1"><span class="text-xs text-slate-500">Observação</span><input id="of_obs" value="${esc(o.obs || '')}" class="w-full border rounded px-2 py-1.5"></label>
   </div>
+  ${id && (DB.historico || []).some(h => h.ordemId === id) ? `<div class="mt-4"><div class="font-semibold text-sm mb-1">Histórico desta linha</div><div class="scroll-x border rounded" style="max-height:200px"><table class="w-full tbl text-xs"><tbody>${[...DB.historico].reverse().filter(h => h.ordemId === id).slice(0, 30).map(h => histLinha(h, false)).join('')}</tbody></table></div></div>` : ''}
   <div class="text-[11px] text-slate-500 mt-2">Câmbio pago: preencha quando o câmbio da compra for fechado. Em branco, o valor usa o câmbio de previsão (atual${DB.settings.cambioMargem ? ' + ' + DB.settings.cambioMargem + '%' : ''}).</div>
   <div class="text-[11px] text-slate-500 mt-1">Ao mudar data do pedido, lead time ou trânsito, as datas de embarque e chegada são recalculadas (você pode sobrescrever).</div>
   <div class="flex gap-2 mt-4">${id ? `<button onclick="delOrdem('${id}')" class="text-red-600 border border-red-200 rounded-lg px-3 py-1.5">Excluir</button>` : ''}<button onclick="closeModal()" class="ml-auto border rounded-lg px-3 py-1.5">Cancelar</button><button onclick="saveOrdem('${id || ''}')" class="bg-sky-600 text-white rounded-lg px-4 py-1.5">Salvar</button></div>`, 'max-w-3xl');
@@ -1798,7 +1802,77 @@ function bulkStatus() {
   <label class="block mt-3 text-xs"><span class="text-slate-500">Nova data de chegada (opcional)</span><input id="bsd" type="date" class="border rounded px-2 py-1.5 w-full"></label>
   <div class="text-[11px] text-slate-500 mt-2">Ao marcar como "Recebido", a quantidade recebida = quantidade da ordem. Lembre-se de atualizar o estoque (importação do ERP) para não contar em dobro.</div>
   <div class="flex mt-4"><button class="ml-auto bg-sky-600 text-white rounded-lg px-4 py-1.5" onclick="applyBulk()">Aplicar</button></div>`, 'max-w-md');
-  window.applyBulk = () => { const s = document.getElementById('bs').value, d = document.getElementById('bsd').value, c = Number(document.getElementById('bsc').value) || 0; DB.ordens.forEach(o => { if (ids.includes(o.id)) { if (s) { o.status = s; if (s === 'Recebido') o.qtdRecebida = o.qtd; } if (d) o.dataChegada = d; if (c > 0) o.cambioPago = c; } }); closeModal(); changed('ordens'); toast(`${ids.length} linha(s) atualizada(s)`); };
+  window.applyBulk = comHist('alteração em lote', () => { const s = document.getElementById('bs').value, d = document.getElementById('bsd').value, c = Number(document.getElementById('bsc').value) || 0; DB.ordens.forEach(o => { if (ids.includes(o.id)) { if (s) { o.status = s; if (s === 'Recebido') o.qtdRecebida = o.qtd; } if (d) o.dataChegada = d; if (c > 0) o.cambioPago = c; } }); closeModal(); changed('ordens'); toast(`${ids.length} linha(s) atualizada(s)`); });
+}
+
+
+/* ================= HISTÓRICO DAS ORDENS ================= */
+const HIST_CAMPOS = { po: 'PO', fornecedor: 'Fornecedor', item: 'Item', qtd: 'Quantidade', qtdRecebida: 'Qtd recebida', dataPedido: 'Data do pedido', dataEmbarque: 'Embarque', dataChegada: 'Chegada', leadTime: 'Lead time', transitTime: 'Trânsito', status: 'Status', custoUnit: 'Custo unit.', moeda: 'Moeda', cambioPago: 'Câmbio pago' };
+const HIST_MAX = 2500;
+function snapOrdens() { return new Map(DB.ordens.map(o => [o.id, Object.fromEntries(Object.keys(HIST_CAMPOS).map(k => [k, o[k] ?? null]))])); }
+const hNorm = v => (v === '' || v === undefined) ? null : (typeof v === 'number' ? Math.round(v * 10000) / 10000 : v);
+// compara as ordens antes/depois de uma ação e grava o que mudou
+function registrarHist(antes, origem, detalhe) {
+  const depois = snapOrdens(), em = new Date().toISOString(), por = user?.email || 'este navegador', ev = [];
+  const base = (sn, id) => ({ id: uid('h'), em, por, origem, ordemId: id, po: sn.po || '', item: sn.item || '', fornecedor: sn.fornecedor || '', obs: (window._histMotivo && window._histMotivo.get(id)) || detalhe || '' });
+  depois.forEach((sn, id) => {
+    const a = antes.get(id);
+    if (!a) { ev.push({ ...base(sn, id), tipo: origem === 'desfazer exclusão' ? 'restauração' : 'criação', mudancas: [['qtd', null, sn.qtd], ['dataChegada', null, sn.dataChegada], ['status', null, sn.status]] }); return; }
+    const m = Object.keys(HIST_CAMPOS).filter(k => hNorm(a[k]) !== hNorm(sn[k])).map(k => [k, a[k], sn[k]]);
+    if (m.length) ev.push({ ...base(sn, id), tipo: m.some(x => x[0] === 'status' && x[2] === 'Cancelado') ? 'cancelamento' : 'alteração', mudancas: m });
+  });
+  antes.forEach((a, id) => { if (!depois.has(id)) ev.push({ ...base(a, id), tipo: 'exclusão', mudancas: [['qtd', a.qtd, null], ['dataChegada', a.dataChegada, null], ['status', a.status, null]] }); });
+  window._histMotivo = null;
+  if (!ev.length) return;
+  DB.historico = [...(DB.historico || []), ...ev].slice(-HIST_MAX);
+  Store.save('historico');
+}
+// envolve uma ação que mexe em ordens para registrar o histórico automaticamente
+function comHist(origem, fn, detalhe) { return function (...args) { const antes = snapOrdens(); const det = detalhe ? detalhe(...args) : ''; const r = fn.apply(this, args); registrarHist(antes, origem, det); return r; }; }
+saveOrdem = comHist('manual', saveOrdem);
+delOrdem = comHist('manual', delOrdem);
+excluirOrdens = comHist('exclusão em lote', excluirOrdens);
+desfazerExclusao = comHist('desfazer exclusão', desfazerExclusao);
+criarPlanejada = comHist('sugestão do MRP', criarPlanejada);
+criarOrdensMP = comHist('montar pedido', criarOrdensMP);
+aplicarRevisao = comHist('revisão do MRP', aplicarRevisao);
+saveEmb = comHist('embarque', saveEmb, () => { const g = k => document.getElementById('ef_' + k)?.value || ''; return `Processo ${g('refImp') || '—'}${g('navio') ? ' · navio ' + g('navio') : ''}${g('prevChegada') ? ' · prev. chegada ' + fd(g('prevChegada')) : ''}${g('atracacao') ? ' · atracação ' + fd(g('atracacao')) : ''}`; });
+
+const fmtHist = (k, v) => v === null || v === undefined || v === '' ? '—' : /^data/.test(k) ? fd(v) : typeof v === 'number' ? (k === 'cambioPago' || k === 'custoUnit' ? nf2.format(v) : f0(v)) : esc(v);
+const HIST_TIPO = { 'criação': 'bg-emerald-100 text-emerald-700', 'alteração': 'bg-sky-100 text-sky-700', 'cancelamento': 'bg-red-100 text-red-700', 'exclusão': 'bg-red-50 text-red-600', 'restauração': 'bg-violet-100 text-violet-700', 'importação': 'bg-slate-100 text-slate-600' };
+function histLinha(h, mostrarOrdem = true) {
+  const dt = new Date(h.em);
+  return `<tr class="border-t align-top"><td class="px-2 py-1.5 whitespace-nowrap">${dt.toLocaleDateString('pt-BR')} ${dt.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}</td>
+  <td class="px-2 whitespace-nowrap text-slate-500">${esc(h.por)}</td><td class="px-2"><span class="badge ${HIST_TIPO[h.tipo] || ''}">${esc(h.tipo)}</span><div class="text-[10px] text-slate-500 mt-0.5">${esc(h.origem)}</div></td>
+  ${mostrarOrdem ? `<td class="px-2">${esc(h.po || '—')}</td><td class="px-2"><span class="text-sky-800 cursor-pointer hover:underline" onclick="openItem('${esc(h.item)}')">${esc(h.item)}</span><div class="text-[10px] text-slate-400">${esc(h.fornecedor)}</div></td>` : ''}
+  <td class="px-2">${h.tipo === 'criação' || h.tipo === 'restauração' ? `qtd ${fmtHist('qtd', h.mudancas.find(m => m[0] === 'qtd')?.[2])} · chegada ${fmtHist('dataChegada', h.mudancas.find(m => m[0] === 'dataChegada')?.[2])} · ${fmtHist('status', h.mudancas.find(m => m[0] === 'status')?.[2])}` : h.tipo === 'exclusão' ? `qtd ${fmtHist('qtd', h.mudancas.find(m => m[0] === 'qtd')?.[1])} · chegada ${fmtHist('dataChegada', h.mudancas.find(m => m[0] === 'dataChegada')?.[1])}` : (h.mudancas || []).map(([k, a, b]) => `<div><span class="text-slate-500">${HIST_CAMPOS[k] || k}:</span> <span class="line-through text-slate-400">${fmtHist(k, a)}</span> → <b>${fmtHist(k, b)}</b></div>`).join('')}</td>
+  <td class="px-2 whitespace-normal min-w-[220px] text-slate-600">${esc(h.obs || '')}</td></tr>`;
+}
+function histFiltrado() {
+  const H = ui.hist, q = H.q.toLowerCase(), lim = H.periodo ? Date.now() - H.periodo * 864e5 : 0;
+  return [...(DB.historico || [])].reverse().filter(h => (!q || `${h.po} ${h.item} ${h.fornecedor}`.toLowerCase().includes(q)) && (!H.origem || h.origem === H.origem || h.tipo === H.origem) && (!lim || new Date(h.em).getTime() >= lim));
+}
+function pgHistorico(el) {
+  const H = ui.hist, rows = histFiltrado();
+  const origens = uniq([...(DB.historico || []).map(h => h.origem), ...(DB.historico || []).map(h => h.tipo)]);
+  el.innerHTML = `${ordTabs()}
+  <div class="flex flex-wrap gap-2 mb-3 items-center">
+    <input id="hq" placeholder="Buscar PO, item ou fornecedor" value="${esc(H.q)}" class="border rounded-lg px-3 py-1.5 w-64">
+    <select class="border rounded-lg px-2 py-1.5" onchange="ui.hist.origem=this.value;render()"><option value="">Todas as origens e tipos</option>${origens.map(o => opt(o, H.origem)).join('')}</select>
+    <select class="border rounded-lg px-2 py-1.5" onchange="ui.hist.periodo=Number(this.value);render()">${[[7, 'Últimos 7 dias'], [30, 'Últimos 30 dias'], [90, 'Últimos 90 dias'], [0, 'Todo o período']].map(([v, l]) => opt(v, H.periodo, l)).join('')}</select>
+    <span class="text-xs text-slate-500">${rows.length} registro(s)</span>
+    <button onclick="exportHist()" class="ml-auto border rounded-lg px-3 py-1.5 bg-white hover:bg-slate-50">Exportar Excel</button>
+  </div>
+  <div class="text-[11px] text-slate-500 mb-2">Registra automaticamente criação, alteração (datas, embarque, quantidade, status, custo, câmbio), cancelamento e exclusão de linhas de ordem — feitas à mão, em lote, pelo embarque, pelas sugestões/montar pedido ou pela revisão do MRP. Guarda os ${f0(HIST_MAX)} registros mais recentes.</div>
+  <div class="bg-white rounded-xl shadow-sm border scroll-x" style="max-height:calc(100vh - 260px)"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="px-2 py-2">Data/hora</th><th class="px-2">Usuário</th><th class="px-2">Tipo / origem</th><th class="px-2">PO</th><th class="px-2">Item</th><th class="px-2">O que mudou</th><th class="px-2">Observação / motivo</th></tr></thead><tbody>
+  ${rows.slice(0, 1000).map(h => histLinha(h)).join('') || '<tr><td colspan=7 class="p-4 text-slate-400">Nenhum registro neste filtro. As alterações passam a ser registradas a partir de agora.</td></tr>'}
+  </tbody></table></div>${rows.length > 1000 ? '<div class="text-xs text-slate-500 mt-2">Mostrando os 1.000 mais recentes — use os filtros ou exporte para ver todos.</div>' : ''}`;
+  document.getElementById('hq').oninput = e => { H.q = e.target.value; clearTimeout(pgHistorico._t); pgHistorico._t = setTimeout(() => { render(); const i = document.getElementById('hq'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }, 300); };
+}
+function exportHist() {
+  const out = []; histFiltrado().forEach(h => { const base = { 'Data/hora': new Date(h.em).toLocaleString('pt-BR'), Usuário: h.por, Tipo: h.tipo, Origem: h.origem, PO: h.po, Item: h.item, Fornecedor: h.fornecedor, Observação: h.obs };
+    (h.mudancas && h.mudancas.length ? h.mudancas : [[null, null, null]]).forEach(([k, a, b]) => out.push({ ...base, Campo: k ? HIST_CAMPOS[k] || k : '', De: a ?? '', Para: b ?? '' })); });
+  xlsxDownload(`Historico_ordens_${C.todayISO()}.xlsx`, [['Histórico', out]]);
 }
 
 /* ================= EMBARQUES ================= */
@@ -1960,6 +2034,7 @@ function pgImportar(el) {
       const wb = XLSX.read(await f.arrayBuffer(), { type: 'array' });
       const { db, log: l } = C.importWorkbook(XLSX, wb);
       db.settings = { ...DB.settings };
+      db.historico = [...(DB.historico || []), { id: uid('h'), em: new Date().toISOString(), por: user?.email || 'este navegador', origem: 'importação da planilha', tipo: 'importação', ordemId: '', po: '', item: '', fornecedor: '', obs: `${f.name}: ordens substituídas (${DB.ordens.length} → ${db.ordens.length} linhas)`, mudancas: [] }].slice(-HIST_MAX);
       DB = db; recalc(); Store.save(); renderNav();
       log.innerHTML = '<b class="text-emerald-700">Importação concluída</b>\n' + l.join('\n') + `\nFornecedores: ${db.fornecedores.length}`;
       toast('Planilha importada');
