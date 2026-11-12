@@ -1651,6 +1651,7 @@ function pgOrdens(el) {
   let rows = DB.ordens.filter(o => (F.status === 'abertas' ? !['Recebido', 'Cancelado'].includes(o.status) : !F.status || o.status === F.status) && (!F.fornecedor || o.fornecedor === F.fornecedor) && (!F.q || (o.po + ' ' + o.item).toLowerCase().includes(F.q.toLowerCase())));
   rows = sortRows('ord', rows, { po: o => o.po, forn: o => o.fornecedor, item: o => o.item, qtd: o => C.num(o.qtd), ped: o => o.dataPedido, emb: o => o.dataEmbarque, che: o => o.dataChegada, st: o => ORD_STATUS.indexOf(o.status) });
   if (!ui.sort.ord) rows = [...rows].sort((a, b) => (a.dataChegada || 'z').localeCompare(b.dataChegada || 'z'));
+  const histCont = new Map(); (DB.historico || []).forEach(h => { if (h.ordemId) histCont.set(h.ordemId, (histCont.get(h.ordemId) || 0) + 1); });
   el.innerHTML = `${ordTabs()}
   <div class="flex flex-wrap gap-2 mb-3 items-center">
     <input id="oq" placeholder="Buscar PO ou item" value="${esc(F.q)}" class="border rounded-lg px-3 py-1.5 w-56">
@@ -1671,7 +1672,7 @@ function pgOrdens(el) {
     <td class="px-2">${fd(o.dataPedido)}</td><td class="px-2">${fd(o.dataEmbarque)}</td><td class="px-2 ${venc ? 'text-red-600 font-semibold' : ''}">${fd(o.dataChegada)}${venc ? ' ⚠' : ''}</td>
     <td class="px-2 num">${v.moeda === 'BRL' ? '–' : `${nf2.format(v.taxa)} <span class="text-[10px] ${v.pago ? 'text-emerald-700 font-semibold' : 'text-slate-400'}">${v.pago ? 'pago' : 'prev.'}</span>`}</td>
     <td class="px-2 num" title="${v.pago ? 'Com câmbio de previsão: ' + brl.format(v.valorPrevisao) : ''}">${v.cu ? brl.format(v.valorTotal) : '–'}</td><td class="px-2">${ordBadge(o.status)}</td>
-    <td class="px-2 text-right"><button class="text-sky-700 hover:underline" onclick="editOrdem('${o.id}')">editar</button></td></tr>`; }).join('') || '<tr><td colspan=13 class="p-4 text-slate-400">Nenhuma ordem</td></tr>'}</tbody></table></div>`;
+    <td class="px-2 text-right whitespace-nowrap">${(() => { const n = histCont.get(o.id) || 0; return `<button class="mr-2 ${n ? 'text-violet-700' : 'text-slate-400'} hover:underline" onclick="verHistOrdem('${o.id}')" title="Histórico desta linha">histórico${n ? ` (${n})` : ''}</button>`; })()}<button class="text-sky-700 hover:underline" onclick="editOrdem('${o.id}')">editar</button></td></tr>`; }).join('') || '<tr><td colspan=13 class="p-4 text-slate-400">Nenhuma ordem</td></tr>'}</tbody></table></div>`;
   document.getElementById('oq').oninput = e => { F.q = e.target.value; clearTimeout(pgOrdens._t); pgOrdens._t = setTimeout(() => { render(); const i = document.getElementById('oq'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }, 250); };
   document.getElementById('ost').onchange = e => { F.status = e.target.value; render(); };
   document.getElementById('ofo').onchange = e => { F.fornecedor = e.target.value; render(); };
@@ -1826,6 +1827,7 @@ function registrarHist(antes, origem, detalhe) {
   if (!ev.length) return;
   DB.historico = [...(DB.historico || []), ...ev].slice(-HIST_MAX);
   Store.save('historico');
+  if (page === 'ordens') render(); // atualiza contadores de histórico na tela
 }
 // envolve uma ação que mexe em ordens para registrar o histórico automaticamente
 function comHist(origem, fn, detalhe) { return function (...args) { const antes = snapOrdens(); const det = detalhe ? detalhe(...args) : ''; const r = fn.apply(this, args); registrarHist(antes, origem, det); return r; }; }
@@ -1868,6 +1870,22 @@ function pgHistorico(el) {
   ${rows.slice(0, 1000).map(h => histLinha(h)).join('') || '<tr><td colspan=7 class="p-4 text-slate-400">Nenhum registro neste filtro. As alterações passam a ser registradas a partir de agora.</td></tr>'}
   </tbody></table></div>${rows.length > 1000 ? '<div class="text-xs text-slate-500 mt-2">Mostrando os 1.000 mais recentes — use os filtros ou exporte para ver todos.</div>' : ''}`;
   document.getElementById('hq').oninput = e => { H.q = e.target.value; clearTimeout(pgHistorico._t); pgHistorico._t = setTimeout(() => { render(); const i = document.getElementById('hq'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }, 300); };
+}
+function verHistOrdem(id, todaPO) {
+  const o = DB.ordens.find(z => z.id === id) || [...(DB.historico || [])].reverse().find(h => h.ordemId === id);
+  if (!o) return;
+  const po = o.po || '';
+  const idsPO = new Set(DB.ordens.filter(z => po && z.po === po).map(z => z.id)); (DB.historico || []).forEach(h => { if (po && h.po === po && h.ordemId) idsPO.add(h.ordemId); });
+  const ev = [...(DB.historico || [])].reverse().filter(h => todaPO ? idsPO.has(h.ordemId) : h.ordemId === id);
+  const atual = DB.ordens.find(z => z.id === id);
+  openModal(`Histórico — ${esc(todaPO ? 'PO ' + (po || '—') : (o.item + ' · PO ' + (po || '—')))}`, `
+  ${atual && !todaPO ? `<div class="grid grid-cols-2 md:grid-cols-6 gap-2 mb-3 text-xs">${[['Item', esc(atual.item)], ['Fornecedor', esc(atual.fornecedor)], ['Quantidade', f0(atual.qtd)], ['Pedido', fd(atual.dataPedido)], ['Chegada', fd(atual.dataChegada)], ['Status', ordBadge(atual.status)]].map(([l, v]) => `<div class="bg-slate-50 rounded-lg p-2"><div class="text-slate-500">${l}</div><div class="font-semibold">${v}</div></div>`).join('')}</div>` : ''}
+  <div class="flex items-center gap-3 mb-2 text-xs"><span class="text-slate-500">${ev.length} registro(s)</span>
+    ${po && idsPO.size > 1 ? `<button class="text-sky-700 underline" onclick="verHistOrdem('${id}', ${!todaPO})">${todaPO ? 'ver só esta linha' : `ver todas as linhas da PO ${esc(po)} (${idsPO.size})`}</button>` : ''}
+    ${atual ? `<button class="ml-auto border rounded px-2 py-1" onclick="editOrdem('${id}')">editar esta linha</button>` : '<span class="ml-auto text-red-600">linha excluída</span>'}</div>
+  <div class="scroll-x border rounded" style="max-height:60vh"><table class="w-full tbl text-xs"><thead><tr class="text-left"><th class="px-2 py-1.5">Data/hora</th><th class="px-2">Usuário</th><th class="px-2">Tipo / origem</th>${todaPO ? '<th class="px-2">PO</th><th class="px-2">Item</th>' : ''}<th class="px-2">O que mudou</th><th class="px-2">Observação / motivo</th></tr></thead><tbody>
+  ${ev.map(h => histLinha(h, !!todaPO)).join('') || `<tr><td colspan="7" class="p-3 text-slate-400">Nenhuma alteração registrada ainda para ${todaPO ? 'esta PO' : 'esta linha'}. O histórico começou a ser gravado em 12/11/26.</td></tr>`}
+  </tbody></table></div>`, 'max-w-5xl');
 }
 function exportHist() {
   const out = []; histFiltrado().forEach(h => { const base = { 'Data/hora': new Date(h.em).toLocaleString('pt-BR'), Usuário: h.por, Tipo: h.tipo, Origem: h.origem, PO: h.po, Item: h.item, Fornecedor: h.fornecedor, Observação: h.obs };
